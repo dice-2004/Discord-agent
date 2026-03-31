@@ -8,7 +8,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -121,7 +121,7 @@ class DiscordOrchestrator:
             md = record.metadata or {}
             channel_id = str(md.get("channel_id", ""))
             channel_name = str(md.get("channel_name", "")).strip()
-            ts = str(record.timestamp or "")[:19]
+            ts = self._format_jst_timestamp(record.timestamp)
             snippet = (record.content or "").replace("\n", " ").strip()
             if len(snippet) > 70:
                 snippet = snippet[:70] + "..."
@@ -136,6 +136,19 @@ class DiscordOrchestrator:
         if not lines:
             return answer_text
         return answer_text.rstrip() + "\n\n[参照メモリ]\n" + "\n".join(lines)
+
+    @staticmethod
+    def _format_jst_timestamp(timestamp_text: str) -> str:
+        if not timestamp_text:
+            return "unknown"
+        try:
+            parsed = datetime.fromisoformat(str(timestamp_text).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            jst = parsed.astimezone(timezone(timedelta(hours=9)))
+            return jst.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return str(timestamp_text)[:19]
 
     async def ingest_channel_history(
         self,

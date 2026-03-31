@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import logging
@@ -10,6 +11,7 @@ from typing import Iterable
 
 import discord
 from discord import app_commands
+from discord.ui import Button, View
 from dotenv import load_dotenv
 
 from discord_ai_agent.core.orchestrator import DiscordOrchestrator, load_orchestrator_config_from_env
@@ -90,6 +92,28 @@ async def send_response(
 
     for chunk in chunk_text(response_text, max_message_len):
         await interaction.followup.send(chunk)
+
+
+async def send_message_response(
+    message: discord.Message,
+    response_text: str,
+    max_message_len: int,
+) -> None:
+    if len(response_text) > MAX_TOTAL_INLINE:
+        summary = response_text[:700] + "\n\n(全文は添付ファイルを参照してください)"
+        file_obj = discord.File(
+            io.BytesIO(response_text.encode("utf-8")),
+            filename=ATTACHMENT_NAME,
+        )
+        await message.reply(summary, file=file_obj, mention_author=False)
+        return
+
+    chunks = chunk_text(response_text, max_message_len)
+    if not chunks:
+        return
+    await message.reply(chunks[0], mention_author=False)
+    for chunk in chunks[1:]:
+        await message.channel.send(chunk)
 
 
 def ensure_runtime_dirs(paths: Iterable[str]) -> None:
@@ -265,6 +289,13 @@ def main() -> None:
         os.getenv("MEMORY_BOOTSTRAP_INCLUDE_ARCHIVED_THREADS", "true").strip().lower() == "true"
     )
     bootstrap_archived_limit_per_parent = int(os.getenv("MEMORY_BOOTSTRAP_ARCHIVED_LIMIT_PER_PARENT", "0"))
+    mention_ask_enabled = os.getenv("MENTION_ASK_ENABLED", "true").strip().lower() == "true"
+    cli_approver_user_ids_raw = os.getenv("CLI_APPROVER_USER_IDS", "").strip()
+    cli_approver_user_ids = {
+        int(part.strip())
+        for part in cli_approver_user_ids_raw.split(",")
+        if part.strip().isdigit()
+    }
 
     orchestrator_config = load_orchestrator_config_from_env()
     ensure_runtime_dirs(
@@ -280,6 +311,61 @@ def main() -> None:
     intents.message_content = enable_message_content_intent
     client = discord.Client(intents=intents)
     tree = app_commands.CommandTree(client)
+
+    class CliApprovalView(View):
+        def __init__(
+            self,
+            command_text: str,
+            requester_id: int,
+            approver_ids: set[int],
+        ) -> None:
+            super().__init__(timeout=90)
+            self.command_text = command_text
+            self.requester_id = requester_id
+            self.approver_ids = approver_ids
+
+        def _is_approver(self, user_id: int) -> bool:
+            if self.approver_ids:
+                return user_id in self.approver_ids
+            return user_id == self.requester_id
+
+        @discord.ui.button(label="承認して実行", style=discord.ButtonStyle.success)
+        async def approve(self, interaction: discord.Interaction, button: Button) -> None:  # type: ignore[override]
+            if interaction.user is None or not self._is_approver(interaction.user.id):
+                await interaction.response.send_message("この操作を承認できる権限がありません。", ephemeral=True)
+                return
+
+            approval_token = os.getenv("CLI_APPROVAL_TOKEN", "").strip()
+            result = await asyncio.to_thread(
+                orchestrator.tool_registry.execute,
+                "run_local_cli",
+                {"command": self.command_text, "approval_token": approval_token},
+            )
+            rendered = result if len(result) <= 1700 else result[:1700] + "..."
+            self.disable_all_items()
+            await interaction.response.edit_message(
+                content=(
+                    "CLI実行を承認しました。\n"
+                    f"command: {self.command_text}\n\n"
+                    f"```text\n{rendered}\n```"
+                ),
+                view=self,
+            )
+
+        @discord.ui.button(label="拒否", style=discord.ButtonStyle.danger)
+        async def reject(self, interaction: discord.Interaction, button: Button) -> None:  # type: ignore[override]
+            if interaction.user is None or not self._is_approver(interaction.user.id):
+                await interaction.response.send_message("この操作を拒否できる権限がありません。", ephemeral=True)
+                return
+
+            self.disable_all_items()
+            await interaction.response.edit_message(
+                content=f"CLI実行は拒否されました。\ncommand: {self.command_text}",
+                view=self,
+            )
+
+        async def on_timeout(self) -> None:
+            self.disable_all_items()
 
     @tree.command(name="ask", description="AIアシスタントに質問します")
     @app_commands.describe(question="質問内容")
@@ -309,6 +395,69 @@ def main() -> None:
                 await interaction.followup.send("応答中にエラーが発生しました。時間をおいて再試行してください。")
             except Exception:
                 logger.exception("Failed to send error message to Discord")
+
+    @tree.command(name="memory_status", description="メモリ保存状況を確認します（管理用）")
+    async def memory_status(interaction: discord.Interaction) -> None:
+        if interaction.guild_id is None or interaction.guild_id not in allowed_guild_ids:
+            await interaction.response.send_message(
+                "このサーバーではこのBotを利用できません。",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            stats = await orchestrator.memory.get_guild_memory_stats(interaction.guild_id)
+            lines = [
+                f"guild: {stats.get('guild_id')}",
+                f"collections: {stats.get('collection_count')}",
+                f"total_records: {stats.get('total_records')}",
+                "",
+                "[top collections]",
+            ]
+            collections = stats.get("collections", [])
+            top = sorted(collections, key=lambda x: int(x.get("count", 0)), reverse=True)[:12]
+            for item in top:
+                lines.append(f"- {item.get('name')}: {item.get('count')}")
+
+            body = "\n".join(lines)
+            chunks = chunk_text(body, 1800)
+            for chunk in chunks:
+                await interaction.followup.send(chunk, ephemeral=True)
+        except Exception:
+            logger.exception("Failed to handle /memory_status")
+            await interaction.followup.send("メモリ状態の取得に失敗しました。", ephemeral=True)
+
+    @tree.command(name="runcli", description="承認付きで許可済みCLIコマンドを実行します")
+    @app_commands.describe(command="許可済みコマンドを入力（例: docker ps）")
+    async def runcli(interaction: discord.Interaction, command: str) -> None:
+        if interaction.guild_id is None or interaction.guild_id not in allowed_guild_ids:
+            await interaction.response.send_message(
+                "このサーバーではこのBotを利用できません。",
+                ephemeral=True,
+            )
+            return
+
+        clean_command = (command or "").strip()
+        if not clean_command:
+            await interaction.response.send_message("コマンドが空です。", ephemeral=True)
+            return
+
+        requester_id = interaction.user.id if interaction.user is not None else 0
+        view = CliApprovalView(
+            command_text=clean_command,
+            requester_id=requester_id,
+            approver_ids=cli_approver_user_ids,
+        )
+        await interaction.response.send_message(
+            (
+                "CLI実行リクエストを受け付けました。\n"
+                f"command: {clean_command}\n"
+                "承認者がボタンを押すと実行されます。"
+            ),
+            view=view,
+            ephemeral=False,
+        )
 
     @client.event
     async def on_ready() -> None:
@@ -363,6 +512,8 @@ def main() -> None:
 
     @client.event
     async def on_message(message: discord.Message) -> None:
+        if message.author.bot:
+            return
         if not enable_message_content_intent:
             return
         if message.guild is None:
@@ -397,6 +548,33 @@ def main() -> None:
                 save_ingest_cursor(orchestrator_config.chromadb_path, ingest_cursor)
         except Exception:
             logger.exception("Failed to ingest streaming message: guild=%s channel=%s", message.guild.id, message.channel.id)
+
+        if not mention_ask_enabled:
+            return
+        if client.user is None:
+            return
+        if client.user not in message.mentions:
+            return
+
+        question = (message.content or "").replace(client.user.mention, "").strip()
+        if not question:
+            return
+
+        try:
+            answer = await orchestrator.answer(
+                question=question,
+                guild_id=message.guild.id,
+                channel_id=message.channel.id,
+                user_id=message.author.id,
+                message_id=message.id,
+            )
+            await send_message_response(message, answer, max_message_len=max_message_len)
+        except Exception:
+            logger.exception("Failed to handle mention ask: guild=%s channel=%s", message.guild.id, message.channel.id)
+            try:
+                await message.reply("応答中にエラーが発生しました。時間をおいて再試行してください。", mention_author=False)
+            except Exception:
+                logger.exception("Failed to send mention error message")
 
     @tree.error
     async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:

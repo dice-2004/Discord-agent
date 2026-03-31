@@ -156,6 +156,36 @@ class ChannelMemoryStore:
             scope,
         )
 
+    async def get_guild_memory_stats(self, guild_id: int | None) -> dict[str, Any]:
+        return await asyncio.to_thread(self._get_guild_memory_stats_sync, guild_id)
+
+    def _get_guild_memory_stats_sync(self, guild_id: int | None) -> dict[str, Any]:
+        guild_part = str(guild_id) if guild_id is not None else "dm"
+        prefix = f"mem_g{guild_part}_"
+        collections = self._client.list_collections()
+        names: list[str] = []
+        for col in collections:
+            name = getattr(col, "name", "")
+            if isinstance(name, str) and name.startswith(prefix):
+                names.append(name)
+
+        stats: list[dict[str, Any]] = []
+        total = 0
+        for name in sorted(names):
+            try:
+                cnt = self._client.get_collection(name=name).count()
+            except Exception:
+                cnt = 0
+            total += int(cnt)
+            stats.append({"name": name, "count": int(cnt)})
+
+        return {
+            "guild_id": guild_id,
+            "collection_count": len(stats),
+            "total_records": total,
+            "collections": stats,
+        }
+
     def _fetch_relevant_messages_sync(
         self,
         guild_id: int | None,
