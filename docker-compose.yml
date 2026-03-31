@@ -1,0 +1,12 @@
+services:
+  discord-ai-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: discord-ai-agent
+    env_file:
+      - ./.env
+    volumes:
+      - ./data/chromadb:/app/data/chromadb
+      - ./data/profiles:/app/data/profiles
+    restart: unless-stopped

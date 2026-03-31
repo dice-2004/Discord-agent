@@ -1,0 +1,7 @@
+discord.py==2.5.2
+langchain==0.3.27
+langchain-core==0.3.75
+langchain-google-genai==2.1.8
+chromadb==1.0.15
+python-dotenv==1.1.1
+duckduckgo-search==7.5.5
