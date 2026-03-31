@@ -44,9 +44,46 @@ class DiscordOrchestrator:
             os.getenv("MEMORY_RESPONSE_INCLUDE_EVIDENCE", "false").strip().lower() == "true"
         )
         self.memory_response_evidence_items = int(os.getenv("MEMORY_RESPONSE_EVIDENCE_ITEMS", "3"))
+        self.persona_memory_enabled = os.getenv("PERSONA_MEMORY_ENABLED", "true").strip().lower() == "true"
+        self.persona_memory_include_in_prompt = (
+            os.getenv("PERSONA_MEMORY_INCLUDE_IN_PROMPT", "true").strip().lower() == "true"
+        )
+        self.persona_memory_max_facts = int(os.getenv("PERSONA_MEMORY_MAX_FACTS", "200"))
+        self.directional_memory_enabled = False
+        self.personal_guild_id: int | None = None
+        self.family_guild_ids: set[int] = set()
 
         genai.configure(api_key=config.gemini_api_key)
         self.model = genai.GenerativeModel(model_name=config.gemini_model)
+
+    def configure_directional_memory_policy(
+        self,
+        *,
+        enabled: bool,
+        personal_guild_id: int | None,
+        family_guild_ids: set[int],
+    ) -> None:
+        self.directional_memory_enabled = bool(enabled)
+        self.personal_guild_id = personal_guild_id if personal_guild_id and personal_guild_id > 0 else None
+        self.family_guild_ids = {gid for gid in family_guild_ids if gid > 0}
+
+    def _resolve_retrieval_guild_ids(self, guild_id: int | None) -> list[int] | None:
+        if guild_id is None:
+            return None
+        if not self.directional_memory_enabled:
+            return [guild_id]
+        if self.personal_guild_id is None:
+            return [guild_id]
+
+        # 個人サーバーのみ、身内サーバー群へ参照可能。逆方向と身内間参照は不可。
+        if guild_id == self.personal_guild_id:
+            ordered = [guild_id]
+            for gid in sorted(self.family_guild_ids):
+                if gid != guild_id:
+                    ordered.append(gid)
+            return ordered
+
+        return [guild_id]
 
     async def answer(
         self,
@@ -56,13 +93,22 @@ class DiscordOrchestrator:
         user_id: int,
         message_id: int | None,
     ) -> str:
-        history_records = await self.memory.fetch_relevant_messages(
-            guild_id=guild_id,
-            channel_id=channel_id,
-            query_text=question,
-            limit=self.memory_top_k,
-            scope=self.memory_scope,
-        )
+        retrieval_guild_ids = self._resolve_retrieval_guild_ids(guild_id)
+        if retrieval_guild_ids is not None and len(retrieval_guild_ids) > 1 and self.memory_scope == "guild":
+            history_records = await self.memory.fetch_relevant_messages_multi_guild(
+                guild_ids=retrieval_guild_ids,
+                channel_id=channel_id,
+                query_text=question,
+                limit=self.memory_top_k,
+            )
+        else:
+            history_records = await self.memory.fetch_relevant_messages(
+                guild_id=guild_id,
+                channel_id=channel_id,
+                query_text=question,
+                limit=self.memory_top_k,
+                scope=self.memory_scope,
+            )
         hit_channels = sorted(
             {
                 str((record.metadata or {}).get("channel_id", ""))
@@ -85,8 +131,24 @@ class DiscordOrchestrator:
             channel_tag = f" ch={source_channel}" if source_channel else ""
             context_lines.append(f"- [{record.timestamp}] {record.role}{channel_tag}: {record.content[:240]}")
         history_context = "\n".join(context_lines) if context_lines else "(関連履歴なし)"
+        persona_context = "(ユーザープロファイル未設定)"
+        if self.persona_memory_enabled and self.persona_memory_include_in_prompt:
+            try:
+                facts = await self.memory.get_user_profile_facts(user_id=user_id, limit=self.persona_memory_max_facts)
+                if facts:
+                    lines = []
+                    for fact in facts[:30]:
+                        k = str(fact.get("key", "")).strip()
+                        v = str(fact.get("value", "")).strip()
+                        if not k or not v:
+                            continue
+                        lines.append(f"- {k}: {v}")
+                    if lines:
+                        persona_context = "\n".join(lines)
+            except Exception:
+                logger.exception("Failed to load persona profile for prompt")
 
-        system_prompt = await self._build_system_prompt(history_context)
+        system_prompt = await self._build_system_prompt(history_context, persona_context)
 
         try:
             answer_text = await self._generate_with_tools(system_prompt, question)
@@ -480,7 +542,7 @@ class DiscordOrchestrator:
         except Exception:
             logger.exception("Failed to persist conversation memory")
 
-    async def _build_system_prompt(self, history_context: str) -> str:
+    async def _build_system_prompt(self, history_context: str, persona_context: str) -> str:
         profile_text = await self._load_profile_text()
         static_profile = profile_text if profile_text else "(initial profileは未設定)"
 
@@ -490,8 +552,11 @@ class DiscordOrchestrator:
             "\n- 必要時のみツールを使う"
             "\n- 回答は簡潔かつ実用的にまとめる"
             "\n- ユーザーの追加指示待ちにならないよう、自律的に必要情報を補って回答する"
+            "\n- ユーザー固有プロファイルがある場合は尊重し、矛盾時は最新の明示指示を優先する"
             "\n\n[Static Profile]\n"
             f"{static_profile}\n\n"
+            "[User Persona Memory]\n"
+            f"{persona_context}\n\n"
             "[Relevant Conversation Memory]\n"
             f"{history_context}"
         )

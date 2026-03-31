@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import logging
 import math
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -33,6 +34,7 @@ class ChannelMemoryStore:
         self._client = chromadb.PersistentClient(path=persist_dir)
         self._top_k = top_k
         self._embedding_dim = embedding_dim
+        self._persona_collection_name = os.getenv("PERSONA_MEMORY_COLLECTION", "persona_profiles").strip() or "persona_profiles"
 
     @staticmethod
     def _normalize_collection_name(guild_id: int | None, channel_id: int) -> str:
@@ -45,6 +47,140 @@ class ChannelMemoryStore:
         guild_part = str(guild_id) if guild_id is not None else "dm"
         raw = f"mem_g{guild_part}_all"
         return re.sub(r"[^a-zA-Z0-9_-]", "_", raw)
+
+    @staticmethod
+    def _normalize_persona_collection_name(name: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9_-]", "_", name)
+
+    @staticmethod
+    def _profile_fact_id(user_id: int, key: str) -> str:
+        return f"u{user_id}:{key.strip().lower()}"
+
+    async def set_user_profile_fact(
+        self,
+        user_id: int,
+        key: str,
+        value: str,
+        source: str = "manual",
+        confirmed: bool = True,
+    ) -> None:
+        await asyncio.to_thread(
+            self._set_user_profile_fact_sync,
+            user_id,
+            key,
+            value,
+            source,
+            confirmed,
+        )
+
+    def _set_user_profile_fact_sync(
+        self,
+        user_id: int,
+        key: str,
+        value: str,
+        source: str,
+        confirmed: bool,
+    ) -> None:
+        clean_key = (key or "").strip().lower()
+        clean_value = (value or "").strip()
+        if not clean_key or not clean_value:
+            return
+
+        col_name = self._normalize_persona_collection_name(self._persona_collection_name)
+        collection = self._client.get_or_create_collection(name=col_name)
+        fact_id = self._profile_fact_id(user_id, clean_key)
+        now = datetime.now(timezone.utc).isoformat()
+        metadata = {
+            "user_id": str(user_id),
+            "key": clean_key,
+            "source": (source or "manual").strip() or "manual",
+            "confirmed": bool(confirmed),
+            "updated_at": now,
+        }
+        doc = f"{clean_key}: {clean_value}"
+        collection.upsert(
+            ids=[fact_id],
+            documents=[doc],
+            metadatas=[metadata],
+            embeddings=[self._embed(doc)],
+        )
+
+    async def get_user_profile_facts(self, user_id: int, limit: int = 50) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._get_user_profile_facts_sync, user_id, limit)
+
+    def _get_user_profile_facts_sync(self, user_id: int, limit: int) -> list[dict[str, Any]]:
+        col_name = self._normalize_persona_collection_name(self._persona_collection_name)
+        try:
+            collection = self._client.get_collection(name=col_name)
+        except Exception:
+            return []
+
+        fetch_limit = max(int(limit), 1)
+        try:
+            result = collection.get(
+                where={"user_id": str(user_id)},
+                include=["documents", "metadatas"],
+                limit=fetch_limit,
+            )
+        except Exception:
+            logger.exception("Failed to get user profile facts: user_id=%s", user_id)
+            return []
+
+        docs = result.get("documents", []) or []
+        mds = result.get("metadatas", []) or []
+        facts: list[dict[str, Any]] = []
+        for idx, doc in enumerate(docs):
+            md = mds[idx] if idx < len(mds) else {}
+            key = str(md.get("key", "")).strip()
+            value = str(doc).split(":", 1)[1].strip() if ":" in str(doc) else str(doc).strip()
+            facts.append(
+                {
+                    "key": key,
+                    "value": value,
+                    "source": str(md.get("source", "")),
+                    "confirmed": bool(md.get("confirmed", False)),
+                    "updated_at": str(md.get("updated_at", "")),
+                }
+            )
+
+        facts.sort(key=lambda x: str(x.get("updated_at", "")), reverse=True)
+        return facts
+
+    async def forget_user_profile_fact(self, user_id: int, key: str | None = None) -> int:
+        return await asyncio.to_thread(self._forget_user_profile_fact_sync, user_id, key)
+
+    def _forget_user_profile_fact_sync(self, user_id: int, key: str | None) -> int:
+        col_name = self._normalize_persona_collection_name(self._persona_collection_name)
+        try:
+            collection = self._client.get_collection(name=col_name)
+        except Exception:
+            return 0
+
+        if key is not None and key.strip():
+            fact_id = self._profile_fact_id(user_id, key)
+            try:
+                collection.delete(ids=[fact_id])
+                return 1
+            except Exception:
+                logger.exception("Failed to delete profile fact: user_id=%s key=%s", user_id, key)
+                return 0
+
+        facts = self._get_user_profile_facts_sync(user_id, limit=1000)
+        if not facts:
+            return 0
+
+        deleted = 0
+        for fact in facts:
+            fact_key = str(fact.get("key", "")).strip()
+            if not fact_key:
+                continue
+            fact_id = self._profile_fact_id(user_id, fact_key)
+            try:
+                collection.delete(ids=[fact_id])
+                deleted += 1
+            except Exception:
+                continue
+        return deleted
 
     def _embed(self, text: str) -> list[float]:
         if not text:
@@ -154,6 +290,21 @@ class ChannelMemoryStore:
             query_text,
             limit or self._top_k,
             scope,
+        )
+
+    async def fetch_relevant_messages_multi_guild(
+        self,
+        guild_ids: list[int],
+        channel_id: int,
+        query_text: str,
+        limit: int | None = None,
+    ) -> list[MemoryRecord]:
+        return await asyncio.to_thread(
+            self._fetch_relevant_messages_multi_guild_sync,
+            guild_ids,
+            channel_id,
+            query_text,
+            limit or self._top_k,
         )
 
     async def get_guild_memory_stats(self, guild_id: int | None) -> dict[str, Any]:
@@ -280,6 +431,55 @@ class ChannelMemoryStore:
                     metadata=record.metadata,
                 )
             )
+            if len(records) >= limit:
+                break
+
+        return records
+
+    def _fetch_relevant_messages_multi_guild_sync(
+        self,
+        guild_ids: list[int],
+        channel_id: int,
+        query_text: str,
+        limit: int,
+    ) -> list[MemoryRecord]:
+        if not guild_ids:
+            return []
+
+        query_tokens = self._tokenize(query_text)
+        now_ts = datetime.now(timezone.utc).timestamp()
+        candidates: list[tuple[int, float, float, MemoryRecord]] = []
+
+        # Per-guildで広めに拾ってから全体で再ランクする。
+        per_guild_limit = max(limit * 3, 12)
+        for gid in guild_ids:
+            records = self._fetch_relevant_messages_sync(
+                guild_id=gid,
+                channel_id=channel_id,
+                query_text=query_text,
+                limit=per_guild_limit,
+                scope="guild",
+            )
+            for record in records:
+                overlap = self._overlap_score(query_tokens, self._tokenize(record.content))
+                recency_bonus = self._recency_score(record.timestamp, now_ts)
+                similarity = max(0.0, 1.0 - self._content_quality_penalty(record))
+                candidates.append((overlap, similarity, recency_bonus, record))
+
+        if not candidates:
+            return []
+
+        candidates.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+
+        records: list[MemoryRecord] = []
+        seen: set[str] = set()
+        for _, __, ___, record in candidates:
+            md = record.metadata or {}
+            key = f"{md.get('guild_id','')}:{md.get('channel_id','')}:{record.role}:{(record.content or '').strip()}"
+            if key in seen:
+                continue
+            seen.add(key)
+            records.append(record)
             if len(records) >= limit:
                 break
 

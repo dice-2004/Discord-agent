@@ -5,6 +5,7 @@ from typing import Any, Callable
 
 from discord_ai_agent.tools.cli_tools import run_local_cli
 from discord_ai_agent.tools.deep_dive_tools import source_deep_dive
+from discord_ai_agent.tools.n8n_tools import trigger_n8n_webhook
 from discord_ai_agent.tools.reader_tools import read_url_markdown
 from discord_ai_agent.tools.search_tools import web_search
 
@@ -116,6 +117,13 @@ def build_default_tool_registry() -> ToolRegistry:
             args_schema={"command": "string", "approval_token": "string"},
             required_args=["command", "approval_token"],
             func=run_local_cli,
+        ),
+        ToolSpec(
+            name="trigger_n8n_webhook",
+            description="許可済みactionのみn8n webhookへJSONをPOSTする",
+            args_schema={"action": "string", "payload_json": "string(JSON object)"},
+            required_args=["action"],
+            func=trigger_n8n_webhook,
         ),
     ]
     return ToolRegistry(specs)

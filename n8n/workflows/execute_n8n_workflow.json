@@ -1,0 +1,763 @@
+[
+  {
+    "id": "CQ6P0owt0ZMIzZP6",
+    "name": "execute_n8n_workflow",
+    "nodes": [
+      {
+        "parameters": {
+          "httpMethod": "POST",
+          "path": "execute_n8n_workflow",
+          "responseMode": "responseNode",
+          "options": {}
+        },
+        "type": "n8n-nodes-base.webhook",
+        "typeVersion": 2.1,
+        "position": [
+          -560,
+          -20
+        ],
+        "id": "node-webhook",
+        "name": "Webhook",
+        "webhookId": "115f552d-845c-4900-89d4-4b61050e5c4f"
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict",
+              "version": 3
+            },
+            "conditions": [
+              {
+                "leftValue": "={{ ($json.body.token || '').toString().trim() }}",
+                "rightValue": "={{ $env.N8N_WEBHOOK_TOKEN }}",
+                "operator": {
+                  "type": "string",
+                  "operation": "equals",
+                  "name": "filter.operator.equals"
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          -320,
+          -20
+        ],
+        "id": "node-if-token",
+        "name": "If Token Valid"
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict",
+              "version": 3
+            },
+            "conditions": [
+              {
+                "leftValue": "={{ $json.body.action }}",
+                "rightValue": "add_calendar_event",
+                "operator": {
+                  "type": "string",
+                  "operation": "equals",
+                  "name": "filter.operator.equals"
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          -80,
+          -120
+        ],
+        "id": "node-if-add",
+        "name": "If add_calendar_event"
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict",
+              "version": 3
+            },
+            "conditions": [
+              {
+                "leftValue": "={{ $json.body.action }}",
+                "rightValue": "get_calendar_events",
+                "operator": {
+                  "type": "string",
+                  "operation": "equals",
+                  "name": "filter.operator.equals"
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          180,
+          -120
+        ],
+        "id": "node-if-get",
+        "name": "If get_calendar_events"
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict",
+              "version": 3
+            },
+            "conditions": [
+              {
+                "leftValue": "={{ $json.body.action }}",
+                "rightValue": "add_notion_memo",
+                "operator": {
+                  "type": "string",
+                  "operation": "equals",
+                  "name": "filter.operator.equals"
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          440,
+          -120
+        ],
+        "id": "node-if-send",
+        "name": "If add_notion_memo"
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict",
+              "version": 3
+            },
+            "conditions": [
+              {
+                "leftValue": "={{ $json.body.action }}",
+                "rightValue": "append_sheet_row",
+                "operator": {
+                  "type": "string",
+                  "operation": "equals",
+                  "name": "filter.operator.equals"
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          700,
+          -120
+        ],
+        "id": "node-if-sheet",
+        "name": "If append_sheet_row"
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict",
+              "version": 3
+            },
+            "conditions": [
+              {
+                "leftValue": "={{ $json.body.action }}",
+                "rightValue": "create_github_issue",
+                "operator": {
+                  "type": "string",
+                  "operation": "equals",
+                  "name": "filter.operator.equals"
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          960,
+          -120
+        ],
+        "id": "node-if-issue",
+        "name": "If create_github_issue"
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict",
+              "version": 3
+            },
+            "conditions": [
+              {
+                "leftValue": "={{ $json.body.action }}",
+                "rightValue": "send_email",
+                "operator": {
+                  "type": "string",
+                  "operation": "equals",
+                  "name": "filter.operator.equals"
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          1220,
+          -120
+        ],
+        "id": "node-if-line",
+        "name": "If send_email"
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict",
+              "version": 3
+            },
+            "conditions": [
+              {
+                "leftValue": "={{ $json.body.action }}",
+                "rightValue": "backup_server_data",
+                "operator": {
+                  "type": "string",
+                  "operation": "equals",
+                  "name": "filter.operator.equals"
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          1480,
+          -120
+        ],
+        "id": "node-if-backup",
+        "name": "If backup_server_data"
+      },
+      {
+        "parameters": {
+          "respondWith": "json",
+          "responseBody": "={{ { status: 'ok', action: 'add_calendar_event', note: 'stub-success' } }}",
+          "options": {
+            "responseCode": 200
+          }
+        },
+        "type": "n8n-nodes-base.respondToWebhook",
+        "typeVersion": 1.5,
+        "position": [
+          160,
+          -240
+        ],
+        "id": "node-response-add",
+        "name": "Respond add_calendar_event"
+      },
+      {
+        "parameters": {
+          "respondWith": "json",
+          "responseBody": "={{ { status: 'ok', action: 'get_calendar_events', note: 'stub-success' } }}",
+          "options": {
+            "responseCode": 200
+          }
+        },
+        "type": "n8n-nodes-base.respondToWebhook",
+        "typeVersion": 1.5,
+        "position": [
+          420,
+          -240
+        ],
+        "id": "node-response-get",
+        "name": "Respond get_calendar_events"
+      },
+      {
+        "parameters": {
+          "respondWith": "json",
+          "responseBody": "={{ { status: 'ok', action: 'add_notion_memo', note: 'stub-success' } }}",
+          "options": {
+            "responseCode": 200
+          }
+        },
+        "type": "n8n-nodes-base.respondToWebhook",
+        "typeVersion": 1.5,
+        "position": [
+          680,
+          -240
+        ],
+        "id": "node-response-send",
+        "name": "Respond add_notion_memo"
+      },
+      {
+        "parameters": {
+          "respondWith": "json",
+          "responseBody": "={{ { status: 'ok', action: 'append_sheet_row', note: 'stub-success' } }}",
+          "options": {
+            "responseCode": 200
+          }
+        },
+        "type": "n8n-nodes-base.respondToWebhook",
+        "typeVersion": 1.5,
+        "position": [
+          940,
+          -240
+        ],
+        "id": "node-response-sheet",
+        "name": "Respond append_sheet_row"
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict",
+              "version": 3
+            },
+            "conditions": [
+              {
+                "leftValue": "={{ ($env.GITHUB_TOKEN || '').trim() }}",
+                "rightValue": "",
+                "operator": {
+                  "type": "string",
+                  "operation": "notEmpty",
+                  "singleValue": true
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          1200,
+          -240
+        ],
+        "id": "node-if-github-config",
+        "name": "If GitHub token configured"
+      },
+      {
+        "parameters": {
+          "jsCode": "const repository = String($json.body?.parameters?.repository || '').trim();\nconst title = String($json.body?.parameters?.title || '').trim();\nconst body = String($json.body?.parameters?.body || '');\nconst token = String($env.GITHUB_TOKEN || '').trim();\n\nif (!repository || !title) {\n  return [{\n    json: {\n      statusCode: 400,\n      body: { message: 'repository and title are required' }\n    }\n  }];\n}\n\nif (!token) {\n  return [{\n    json: {\n      statusCode: 503,\n      body: { message: 'Set GITHUB_TOKEN in n8n environment.' }\n    }\n  }];\n}\n\ntry {\n  const response = await this.helpers.httpRequest({\n    method: 'POST',\n    url: `https://api.github.com/repos/${repository}/issues`,\n    headers: {\n      'Accept': 'application/vnd.github+json',\n      'Authorization': `Bearer ${token}`,\n      'X-GitHub-Api-Version': '2022-11-28'\n    },\n    body: { title, body },\n    json: true,\n    resolveWithFullResponse: true,\n    simple: false\n  });\n\n  return [{\n    json: {\n      statusCode: Number(response.statusCode || 500),\n      body: response.body || {}\n    }\n  }];\n} catch (error) {\n  const status = Number(error?.statusCode || error?.response?.statusCode || 502);\n  const message = error?.response?.body?.message || error?.message || String(error);\n  return [{\n    json: {\n      statusCode: status,\n      body: { message }\n    }\n  }];\n}"
+        },
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          1460,
+          -320
+        ],
+        "id": "node-github-create-issue",
+        "name": "GitHub create issue"
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict",
+              "version": 3
+            },
+            "conditions": [
+              {
+                "leftValue": "={{ String($json.statusCode || '') }}",
+                "rightValue": "201",
+                "operator": {
+                  "type": "string",
+                  "operation": "equals",
+                  "name": "filter.operator.equals"
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          1720,
+          -320
+        ],
+        "id": "node-if-github-created",
+        "name": "If GitHub issue created"
+      },
+      {
+        "parameters": {
+          "respondWith": "json",
+          "responseBody": "={{ { status: 'ok', action: 'create_github_issue', issue_number: $json.body.number, issue_url: $json.body.html_url, repository: $json.body.repository_url } }}",
+          "options": {
+            "responseCode": 200
+          }
+        },
+        "type": "n8n-nodes-base.respondToWebhook",
+        "typeVersion": 1.5,
+        "position": [
+          1980,
+          -420
+        ],
+        "id": "node-response-issue-success",
+        "name": "Respond create_github_issue success"
+      },
+      {
+        "parameters": {
+          "respondWith": "json",
+          "responseBody": "={{ { status: 'error', code: 'github_not_configured', action: 'create_github_issue', detail: 'Set GITHUB_TOKEN in n8n environment.' } }}",
+          "options": {
+            "responseCode": 503
+          }
+        },
+        "type": "n8n-nodes-base.respondToWebhook",
+        "typeVersion": 1.5,
+        "position": [
+          1460,
+          -160
+        ],
+        "id": "node-response-issue-not-configured",
+        "name": "Respond create_github_issue not configured"
+      },
+      {
+        "parameters": {
+          "respondWith": "json",
+          "responseBody": "={{ { status: 'error', code: 'github_issue_create_failed', action: 'create_github_issue', status_code: $json.statusCode || 500, detail: $json.body?.message || 'GitHub API request failed' } }}",
+          "options": {
+            "responseCode": "={{ Number($json.statusCode || 500) }}"
+          }
+        },
+        "type": "n8n-nodes-base.respondToWebhook",
+        "typeVersion": 1.5,
+        "position": [
+          1980,
+          -240
+        ],
+        "id": "node-response-issue-failed",
+        "name": "Respond create_github_issue failed"
+      },
+      {
+        "parameters": {
+          "respondWith": "json",
+          "responseBody": "={{ { status: 'ok', action: 'send_email', note: 'stub-success' } }}",
+          "options": {
+            "responseCode": 200
+          }
+        },
+        "type": "n8n-nodes-base.respondToWebhook",
+        "typeVersion": 1.5,
+        "position": [
+          1460,
+          -240
+        ],
+        "id": "node-response-line",
+        "name": "Respond send_email"
+      },
+      {
+        "parameters": {
+          "respondWith": "json",
+          "responseBody": "={{ { status: 'ok', action: 'backup_server_data', note: 'stub-success' } }}",
+          "options": {
+            "responseCode": 200
+          }
+        },
+        "type": "n8n-nodes-base.respondToWebhook",
+        "typeVersion": 1.5,
+        "position": [
+          1720,
+          -240
+        ],
+        "id": "node-response-backup",
+        "name": "Respond backup_server_data"
+      },
+      {
+        "parameters": {
+          "respondWith": "json",
+          "responseBody": "={{ { status: 'error', code: 'unsupported_action', action: $json.body.action || '' } }}",
+          "options": {
+            "responseCode": 400
+          }
+        },
+        "type": "n8n-nodes-base.respondToWebhook",
+        "typeVersion": 1.5,
+        "position": [
+          1720,
+          -20
+        ],
+        "id": "node-response-unsupported",
+        "name": "Respond unsupported action"
+      },
+      {
+        "parameters": {
+          "respondWith": "json",
+          "responseBody": "={{ { status: 'error', code: 'invalid_webhook_token' } }}",
+          "options": {
+            "responseCode": 403
+          }
+        },
+        "type": "n8n-nodes-base.respondToWebhook",
+        "typeVersion": 1.5,
+        "position": [
+          -80,
+          100
+        ],
+        "id": "node-response-token-invalid",
+        "name": "Respond invalid token"
+      }
+    ],
+    "connections": {
+      "Webhook": {
+        "main": [
+          [
+            {
+              "node": "If Token Valid",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "If Token Valid": {
+        "main": [
+          [
+            {
+              "node": "If add_calendar_event",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Respond invalid token",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "If add_calendar_event": {
+        "main": [
+          [
+            {
+              "node": "Respond add_calendar_event",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "If get_calendar_events",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "If get_calendar_events": {
+        "main": [
+          [
+            {
+              "node": "Respond get_calendar_events",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "If add_notion_memo",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "If add_notion_memo": {
+        "main": [
+          [
+            {
+              "node": "Respond add_notion_memo",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "If append_sheet_row",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "If append_sheet_row": {
+        "main": [
+          [
+            {
+              "node": "Respond append_sheet_row",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "If create_github_issue",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "If create_github_issue": {
+        "main": [
+          [
+            {
+              "node": "If GitHub token configured",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "If send_email",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "If GitHub token configured": {
+        "main": [
+          [
+            {
+              "node": "GitHub create issue",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Respond create_github_issue not configured",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "GitHub create issue": {
+        "main": [
+          [
+            {
+              "node": "If GitHub issue created",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "If GitHub issue created": {
+        "main": [
+          [
+            {
+              "node": "Respond create_github_issue success",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Respond create_github_issue failed",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "If send_email": {
+        "main": [
+          [
+            {
+              "node": "Respond send_email",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "If backup_server_data",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "If backup_server_data": {
+        "main": [
+          [
+            {
+              "node": "Respond backup_server_data",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Respond unsupported action",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "settings": {
+      "executionOrder": "v1",
+      "binaryMode": "separate"
+    }
+  }
+]

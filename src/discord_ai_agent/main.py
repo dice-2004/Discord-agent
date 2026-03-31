@@ -5,7 +5,8 @@ import io
 import json
 import logging
 import os
-from datetime import timezone
+import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -19,6 +20,7 @@ from discord_ai_agent.core.orchestrator import DiscordOrchestrator, load_orchest
 MAX_TOTAL_INLINE = 15000
 ATTACHMENT_NAME = "ask_response.txt"
 CURSOR_FILE_NAME = "memory_ingest_cursor.json"
+RUNCLI_AUDIT_LOG_DEFAULT = "./data/audit/runcli_audit.jsonl"
 
 
 def setup_logging() -> None:
@@ -159,6 +161,119 @@ def _cursor_key(guild_id: int | None, channel_id: int) -> str:
     return f"{guild_id or 0}:{channel_id}"
 
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def resolve_runcli_audit_log_path() -> Path:
+    raw = os.getenv("RUNCLI_AUDIT_LOG_PATH", RUNCLI_AUDIT_LOG_DEFAULT).strip()
+    path = Path(raw or RUNCLI_AUDIT_LOG_DEFAULT)
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    return path
+
+
+def append_runcli_audit(path: Path, payload: dict[str, object]) -> None:
+    logger = logging.getLogger(__name__)
+    row = {"ts": _utc_now_iso(), **payload}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fp:
+            fp.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        logger.exception("Failed to append runcli audit log")
+
+
+def read_runcli_audit_tail(path: Path, limit: int) -> list[dict[str, object]]:
+    if limit <= 0:
+        return []
+    if not path.exists():
+        return []
+
+    try:
+        with path.open("r", encoding="utf-8") as fp:
+            lines = fp.readlines()
+    except Exception:
+        logging.getLogger(__name__).exception("Failed to read runcli audit log")
+        return []
+
+    rows: list[dict[str, object]] = []
+    for row in lines[-limit:]:
+        raw = row.strip()
+        if not raw:
+            continue
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            rows.append(parsed)
+    return rows
+
+
+def _tokenize_for_logsearch(text: str) -> set[str]:
+    if not text:
+        return set()
+    return set(re.findall(r"[a-zA-Z0-9_\-]+|[一-龥]{2,}|[ぁ-ん]{2,}|[ァ-ンー]{2,}", text.lower()))
+
+
+def _logsearch_overlap_score(keyword: str, content: str) -> float:
+    q_tokens = _tokenize_for_logsearch(keyword)
+    if not q_tokens:
+        return 0.0
+    c_tokens = _tokenize_for_logsearch(content)
+    if not c_tokens:
+        return 0.0
+    hit = len(q_tokens.intersection(c_tokens))
+    return hit / max(len(q_tokens), 1)
+
+
+def _logsearch_recency_score(timestamp_text: str) -> float:
+    if not timestamp_text:
+        return 0.15
+    try:
+        parsed = datetime.fromisoformat(str(timestamp_text).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        days = max((now - parsed.astimezone(timezone.utc)).total_seconds() / 86400.0, 0.0)
+        if days <= 1:
+            return 1.0
+        if days <= 7:
+            return 0.82
+        if days <= 30:
+            return 0.56
+        if days <= 90:
+            return 0.34
+        return 0.18
+    except Exception:
+        return 0.15
+
+
+def _safe_float_env(name: str, default: float) -> float:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _parse_int_set_env(name: str) -> set[int]:
+    raw = os.getenv(name, "").strip()
+    values: set[int] = set()
+    if not raw:
+        return values
+    for part in raw.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        try:
+            values.add(int(item))
+        except ValueError:
+            logging.getLogger(__name__).warning("Ignore invalid integer in %s: %s", name, item)
+    return values
+
+
 def iter_bootstrap_channels(guild: discord.Guild) -> list[discord.abc.MessageableChannel]:
     by_id: dict[int, discord.abc.MessageableChannel] = {}
     for channel in guild.text_channels:
@@ -290,7 +405,33 @@ def main() -> None:
     )
     bootstrap_archived_limit_per_parent = int(os.getenv("MEMORY_BOOTSTRAP_ARCHIVED_LIMIT_PER_PARENT", "0"))
     mention_ask_enabled = os.getenv("MENTION_ASK_ENABLED", "true").strip().lower() == "true"
+    logsearch_default_scope = os.getenv("LOGSEARCH_DEFAULT_SCOPE", "guild").strip().lower()
+    if logsearch_default_scope not in {"channel", "guild"}:
+        logsearch_default_scope = "guild"
     cli_approver_user_ids_raw = os.getenv("CLI_APPROVER_USER_IDS", "").strip()
+    runcli_audit_tail_default = int(os.getenv("RUNCLI_AUDIT_TAIL_DEFAULT", "20"))
+    if runcli_audit_tail_default < 1:
+        runcli_audit_tail_default = 20
+    runcli_audit_event_filter_default = os.getenv("RUNCLI_AUDIT_EVENT_FILTER_DEFAULT", "all").strip().lower()
+    if not runcli_audit_event_filter_default:
+        runcli_audit_event_filter_default = "all"
+    logsearch_include_score = os.getenv("LOGSEARCH_INCLUDE_SCORE", "true").strip().lower() == "true"
+    score_overlap_weight = _safe_float_env("LOGSEARCH_SCORE_OVERLAP_WEIGHT", 0.7)
+    score_recency_weight = _safe_float_env("LOGSEARCH_SCORE_RECENCY_WEIGHT", 0.3)
+    if score_overlap_weight < 0:
+        score_overlap_weight = 0.0
+    if score_recency_weight < 0:
+        score_recency_weight = 0.0
+    weight_sum = score_overlap_weight + score_recency_weight
+    if weight_sum <= 0:
+        score_overlap_weight, score_recency_weight = 0.7, 0.3
+    else:
+        score_overlap_weight /= weight_sum
+        score_recency_weight /= weight_sum
+    persona_memory_enabled = os.getenv("PERSONA_MEMORY_ENABLED", "true").strip().lower() == "true"
+    directional_memory_enabled = os.getenv("DIRECTIONAL_MEMORY_ENABLED", "false").strip().lower() == "true"
+    personal_guild_id = int(os.getenv("PERSONAL_GUILD_ID", "0") or 0)
+    family_guild_ids = _parse_int_set_env("FAMILY_GUILD_IDS")
     cli_approver_user_ids = {
         int(part.strip())
         for part in cli_approver_user_ids_raw.split(",")
@@ -298,13 +439,20 @@ def main() -> None:
     }
 
     orchestrator_config = load_orchestrator_config_from_env()
+    runcli_audit_log_path = resolve_runcli_audit_log_path()
     ensure_runtime_dirs(
         [
             orchestrator_config.chromadb_path,
             str(Path(orchestrator_config.profile_path).parent),
+            str(runcli_audit_log_path.parent),
         ]
     )
     orchestrator = DiscordOrchestrator(orchestrator_config)
+    orchestrator.configure_directional_memory_policy(
+        enabled=directional_memory_enabled,
+        personal_guild_id=personal_guild_id if personal_guild_id > 0 else None,
+        family_guild_ids=family_guild_ids,
+    )
     ingest_cursor = load_ingest_cursor(orchestrator_config.chromadb_path)
 
     intents = discord.Intents.default()
@@ -318,11 +466,17 @@ def main() -> None:
             command_text: str,
             requester_id: int,
             approver_ids: set[int],
+            guild_id: int,
+            channel_id: int,
+            audit_log_path: Path,
         ) -> None:
             super().__init__(timeout=90)
             self.command_text = command_text
             self.requester_id = requester_id
             self.approver_ids = approver_ids
+            self.guild_id = guild_id
+            self.channel_id = channel_id
+            self.audit_log_path = audit_log_path
 
         def _is_approver(self, user_id: int) -> bool:
             if self.approver_ids:
@@ -332,8 +486,31 @@ def main() -> None:
         @discord.ui.button(label="承認して実行", style=discord.ButtonStyle.success)
         async def approve(self, interaction: discord.Interaction, button: Button) -> None:  # type: ignore[override]
             if interaction.user is None or not self._is_approver(interaction.user.id):
+                append_runcli_audit(
+                    self.audit_log_path,
+                    {
+                        "event": "unauthorized_approve",
+                        "guild_id": self.guild_id,
+                        "channel_id": self.channel_id,
+                        "requester_id": self.requester_id,
+                        "actor_id": interaction.user.id if interaction.user else 0,
+                        "command": self.command_text,
+                    },
+                )
                 await interaction.response.send_message("この操作を承認できる権限がありません。", ephemeral=True)
                 return
+
+            append_runcli_audit(
+                self.audit_log_path,
+                {
+                    "event": "approved",
+                    "guild_id": self.guild_id,
+                    "channel_id": self.channel_id,
+                    "requester_id": self.requester_id,
+                    "actor_id": interaction.user.id,
+                    "command": self.command_text,
+                },
+            )
 
             approval_token = os.getenv("CLI_APPROVAL_TOKEN", "").strip()
             result = await asyncio.to_thread(
@@ -341,6 +518,27 @@ def main() -> None:
                 "run_local_cli",
                 {"command": self.command_text, "approval_token": approval_token},
             )
+            exit_code: int | None = None
+            if result.startswith("[exit="):
+                try:
+                    exit_code = int(result.split("]", 1)[0].replace("[exit=", ""))
+                except Exception:
+                    exit_code = None
+
+            append_runcli_audit(
+                self.audit_log_path,
+                {
+                    "event": "executed",
+                    "guild_id": self.guild_id,
+                    "channel_id": self.channel_id,
+                    "requester_id": self.requester_id,
+                    "actor_id": interaction.user.id,
+                    "command": self.command_text,
+                    "exit_code": exit_code,
+                    "result_preview": result[:280],
+                },
+            )
+
             rendered = result if len(result) <= 1700 else result[:1700] + "..."
             self.disable_all_items()
             await interaction.response.edit_message(
@@ -355,9 +553,31 @@ def main() -> None:
         @discord.ui.button(label="拒否", style=discord.ButtonStyle.danger)
         async def reject(self, interaction: discord.Interaction, button: Button) -> None:  # type: ignore[override]
             if interaction.user is None or not self._is_approver(interaction.user.id):
+                append_runcli_audit(
+                    self.audit_log_path,
+                    {
+                        "event": "unauthorized_reject",
+                        "guild_id": self.guild_id,
+                        "channel_id": self.channel_id,
+                        "requester_id": self.requester_id,
+                        "actor_id": interaction.user.id if interaction.user else 0,
+                        "command": self.command_text,
+                    },
+                )
                 await interaction.response.send_message("この操作を拒否できる権限がありません。", ephemeral=True)
                 return
 
+            append_runcli_audit(
+                self.audit_log_path,
+                {
+                    "event": "rejected",
+                    "guild_id": self.guild_id,
+                    "channel_id": self.channel_id,
+                    "requester_id": self.requester_id,
+                    "actor_id": interaction.user.id,
+                    "command": self.command_text,
+                },
+            )
             self.disable_all_items()
             await interaction.response.edit_message(
                 content=f"CLI実行は拒否されました。\ncommand: {self.command_text}",
@@ -428,6 +648,118 @@ def main() -> None:
             logger.exception("Failed to handle /memory_status")
             await interaction.followup.send("メモリ状態の取得に失敗しました。", ephemeral=True)
 
+    @tree.command(name="profile_show", description="保存されたユーザープロファイルを表示します")
+    @app_commands.describe(limit="表示件数(1-50)")
+    async def profile_show(
+        interaction: discord.Interaction,
+        limit: app_commands.Range[int, 1, 50] = 20,
+    ) -> None:
+        if interaction.guild_id is None or interaction.guild_id not in allowed_guild_ids:
+            await interaction.response.send_message(
+                "このサーバーではこのBotを利用できません。",
+                ephemeral=True,
+            )
+            return
+        if not persona_memory_enabled:
+            await interaction.response.send_message("ペルソナ記憶は無効です。", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            facts = await orchestrator.memory.get_user_profile_facts(user_id=interaction.user.id, limit=int(limit))
+            if not facts:
+                await interaction.followup.send("保存されたプロファイルはありません。", ephemeral=True)
+                return
+
+            lines = [f"user_id: {interaction.user.id}", f"facts: {len(facts)}", ""]
+            for idx, fact in enumerate(facts, start=1):
+                key = str(fact.get("key", ""))
+                value = str(fact.get("value", ""))
+                if len(value) > 140:
+                    value = value[:137] + "..."
+                updated = str(fact.get("updated_at", ""))
+                lines.append(f"{idx}. {key} = {value} (updated={updated})")
+
+            body = "\n".join(lines)
+            for chunk in chunk_text(body, 1800):
+                await interaction.followup.send(chunk, ephemeral=True)
+        except Exception:
+            logger.exception("Failed to handle /profile_show")
+            await interaction.followup.send("プロフィール取得に失敗しました。", ephemeral=True)
+
+    @tree.command(name="profile_set", description="ユーザープロファイルを保存または更新します")
+    @app_commands.describe(key="項目名", value="値")
+    async def profile_set(interaction: discord.Interaction, key: str, value: str) -> None:
+        if interaction.guild_id is None or interaction.guild_id not in allowed_guild_ids:
+            await interaction.response.send_message(
+                "このサーバーではこのBotを利用できません。",
+                ephemeral=True,
+            )
+            return
+        if not persona_memory_enabled:
+            await interaction.response.send_message("ペルソナ記憶は無効です。", ephemeral=True)
+            return
+
+        clean_key = (key or "").strip().lower()
+        clean_value = (value or "").strip()
+        if not clean_key or not clean_value:
+            await interaction.response.send_message("key/value は空にできません。", ephemeral=True)
+            return
+        if len(clean_key) > 48:
+            await interaction.response.send_message("key は48文字以内で指定してください。", ephemeral=True)
+            return
+        if len(clean_value) > 500:
+            await interaction.response.send_message("value は500文字以内で指定してください。", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            await orchestrator.memory.set_user_profile_fact(
+                user_id=interaction.user.id,
+                key=clean_key,
+                value=clean_value,
+                source="manual",
+                confirmed=True,
+            )
+            await interaction.followup.send(f"保存しました: {clean_key}", ephemeral=True)
+        except Exception:
+            logger.exception("Failed to handle /profile_set")
+            await interaction.followup.send("プロフィール保存に失敗しました。", ephemeral=True)
+
+    @tree.command(name="profile_forget", description="ユーザープロファイルを削除します")
+    @app_commands.describe(key="削除する項目名（未指定で全削除）")
+    async def profile_forget(interaction: discord.Interaction, key: str = "") -> None:
+        if interaction.guild_id is None or interaction.guild_id not in allowed_guild_ids:
+            await interaction.response.send_message(
+                "このサーバーではこのBotを利用できません。",
+                ephemeral=True,
+            )
+            return
+        if not persona_memory_enabled:
+            await interaction.response.send_message("ペルソナ記憶は無効です。", ephemeral=True)
+            return
+
+        clean_key = (key or "").strip().lower()
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            deleted = await orchestrator.memory.forget_user_profile_fact(
+                user_id=interaction.user.id,
+                key=clean_key if clean_key else None,
+            )
+            if clean_key:
+                await interaction.followup.send(
+                    f"項目削除: {clean_key} (deleted={deleted})",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(
+                    f"プロフィール全削除を実行しました (deleted={deleted})",
+                    ephemeral=True,
+                )
+        except Exception:
+            logger.exception("Failed to handle /profile_forget")
+            await interaction.followup.send("プロフィール削除に失敗しました。", ephemeral=True)
+
     @tree.command(name="runcli", description="承認付きで許可済みCLIコマンドを実行します")
     @app_commands.describe(command="許可済みコマンドを入力（例: docker ps）")
     async def runcli(interaction: discord.Interaction, command: str) -> None:
@@ -444,10 +776,23 @@ def main() -> None:
             return
 
         requester_id = interaction.user.id if interaction.user is not None else 0
+        append_runcli_audit(
+            runcli_audit_log_path,
+            {
+                "event": "requested",
+                "guild_id": interaction.guild_id,
+                "channel_id": interaction.channel_id,
+                "requester_id": requester_id,
+                "command": clean_command,
+            },
+        )
         view = CliApprovalView(
             command_text=clean_command,
             requester_id=requester_id,
             approver_ids=cli_approver_user_ids,
+            guild_id=int(interaction.guild_id),
+            channel_id=int(interaction.channel_id),
+            audit_log_path=runcli_audit_log_path,
         )
         await interaction.response.send_message(
             (
@@ -459,17 +804,241 @@ def main() -> None:
             ephemeral=False,
         )
 
+    @tree.command(name="runcli_audit", description="runcli監査ログの直近イベントを確認します")
+    @app_commands.describe(limit="取得件数(1-50)", event="event種別フィルタ")
+    @app_commands.choices(
+        event=[
+            app_commands.Choice(name="default", value="default"),
+            app_commands.Choice(name="all", value="all"),
+            app_commands.Choice(name="requested", value="requested"),
+            app_commands.Choice(name="approved", value="approved"),
+            app_commands.Choice(name="rejected", value="rejected"),
+            app_commands.Choice(name="executed", value="executed"),
+            app_commands.Choice(name="unauthorized_approve", value="unauthorized_approve"),
+            app_commands.Choice(name="unauthorized_reject", value="unauthorized_reject"),
+        ]
+    )
+    async def runcli_audit(
+        interaction: discord.Interaction,
+        limit: app_commands.Range[int, 1, 50] | None = None,
+        event: app_commands.Choice[str] | None = None,
+    ) -> None:
+        if interaction.guild_id is None or interaction.guild_id not in allowed_guild_ids:
+            await interaction.response.send_message(
+                "このサーバーではこのBotを利用できません。",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            fetch_limit = int(limit) if limit is not None else runcli_audit_tail_default
+            rows = await asyncio.to_thread(read_runcli_audit_tail, runcli_audit_log_path, fetch_limit)
+            selected_event = event.value if event is not None else "default"
+            event_filter = runcli_audit_event_filter_default if selected_event == "default" else selected_event
+            if event_filter != "all":
+                rows = [row for row in rows if str(row.get("event", "")).strip().lower() == event_filter]
+            if not rows:
+                await interaction.followup.send("監査ログはまだありません。", ephemeral=True)
+                return
+
+            lines = [
+                f"path: {runcli_audit_log_path}",
+                f"event_filter: {event_filter}",
+                f"events: {len(rows)}",
+                "",
+            ]
+            for idx, row in enumerate(rows, start=1):
+                ts = str(row.get("ts", "-"))
+                event = str(row.get("event", "-"))
+                actor = str(row.get("actor_id", row.get("requester_id", "-")))
+                command = str(row.get("command", "-"))
+                if len(command) > 64:
+                    command = command[:61] + "..."
+                lines.append(f"{idx}. [{ts}] {event} actor={actor} cmd={command}")
+
+            body = "\n".join(lines)
+            for chunk in chunk_text(body, 1800):
+                await interaction.followup.send(chunk, ephemeral=True)
+        except Exception:
+            logger.exception("Failed to handle /runcli_audit")
+            await interaction.followup.send("監査ログの取得に失敗しました。", ephemeral=True)
+
+    @tree.command(name="readurl", description="URL本文を取得して確認します")
+    @app_commands.describe(url="読み取り対象URL")
+    async def readurl(interaction: discord.Interaction, url: str) -> None:
+        if interaction.guild_id is None or interaction.guild_id not in allowed_guild_ids:
+            await interaction.response.send_message(
+                "このサーバーではこのBotを利用できません。",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(thinking=True)
+        try:
+            result = await asyncio.to_thread(
+                orchestrator.tool_registry.execute,
+                "read_url_markdown",
+                {"url": url},
+            )
+            await send_response(interaction, result, max_message_len=max_message_len)
+        except Exception:
+            logger.exception("Failed to handle /readurl")
+            await interaction.followup.send("URL本文の取得に失敗しました。")
+
+    @tree.command(name="deepdive", description="ソース特化で調査します")
+    @app_commands.describe(topic="調査トピック", source="対象ソース")
+    @app_commands.choices(
+        source=[
+            app_commands.Choice(name="auto", value="auto"),
+            app_commands.Choice(name="github", value="github"),
+            app_commands.Choice(name="reddit", value="reddit"),
+            app_commands.Choice(name="youtube", value="youtube"),
+            app_commands.Choice(name="x", value="x"),
+        ]
+    )
+    async def deepdive(
+        interaction: discord.Interaction,
+        topic: str,
+        source: app_commands.Choice[str] | None = None,
+    ) -> None:
+        if interaction.guild_id is None or interaction.guild_id not in allowed_guild_ids:
+            await interaction.response.send_message(
+                "このサーバーではこのBotを利用できません。",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(thinking=True)
+        try:
+            source_value = source.value if source is not None else "auto"
+            result = await asyncio.to_thread(
+                orchestrator.tool_registry.execute,
+                "source_deep_dive",
+                {"topic": topic, "source": source_value},
+            )
+            await send_response(interaction, result, max_message_len=max_message_len)
+        except Exception:
+            logger.exception("Failed to handle /deepdive")
+            await interaction.followup.send("deep diveの実行に失敗しました。")
+
+    @tree.command(name="logsearch", description="Discord過去ログをキーワード検索します")
+    @app_commands.describe(keyword="検索キーワード", scope="検索範囲", limit="表示件数(1-12)")
+    @app_commands.choices(
+        scope=[
+            app_commands.Choice(name="default", value="default"),
+            app_commands.Choice(name="channel", value="channel"),
+            app_commands.Choice(name="guild", value="guild"),
+        ]
+    )
+    async def logsearch(
+        interaction: discord.Interaction,
+        keyword: str,
+        scope: app_commands.Choice[str] | None = None,
+        limit: app_commands.Range[int, 1, 12] = 6,
+    ) -> None:
+        if interaction.guild_id is None or interaction.guild_id not in allowed_guild_ids:
+            await interaction.response.send_message(
+                "このサーバーではこのBotを利用できません。",
+                ephemeral=True,
+            )
+            return
+
+        clean_keyword = (keyword or "").strip()
+        if not clean_keyword:
+            await interaction.response.send_message("キーワードが空です。", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            selected_scope = scope.value if scope is not None else "default"
+            query_scope = logsearch_default_scope if selected_scope == "default" else selected_scope
+
+            records = await orchestrator.memory.fetch_relevant_messages(
+                guild_id=interaction.guild_id,
+                channel_id=interaction.channel_id,
+                query_text=clean_keyword,
+                limit=int(limit),
+                scope=query_scope,
+            )
+
+            if not records:
+                await interaction.followup.send("該当する過去ログは見つかりませんでした。", ephemeral=True)
+                return
+
+            lines = [f"keyword: {clean_keyword}", f"scope: {query_scope}", f"hits: {len(records)}", ""]
+            for idx, record in enumerate(records, start=1):
+                md = record.metadata or {}
+                ch_name = str(md.get("channel_name", "")).strip()
+                ch_id = str(md.get("channel_id", "")).strip()
+                ch_label = f"#{ch_name}" if ch_name else f"ch={ch_id or 'unknown'}"
+                snippet = (record.content or "").replace("\n", " ").strip()
+                if len(snippet) > 120:
+                    snippet = snippet[:117] + "..."
+                if logsearch_include_score:
+                    overlap = _logsearch_overlap_score(clean_keyword, record.content or "")
+                    recency = _logsearch_recency_score(record.timestamp)
+                    final_score = (score_overlap_weight * overlap) + (score_recency_weight * recency)
+                    lines.append(
+                        f"{idx}. [{record.timestamp}] {ch_label} {record.role}: {snippet} "
+                        f"(score={final_score:.2f}, overlap={overlap:.2f}, recency={recency:.2f})"
+                    )
+                else:
+                    lines.append(f"{idx}. [{record.timestamp}] {ch_label} {record.role}: {snippet}")
+
+            body = "\n".join(lines)
+            for chunk in chunk_text(body, 1800):
+                await interaction.followup.send(chunk, ephemeral=True)
+        except Exception:
+            logger.exception("Failed to handle /logsearch")
+            await interaction.followup.send("ログ検索に失敗しました。", ephemeral=True)
+
+    @tree.command(name="n8n_action", description="許可済みn8n webhook actionを実行します")
+    @app_commands.describe(action="action名", payload_json="JSONオブジェクト文字列")
+    async def n8n_action(
+        interaction: discord.Interaction,
+        action: str,
+        payload_json: str = "{}",
+    ) -> None:
+        if interaction.guild_id is None or interaction.guild_id not in allowed_guild_ids:
+            await interaction.response.send_message(
+                "このサーバーではこのBotを利用できません。",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            result = await asyncio.to_thread(
+                orchestrator.tool_registry.execute,
+                "trigger_n8n_webhook",
+                {"action": action, "payload_json": payload_json},
+            )
+            for chunk in chunk_text(result, 1800):
+                await interaction.followup.send(chunk, ephemeral=True)
+        except Exception:
+            logger.exception("Failed to handle /n8n_action")
+            await interaction.followup.send("n8n action の実行に失敗しました。", ephemeral=True)
+
     @client.event
     async def on_ready() -> None:
         logger.info("Logged in as %s (%s)", client.user, client.user.id if client.user else "unknown")
-        try:
-            for guild_id in allowed_guild_ids:
+        synced: list[int] = []
+        failed: list[int] = []
+        for guild_id in sorted(allowed_guild_ids):
+            try:
                 guild = discord.Object(id=guild_id)
                 tree.copy_global_to(guild=guild)
                 await tree.sync(guild=guild)
-            logger.info("Command sync completed for guilds: %s", sorted(allowed_guild_ids))
-        except Exception:
-            logger.exception("Failed to sync commands")
+                synced.append(guild_id)
+            except Exception:
+                failed.append(guild_id)
+                logger.exception("Failed to sync commands for guild: %s", guild_id)
+
+        if synced:
+            logger.info("Command sync completed for guilds: %s", synced)
+        if failed:
+            logger.warning("Command sync failed for guilds: %s", failed)
 
         if bootstrap_on_ready:
             if not enable_message_content_intent:
