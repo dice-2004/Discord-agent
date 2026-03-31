@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import io
+import json
 import logging
 import os
+from datetime import timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -14,6 +16,7 @@ from discord_ai_agent.core.orchestrator import DiscordOrchestrator, load_orchest
 
 MAX_TOTAL_INLINE = 15000
 ATTACHMENT_NAME = "ask_response.txt"
+CURSOR_FILE_NAME = "memory_ingest_cursor.json"
 
 
 def setup_logging() -> None:
@@ -94,6 +97,151 @@ def ensure_runtime_dirs(paths: Iterable[str]) -> None:
         Path(path).mkdir(parents=True, exist_ok=True)
 
 
+def _cursor_file_path(chromadb_path: str) -> Path:
+    return Path(chromadb_path) / CURSOR_FILE_NAME
+
+
+def load_ingest_cursor(chromadb_path: str) -> dict[str, int]:
+    path = _cursor_file_path(chromadb_path)
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        logging.getLogger(__name__).exception("Failed to load ingest cursor file")
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+
+    normalized: dict[str, int] = {}
+    for key, value in raw.items():
+        try:
+            normalized[str(key)] = int(value)
+        except Exception:
+            continue
+    return normalized
+
+
+def save_ingest_cursor(chromadb_path: str, cursor_map: dict[str, int]) -> None:
+    path = _cursor_file_path(chromadb_path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(cursor_map, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        logging.getLogger(__name__).exception("Failed to save ingest cursor file")
+
+
+def _cursor_key(guild_id: int | None, channel_id: int) -> str:
+    return f"{guild_id or 0}:{channel_id}"
+
+
+def iter_bootstrap_channels(guild: discord.Guild) -> list[discord.abc.MessageableChannel]:
+    by_id: dict[int, discord.abc.MessageableChannel] = {}
+    for channel in guild.text_channels:
+        by_id[int(channel.id)] = channel
+    for thread in guild.threads:
+        by_id[int(thread.id)] = thread
+    return list(by_id.values())
+
+
+async def iter_archived_threads(
+    guild: discord.Guild,
+    include_private: bool,
+    limit_per_parent: int,
+) -> list[discord.Thread]:
+    collected: dict[int, discord.Thread] = {}
+    parent_candidates = list(guild.text_channels)
+    parent_candidates.extend([c for c in guild.channels if isinstance(c, discord.ForumChannel)])
+
+    history_limit = None if limit_per_parent <= 0 else limit_per_parent
+    for parent in parent_candidates:
+        if not hasattr(parent, "archived_threads"):
+            continue
+
+        for private_flag in ([False, True] if include_private else [False]):
+            try:
+                async for thread in parent.archived_threads(limit=history_limit, private=private_flag):
+                    collected[int(thread.id)] = thread
+            except Exception:
+                logging.getLogger(__name__).debug(
+                    "Skip archived thread scan: guild=%s parent=%s private=%s",
+                    guild.id,
+                    getattr(parent, "id", "unknown"),
+                    private_flag,
+                )
+
+    return list(collected.values())
+
+
+async def bootstrap_channel_history(
+    orchestrator: DiscordOrchestrator,
+    guild_id: int | None,
+    channel: discord.abc.MessageableChannel,
+    chromadb_path: str,
+    cursor_map: dict[str, int],
+    max_per_channel: int,
+    batch_size: int,
+    force_reindex: bool,
+) -> int:
+    channel_id = int(getattr(channel, "id", 0) or 0)
+    if channel_id <= 0:
+        return 0
+
+    key = _cursor_key(guild_id, channel_id)
+    after_id = None if force_reindex else cursor_map.get(key)
+    after_obj = discord.Object(id=after_id) if after_id else None
+
+    limit = None if max_per_channel <= 0 else max_per_channel
+    payload: list[dict[str, int | str | bool]] = []
+    ingested = 0
+    latest_seen = after_id or 0
+
+    try:
+        async for msg in channel.history(limit=limit, oldest_first=True, after=after_obj):
+            text = (msg.content or "").strip()
+            if not text:
+                continue
+            payload.append(
+                {
+                    "message_id": int(msg.id),
+                    "author_id": int(msg.author.id),
+                    "is_bot": bool(getattr(msg.author, "bot", False)),
+                    "content": text,
+                    "created_at": msg.created_at.astimezone(timezone.utc).isoformat(),
+                    "channel_name": str(getattr(msg.channel, "name", "") or ""),
+                }
+            )
+            latest_seen = max(latest_seen, int(msg.id))
+
+            if len(payload) >= batch_size:
+                ingested += await orchestrator.ingest_channel_history(
+                    guild_id=guild_id,
+                    channel_id=channel_id,
+                    messages=payload,
+                )
+                payload = []
+
+        if payload:
+            ingested += await orchestrator.ingest_channel_history(
+                guild_id=guild_id,
+                channel_id=channel_id,
+                messages=payload,
+            )
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Failed bootstrap history: guild=%s channel=%s",
+            guild_id,
+            channel_id,
+        )
+        return ingested
+
+    if latest_seen > (after_id or 0):
+        cursor_map[key] = latest_seen
+        save_ingest_cursor(chromadb_path, cursor_map)
+
+    return ingested
+
+
 def main() -> None:
     load_dotenv()
     setup_logging()
@@ -106,6 +254,17 @@ def main() -> None:
 
     allowed_guild_ids = parse_allowed_guild_ids()
     max_message_len = int(os.getenv("MAX_DISCORD_MESSAGE_LEN", "1900"))
+    enable_message_content_intent = (
+        os.getenv("DISCORD_ENABLE_MESSAGE_CONTENT_INTENT", "false").strip().lower() == "true"
+    )
+    bootstrap_on_ready = os.getenv("MEMORY_BOOTSTRAP_ON_READY", "true").strip().lower() == "true"
+    bootstrap_max_per_channel = int(os.getenv("MEMORY_BOOTSTRAP_MAX_PER_CHANNEL", "0"))
+    bootstrap_batch_size = int(os.getenv("MEMORY_BOOTSTRAP_BATCH_SIZE", "200"))
+    bootstrap_force_reindex = os.getenv("MEMORY_BOOTSTRAP_FORCE_REINDEX", "false").strip().lower() == "true"
+    bootstrap_include_archived = (
+        os.getenv("MEMORY_BOOTSTRAP_INCLUDE_ARCHIVED_THREADS", "true").strip().lower() == "true"
+    )
+    bootstrap_archived_limit_per_parent = int(os.getenv("MEMORY_BOOTSTRAP_ARCHIVED_LIMIT_PER_PARENT", "0"))
 
     orchestrator_config = load_orchestrator_config_from_env()
     ensure_runtime_dirs(
@@ -115,8 +274,10 @@ def main() -> None:
         ]
     )
     orchestrator = DiscordOrchestrator(orchestrator_config)
+    ingest_cursor = load_ingest_cursor(orchestrator_config.chromadb_path)
 
     intents = discord.Intents.default()
+    intents.message_content = enable_message_content_intent
     client = discord.Client(intents=intents)
     tree = app_commands.CommandTree(client)
 
@@ -160,6 +321,82 @@ def main() -> None:
             logger.info("Command sync completed for guilds: %s", sorted(allowed_guild_ids))
         except Exception:
             logger.exception("Failed to sync commands")
+
+        if bootstrap_on_ready:
+            if not enable_message_content_intent:
+                logger.warning(
+                    "Skip memory bootstrap because DISCORD_ENABLE_MESSAGE_CONTENT_INTENT=false. "
+                    "Enable Message Content Intent in Discord Developer Portal and set env=true to use full history ingestion."
+                )
+                return
+
+            total = 0
+            for guild in client.guilds:
+                if guild.id not in allowed_guild_ids:
+                    continue
+
+                targets: list[discord.abc.MessageableChannel] = list(iter_bootstrap_channels(guild))
+                if bootstrap_include_archived:
+                    archived_threads = await iter_archived_threads(
+                        guild=guild,
+                        include_private=False,
+                        limit_per_parent=bootstrap_archived_limit_per_parent,
+                    )
+                    by_id = {int(getattr(ch, "id", 0)): ch for ch in targets}
+                    for thread in archived_threads:
+                        by_id[int(thread.id)] = thread
+                    targets = [ch for _, ch in sorted(by_id.items(), key=lambda x: x[0])]
+
+                for channel in targets:
+                    count = await bootstrap_channel_history(
+                        orchestrator=orchestrator,
+                        guild_id=guild.id,
+                        channel=channel,
+                        chromadb_path=orchestrator_config.chromadb_path,
+                        cursor_map=ingest_cursor,
+                        max_per_channel=bootstrap_max_per_channel,
+                        batch_size=bootstrap_batch_size,
+                        force_reindex=bootstrap_force_reindex,
+                    )
+                    total += count
+            logger.info("Memory bootstrap completed: ingested=%s", total)
+
+    @client.event
+    async def on_message(message: discord.Message) -> None:
+        if not enable_message_content_intent:
+            return
+        if message.guild is None:
+            return
+        if message.guild.id not in allowed_guild_ids:
+            return
+
+        content = (message.content or "").strip()
+        if not content:
+            return
+
+        role = "assistant" if bool(getattr(message.author, "bot", False)) else "user"
+        try:
+            await orchestrator.memory.add_message(
+                guild_id=message.guild.id,
+                channel_id=message.channel.id,
+                role=role,
+                content=content,
+                user_id=message.author.id,
+                message_id=message.id,
+                metadata={
+                    "source": "discord_stream",
+                    "kind": "stream",
+                    "timestamp": message.created_at.astimezone(timezone.utc).isoformat(),
+                    "channel_name": str(getattr(message.channel, "name", "") or ""),
+                },
+            )
+            key = _cursor_key(message.guild.id, message.channel.id)
+            prev = ingest_cursor.get(key, 0)
+            if message.id > prev:
+                ingest_cursor[key] = int(message.id)
+                save_ingest_cursor(orchestrator_config.chromadb_path, ingest_cursor)
+        except Exception:
+            logger.exception("Failed to ingest streaming message: guild=%s channel=%s", message.guild.id, message.channel.id)
 
     @tree.error
     async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:

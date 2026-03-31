@@ -7,6 +7,10 @@ from urllib.parse import urlparse
 from duckduckgo_search import DDGS
 
 
+_SEARCH_CACHE: dict[str, tuple[float, str]] = {}
+_RATE_LIMIT_UNTIL: float = 0.0
+
+
 def _safe_int(env_key: str, default_value: int) -> int:
     raw = os.getenv(env_key, str(default_value)).strip()
     try:
@@ -22,13 +26,27 @@ def _domain(url: str) -> str:
 
 def web_search(query: str) -> str:
     """DuckDuckGoで一般Web検索を行い、重複ドメインを除いた上位結果を返す。"""
+    global _RATE_LIMIT_UNTIL
+
     clean_query = (query or "").strip()
     if not clean_query:
         return "検索クエリが空です。質問内容を具体的にしてください。"
 
     max_results = _safe_int("SEARCH_MAX_RESULTS", 5)
     timeout_sec = _safe_int("SEARCH_TIMEOUT_SEC", 10)
+    cache_ttl_sec = _safe_int("SEARCH_CACHE_TTL_SEC", 180)
+    cooldown_sec = _safe_int("SEARCH_COOLDOWN_SEC", 45)
     retries = 2
+
+    now = time.time()
+    cached = _SEARCH_CACHE.get(clean_query)
+    if cached is not None:
+        cached_at, cached_value = cached
+        if now - cached_at <= cache_ttl_sec:
+            return cached_value
+
+    if now < _RATE_LIMIT_UNTIL:
+        return "検索先がレート制限中です。少し時間をおいて再試行してください。"
 
     last_error: Exception | None = None
     raw_results: list[dict] = []
@@ -40,6 +58,9 @@ def web_search(query: str) -> str:
             break
         except Exception as exc:
             last_error = exc
+            lower = str(exc).lower()
+            if "ratelimit" in lower or " 202" in lower:
+                _RATE_LIMIT_UNTIL = time.time() + cooldown_sec
             if attempt < retries:
                 time.sleep(2**attempt)
 
@@ -88,4 +109,6 @@ def web_search(query: str) -> str:
     output = "\n".join(lines).strip()
     if len(output) > 2500:
         output = output[:2497] + "..."
+
+    _SEARCH_CACHE[clean_query] = (time.time(), output)
     return output
