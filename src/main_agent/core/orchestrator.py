@@ -15,8 +15,8 @@ from uuid import uuid4
 
 import google.generativeai as genai
 
-from discord_ai_agent.core.memory import ChannelMemoryStore, TaskCheckpointStore
-from discord_ai_agent.tools import ToolRegistry, build_default_tool_registry
+from main_agent.core.memory import ChannelMemoryStore, TaskCheckpointStore
+from main_agent.tools import ToolRegistry, build_default_tool_registry
 
 logger = logging.getLogger(__name__)
 

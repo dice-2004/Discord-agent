@@ -130,7 +130,7 @@
 ### 2.4. 現時点での実装上の解釈（追記）
 
 現時点では、この3層のうち**常時動作の中心は Main Agent**です。
-ただし、`src/discord_ai_agent/core/orchestrator.py` の設計においては、将来以下を差し込めるようにしてください。
+ただし、`src/main_agent/core/orchestrator.py` の設計においては、将来以下を差し込めるようにしてください。
 
 * 重い依頼を判定するルーティングフック
 * 将来的な `dispatch_to_research_agent(...)` 相当の拡張ポイント
@@ -173,7 +173,7 @@
 
 #### 現時点で必須のツール要件
 
-* `src/discord_ai_agent/tools/search_tools.py` に分離すること
+* `src/main_agent/tools/search_tools.py` に分離すること
 * Orchestrator から呼び出せる独立関数として実装すること（将来のFramework差し替えを容易にする）
 * 検索結果は**上位数件のタイトル / URL / 概要**をテキストとして返すこと
 * 検索失敗時は例外を握りつぶさず、**LLMが扱える安全な失敗メッセージ**を返すこと
@@ -267,7 +267,7 @@
 
 ### 4.1. 現時点でのメモリ設計の具体条件（追記）
 
-`src/discord_ai_agent/core/memory.py` では以下を満たしてください。
+`src/main_agent/core/memory.py` では以下を満たしてください。
 
 * **保存単位:** Discordメッセージ単位
 * **分離キー:** 最低でも `channel_id` ベースで分離
@@ -374,16 +374,19 @@ AI-agent-bot/
 │   └── chromadb/               # ChromaDBの永続化ストレージ (自動生成・Git管理外)
 │
 ├── src/
-│   └── discord_ai_agent/
+│   ├── main_agent/
+│   │   ├── __init__.py
+│   │   ├── main.py             # Botの起動、イベントリスナー
+│   │   ├── core/
+│   │   │   ├── __init__.py
+│   │   │   ├── orchestrator.py
+│   │   │   └── memory.py
+│   │   └── tools/
+│   │       ├── __init__.py
+│   │       └── search_tools.py
+│   └── research_agent/
 │       ├── __init__.py
-│       ├── main.py             # Botの起動、イベントリスナー
-│       ├── core/
-│       │   ├── __init__.py
-│       │   ├── orchestrator.py
-│       │   └── memory.py
-│       └── tools/
-│           ├── __init__.py
-│           └── search_tools.py
+│       └── research_agent_server.py
 │
 └── docs/
    └── DESIGN.md
@@ -466,7 +469,7 @@ AI-agent-bot/
 
 ### 8.3. Orchestrator条件
 
-* `src/discord_ai_agent/core/orchestrator.py` がMain Agentとして機能する
+* `src/main_agent/core/orchestrator.py` がMain Agentとして機能する
 * `initial_profile.md` を読み込んで応答に反映する
 * 検索ツールを組み込める
 
@@ -512,10 +515,10 @@ AI-agent-bot/
 以下をこの順で出力すること。
 
 1. `requirements.txt`
-2. `src/discord_ai_agent/main.py`
-3. `src/discord_ai_agent/core/orchestrator.py`
-4. `src/discord_ai_agent/core/memory.py`
-5. `src/discord_ai_agent/tools/search_tools.py`
+2. `src/main_agent/main.py`
+3. `src/main_agent/core/orchestrator.py`
+4. `src/main_agent/core/memory.py`
+5. `src/main_agent/tools/search_tools.py`
 
 ### 9.3. 出力ルール
 
@@ -550,10 +553,10 @@ AI-agent-bot/
 2. **依存関係:** `requirements.txt` の内容を出力してください。
 3. **コード生成:**
 
-   * `src/discord_ai_agent/main.py`
-   * `src/discord_ai_agent/core/orchestrator.py`
-   * `src/discord_ai_agent/core/memory.py`
-   * `src/discord_ai_agent/tools/search_tools.py`
+   * `src/main_agent/main.py`
+   * `src/main_agent/core/orchestrator.py`
+   * `src/main_agent/core/memory.py`
+   * `src/main_agent/tools/search_tools.py`
      の4つのファイルの完全なPythonコードを出力してください。非同期処理（`async/await`）を適切に使用し、チャンネルIDごとの記憶分離ロジックを必ず含めてください。
 
 > **もしライブラリの最新バージョン差異により LangChain / Gemini 連携実装が不安定な場合は、過剰に抽象化せず、「安定して動作する最小の呼び出し実装」を優先してください。**
@@ -782,7 +785,7 @@ Google AI Studio/Geminiの「検索・地図グラウンディング」は、将
 
 ただし現時点では、以下の理由で**既定採用しない**。
 
-* 仕様上、検索ツールは `src/discord_ai_agent/tools/search_tools.py` で独立実装する方針
+* 仕様上、検索ツールは `src/main_agent/tools/search_tools.py` で独立実装する方針
 * 依存を増やしすぎると、N100運用時の障害切り分けが難しくなる
 * 将来比較検証（DuckDuckGo vs Gemini Grounding）を行う余地を残したい
 

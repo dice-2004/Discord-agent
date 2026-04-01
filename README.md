@@ -27,10 +27,12 @@ AI-agent-bot/
 ├── docs/
 │   └── DESIGN.md
 └── src/
-    └── discord_ai_agent/
-        ├── main.py
-        ├── core/
-        └── tools/
+    ├── main_agent/
+    │   ├── main.py
+    │   ├── core/
+    │   └── tools/
+    └── research_agent/
+        └── research_agent_server.py
 ```
 
 ## クイックスタート（Docker）
@@ -58,7 +60,7 @@ docker compose up -d
 4. ログ確認
 
 ```bash
-docker compose logs -f discord-ai-agent
+docker compose logs -f main-agent
 ```
 
 Research Agent の状態確認:
@@ -125,6 +127,48 @@ Gemini CLI の利用方針:
 - 有効化時は `RESEARCH_AGENT_USE_GEMINI_CLI=true` と `RESEARCH_AGENT_GEMINI_COMMAND` を設定
 - CLI未導入や失敗時は deep-dive 実装へフォールバックします
 
+Gemini CLI を実際に使う手順（Research Agent）:
+
+1. Research Agent を再ビルド
+
+```bash
+docker compose build research-agent
+docker compose up -d research-agent
+```
+
+2. CLI 導入確認
+
+```bash
+docker compose exec research-agent gemini --version
+```
+
+3. コンテナ内でログイン（初回のみ）
+
+```bash
+docker compose exec -it research-agent gemini login
+```
+
+4. `.env` で有効化
+
+- `RESEARCH_AGENT_USE_GEMINI_CLI=true`
+- 必要に応じて `RESEARCH_AGENT_GEMINI_COMMAND=gemini`
+
+5. 反映
+
+```bash
+docker compose up -d --build research-agent main-agent
+```
+
+6. Bot から呼び出し
+
+- Discord で `/deepdive topic:<調査したい内容>` を実行
+- 既定の `mode=auto` で Research Agent が Gemini CLI を優先利用し、失敗時はフォールバックします
+
+認証情報の保存先:
+
+- Research Agent は `HOME=/app/data/runtime/gemini_home` を使用します
+- ログイン情報は `data/runtime/gemini_home/.gemini/` に永続化され、コンテナ再作成後も保持されます
+
 ## Discord Botセットアップ手順（初学者向け）
 
 1. Discord Developer Portalにアクセス
@@ -188,5 +232,5 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 export PYTHONPATH=./src
-python -m discord_ai_agent.main
+python -m main_agent.main
 ```

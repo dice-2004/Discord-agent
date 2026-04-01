@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 
-from discord_ai_agent.tools.search_tools import web_search
+from main_agent.tools.search_tools import web_search
 
 
 def _safe_int(env_key: str, default_value: int) -> int:

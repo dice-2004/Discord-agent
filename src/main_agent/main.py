@@ -15,12 +15,14 @@ from discord import app_commands
 from discord.ui import Button, View
 from dotenv import load_dotenv
 
-from discord_ai_agent.core.orchestrator import DiscordOrchestrator, load_orchestrator_config_from_env
+from main_agent.core.orchestrator import DiscordOrchestrator, load_orchestrator_config_from_env
 
 MAX_TOTAL_INLINE = 15000
 ATTACHMENT_NAME = "ask_response.txt"
+RESEARCH_ATTACHMENT_NAME = "research_report.txt"
 CURSOR_FILE_NAME = "memory_ingest_cursor.json"
 RUNCLI_AUDIT_LOG_DEFAULT = "./data/audit/runcli_audit.jsonl"
+RESEARCH_AUDIT_LOG_DEFAULT = "./data/audit/research_audit.jsonl"
 
 
 def setup_logging() -> None:
@@ -171,6 +173,25 @@ def resolve_runcli_audit_log_path() -> Path:
     if not path.is_absolute():
         path = (Path.cwd() / path).resolve()
     return path
+
+
+def resolve_research_audit_log_path() -> Path:
+    raw = os.getenv("RESEARCH_AUDIT_LOG_PATH", RESEARCH_AUDIT_LOG_DEFAULT).strip()
+    path = Path(raw or RESEARCH_AUDIT_LOG_DEFAULT)
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    return path
+
+
+def append_research_audit(path: Path, payload: dict[str, object]) -> None:
+    logger = logging.getLogger(__name__)
+    row = {"ts": _utc_now_iso(), **payload}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fp:
+            fp.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        logger.exception("Failed to append research audit log")
 
 
 def append_runcli_audit(path: Path, payload: dict[str, object]) -> None:
@@ -690,11 +711,13 @@ def main() -> None:
 
     orchestrator_config = load_orchestrator_config_from_env()
     runcli_audit_log_path = resolve_runcli_audit_log_path()
+    research_audit_log_path = resolve_research_audit_log_path()
     ensure_runtime_dirs(
         [
             orchestrator_config.chromadb_path,
             str(Path(orchestrator_config.profile_path).parent),
             str(runcli_audit_log_path.parent),
+            str(research_audit_log_path.parent),
         ]
     )
     orchestrator = DiscordOrchestrator(orchestrator_config)
@@ -743,6 +766,16 @@ def main() -> None:
                 },
                 job_id=job_id,
             )
+            append_research_audit(
+                research_audit_log_path,
+                {
+                    "event": "queued",
+                    "job_id": job_id,
+                    "topic": topic,
+                    "source": source,
+                    "channel_id": channel_id,
+                },
+            )
 
             elapsed = 0
             while elapsed <= research_notify_timeout_sec:
@@ -757,6 +790,17 @@ def main() -> None:
                         status_payload = {"status": "error", "detail": str(status_payload)}
                 except Exception as exc:
                     logger.exception("Failed polling research job status: job_id=%s", job_id)
+                    append_research_audit(
+                        research_audit_log_path,
+                        {
+                            "event": "poll_failed",
+                            "job_id": job_id,
+                            "topic": topic,
+                            "source": source,
+                            "channel_id": channel_id,
+                            "error": str(exc)[:600],
+                        },
+                    )
                     await orchestrator.save_workflow_checkpoint(
                         workflow="research_job",
                         status="failed",
@@ -782,9 +826,28 @@ def main() -> None:
                             f"topic: {topic}\n"
                             f"source: {source}"
                         )
-                        await channel.send(summary)
-                        for chunk in chunk_text(report, max_message_len):
-                            await channel.send(chunk)
+                        if len(report) > MAX_TOTAL_INLINE:
+                            file_obj = discord.File(
+                                io.BytesIO(report.encode("utf-8")),
+                                filename=RESEARCH_ATTACHMENT_NAME,
+                            )
+                            await channel.send(summary + "\n\n(全文は添付ファイルを参照してください)", file=file_obj)
+                        else:
+                            await channel.send(summary)
+                            for chunk in chunk_text(report, max_message_len):
+                                await channel.send(chunk)
+
+                    append_research_audit(
+                        research_audit_log_path,
+                        {
+                            "event": "done",
+                            "job_id": job_id,
+                            "topic": topic,
+                            "source": source,
+                            "channel_id": channel_id,
+                            "report_chars": len(report),
+                        },
+                    )
 
                     await orchestrator.save_workflow_checkpoint(
                         workflow="research_job",
@@ -810,6 +873,17 @@ def main() -> None:
                             f"topic: {topic}\n"
                             f"detail: {detail[:700]}"
                         )
+                    append_research_audit(
+                        research_audit_log_path,
+                        {
+                            "event": "failed",
+                            "job_id": job_id,
+                            "topic": topic,
+                            "source": source,
+                            "channel_id": channel_id,
+                            "error": detail[:600],
+                        },
+                    )
                     await orchestrator.save_workflow_checkpoint(
                         workflow="research_job",
                         status="failed",
@@ -847,6 +921,16 @@ def main() -> None:
                     f"job_id: {job_id}\n"
                     "しばらくしてから再確認します。"
                 )
+            append_research_audit(
+                research_audit_log_path,
+                {
+                    "event": "timeout",
+                    "job_id": job_id,
+                    "topic": topic,
+                    "source": source,
+                    "channel_id": channel_id,
+                },
+            )
 
         task = asyncio.create_task(_runner(), name=f"research-notify-{job_id}")
         research_notify_tasks.add(task)
@@ -1322,6 +1406,17 @@ def main() -> None:
                 ):
                     job_id = str(payload.get("job_id", "")).strip()
                     if job_id:
+                        append_research_audit(
+                            research_audit_log_path,
+                            {
+                                "event": "submitted",
+                                "job_id": job_id,
+                                "topic": topic,
+                                "source": source_value,
+                                "channel_id": int(interaction.channel_id),
+                                "actor_id": interaction.user.id if interaction.user else 0,
+                            },
+                        )
                         await _start_research_notification(
                             job_id=job_id,
                             topic=topic,

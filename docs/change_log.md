@@ -6,6 +6,7 @@
 
 ### 仕様更新
 
+- Main Agentの実装ディレクトリ表記を `src/main_agent/` へ更新した（旧 `src/discord_ai_agent/` は互換shimとして残置）
 - Research Agentを段階実装対象へ更新し、別コンテナ + 軽量HTTP + 共有トークンの最小通信方式を仕様に追記した
 - Gemini CLI配置方針を追記し、Research Agentコンテナ同梱を既定推奨、ホスト実行を代替案として明文化した
 - n8n中継方式を非推奨化し、外部アクションをBotコード内で直接実行する方針へ更新した
@@ -51,6 +52,11 @@
 
 ### 実装
 
+- 互換shimを整理し、`src/discord_ai_agent/` と `src/main_agent/research_agent_server.py` を削除して、Research実体を `src/research_agent/research_agent_server.py` に一本化した
+- `deepdive` のResearch投入時に `job_id` / `topic` / `source` を `research_audit.jsonl` へ監査記録するようにした
+- Research完了通知を改善し、長文レポートは要約メッセージ + `research_report.txt` 添付へ切替えるようにした
+- docker compose のMainサービス名/コンテナ名を `main-agent` へ変更した
+- 実装パッケージを `src/main_agent/` へ移行し、`src/discord_ai_agent/` は後方互換用の薄いshimへ変更した
 - `research-agent` サービスを `docker-compose.yml` に追加し、Main/Researchの別コンテナ分離を実装した
 - `src/discord_ai_agent/research_agent_server.py` を追加し、`POST /v1/jobs` / `GET /v1/jobs/{job_id}` とSQLiteジョブ状態管理を実装した
 - `dispatch_research_job` ツールを追加し、Main AgentからResearch Agentへジョブ投入・ポーリング取得できるようにした

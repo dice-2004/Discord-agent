@@ -1,9 +1,11 @@
 services:
-  discord-ai-agent:
+  main-agent:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: discord-ai-agent
+      args:
+        INSTALL_GEMINI_CLI: "false"
+    container_name: main-agent
     env_file:
       - ./.env
     volumes:
@@ -16,8 +18,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        INSTALL_GEMINI_CLI: "true"
     container_name: research-agent
-    command: ["python", "-m", "discord_ai_agent.research_agent_server"]
+    command: ["sh", "-lc", "mkdir -p \"$HOME/.gemini\" && python -m research_agent.research_agent_server"]
+    environment:
+      - HOME=/app/data/runtime/gemini_home
     env_file:
       - ./.env
     volumes:

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from discord_ai_agent.tools.deep_dive_tools import source_deep_dive
+from main_agent.tools.deep_dive_tools import source_deep_dive
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +117,6 @@ def _run_gemini_cli(topic: str, source: str) -> tuple[str, str | None]:
     )
 
     try:
-        # NOTE: CLIの引数仕様差異に備え、最初は標準入力を使う呼び出しを採用。
         completed = subprocess.run(
             [cmd],
             input=prompt,
