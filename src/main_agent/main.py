@@ -1517,7 +1517,7 @@ def main() -> None:
     }
     command_allowlist = {
         part.strip()
-        for part in os.getenv("DISCORD_COMMAND_ALLOWLIST", "ask,auth_status,debug_action").split(",")
+        for part in os.getenv("DISCORD_COMMAND_ALLOWLIST", "ask,deepdive,auth_status,debug_action").split(",")
         if part.strip()
     }
 

@@ -1,0 +1,23 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app/src \
+    HOME=/app/data/runtime/gemini_home
+
+WORKDIR /app
+
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nodejs npm ca-certificates \
+    && npm install -g @google/gemini-cli \
+    && npm cache clean --force \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY src /app/src
+COPY data /app/data
+
+CMD ["sh", "-lc", "mkdir -p \"$HOME/.gemini\" && python -m research_agent.research_agent_server"]

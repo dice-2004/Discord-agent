@@ -2,9 +2,7 @@ services:
   main-agent:
     build:
       context: .
-      dockerfile: Dockerfile
-      args:
-        INSTALL_GEMINI_CLI: "false"
+      dockerfile: Dockerfile.main
     container_name: main-agent
     env_file:
       - ./.env
@@ -17,13 +15,8 @@ services:
   research-agent:
     build:
       context: .
-      dockerfile: Dockerfile
-      args:
-        INSTALL_GEMINI_CLI: "true"
+      dockerfile: Dockerfile.research
     container_name: research-agent
-    command: ["sh", "-lc", "mkdir -p \"$HOME/.gemini\" && python -m research_agent.research_agent_server"]
-    environment:
-      - HOME=/app/data/runtime/gemini_home
     env_file:
       - ./.env
     volumes:

@@ -5,3 +5,7 @@ __pycache__/
 .env
 data/chromadb/
 data/profiles/*.local.md
+data/runtime/
+data/audit/
+*.sqlite3
+*.jsonl

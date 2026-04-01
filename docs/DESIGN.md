@@ -365,7 +365,8 @@ AI-agent-bot/
 ├── README.md
 ├── requirements.txt
 ├── .env.example                 # 実運用では .env を作成（Git管理外）
-├── Dockerfile
+├── Dockerfile.main
+├── Dockerfile.research
 ├── docker-compose.yml
 │
 ├── data/
@@ -803,7 +804,7 @@ Google AI Studio/Geminiの「検索・地図グラウンディング」は、将
 
 * 実装・検証・実運用は **Dockerコンテナ内で実行**する
 * 現行では、以下を最小要件とする
-   * `Dockerfile` を用意し、`python:3.11-slim` 系を利用
+   * `Dockerfile.main` / `Dockerfile.research` を用意し、`python:3.11-slim` 系を利用
    * ルートディレクトリの `.env` を渡して起動可能であること
    * ルートの `data/chromadb` をボリューム永続化できる構成であること
 * 追加の管理基盤（Kubernetes等）は現時点の対象外
