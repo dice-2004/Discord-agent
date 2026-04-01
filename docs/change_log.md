@@ -6,6 +6,8 @@
 
 ### 仕様更新
 
+- Research Agentを段階実装対象へ更新し、別コンテナ + 軽量HTTP + 共有トークンの最小通信方式を仕様に追記した
+- Gemini CLI配置方針を追記し、Research Agentコンテナ同梱を既定推奨、ホスト実行を代替案として明文化した
 - n8n中継方式を非推奨化し、外部アクションをBotコード内で直接実行する方針へ更新した
 - `/n8n_action` 中心の運用方針を `/action` 中心へ更新し、`/n8n_action` は互換コマンドとして扱う方針へ変更した
 - `.env` 仕様を `N8N_*` 系から `INTERNAL_*` 系へ移行し、認証誘導URL（`GITHUB_AUTH_URL` / `SMTP_AUTH_URL`）を追加した
@@ -49,6 +51,11 @@
 
 ### 実装
 
+- `research-agent` サービスを `docker-compose.yml` に追加し、Main/Researchの別コンテナ分離を実装した
+- `src/discord_ai_agent/research_agent_server.py` を追加し、`POST /v1/jobs` / `GET /v1/jobs/{job_id}` とSQLiteジョブ状態管理を実装した
+- `dispatch_research_job` ツールを追加し、Main AgentからResearch Agentへジョブ投入・ポーリング取得できるようにした
+- `deepdive` コマンドに Research Agent 経由モード（`DEEPDIVE_USE_RESEARCH_AGENT=true`）を追加した
+- `.env.example` に `RESEARCH_AGENT_*` / `DEEPDIVE_USE_RESEARCH_AGENT` 設定を追加した
 - `/n8n_action` 互換コマンドを削除し、`/action` のみを正式コマンドとして運用するようにした
 - `/action` を `debug_action`（デバッグ専用）へ移行し、通常運用は `/ask` 中心とする方針へ更新した
 - `/auth_status` コマンドを追加し、外部連携の認証状態と導線URLをDiscord上で確認できるようにした
@@ -68,6 +75,7 @@
 - `execute_internal_action` に action別名の正規化を追加し、`calendar_add_event` / `calendar_get_events` を `add_calendar_event` / `get_calendar_events` へ自動変換できるようにした
 - メンション高速ルーターで `4月5日` のような和文月日入力を解釈できるようにし、終日登録の取りこぼしを低減した
 - オーケストレーター方針文を更新し、入力が明確な予定追加は確認質問を省略して実行するルールを強化した
+- `add_calendar_event` のpayload正規化を追加し、`summary` / `event` / `name` などの同義キーから `title` を補完できるようにした
 - `docs/DESIGN.md` を更新し、Research Agent/Eternal Explorer の別コンテナ分離推奨方針を追記した
 - `docs/DESIGN.md` と `.env.example` の `INTERNAL_ACTION_REQUIRED_FIELDS` を更新し、`add_calendar_event` は `title` を共通必須として timed/all-day の二方式を許可した
 - `create_github_issue` と `send_email` の内部アクション実装を追加し、認証未設定時は `auth_required` と `auth_url` を返すようにした

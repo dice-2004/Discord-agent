@@ -7,6 +7,7 @@ from typing import Any, Callable
 from discord_ai_agent.tools.action_tools import execute_internal_action
 from discord_ai_agent.tools.cli_tools import run_local_cli
 from discord_ai_agent.tools.deep_dive_tools import source_deep_dive
+from discord_ai_agent.tools.research_tools import dispatch_research_job
 from discord_ai_agent.tools.reader_tools import read_url_markdown
 from discord_ai_agent.tools.search_tools import web_search
 
@@ -128,6 +129,19 @@ def build_default_tool_registry() -> ToolRegistry:
             args_schema={"topic": "string", "source": "string(auto/github/reddit/youtube/x)"},
             required_args=["topic"],
             func=source_deep_dive,
+        ),
+        ToolSpec(
+            name="dispatch_research_job",
+            description="Research Agentへ重い調査ジョブを委譲する",
+            args_schema={
+                "topic": "string",
+                "source": "string(auto/github/reddit/youtube/x)",
+                "wait": "string(true/false)",
+                "mode": "string(auto/gemini_cli/fallback)",
+                "timeout_sec": "string(int seconds)",
+            },
+            required_args=["topic"],
+            func=dispatch_research_job,
         ),
         ToolSpec(
             name="run_local_cli",

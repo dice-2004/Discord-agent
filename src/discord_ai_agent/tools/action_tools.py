@@ -61,6 +61,32 @@ def _normalize_action_name(action: str) -> str:
     return aliases.get(key, key)
 
 
+def _normalize_add_calendar_payload(payload: dict[str, object]) -> dict[str, object]:
+    normalized = dict(payload)
+    if str(normalized.get("title", "")).strip():
+        return normalized
+
+    title_aliases = [
+        "summary",
+        "subject",
+        "name",
+        "task",
+        "event",
+        "item",
+        "content",
+        "件名",
+        "内容",
+        "タイトル",
+    ]
+    for key in title_aliases:
+        candidate = str(normalized.get(key, "")).strip()
+        if candidate:
+            normalized["title"] = candidate
+            break
+
+    return normalized
+
+
 def _truncate_text(text: str, limit: int = 1200) -> str:
     clean = (text or "").strip()
     if len(clean) <= limit:
@@ -149,6 +175,13 @@ def _calendar_provider() -> str:
 def _google_calendar_auth_url() -> str:
     return os.getenv(
         "GOOGLE_CALENDAR_AUTH_URL",
+        "https://console.cloud.google.com/apis/credentials",
+    ).strip()
+
+
+def _google_tasks_auth_url() -> str:
+    return os.getenv(
+        "GOOGLE_TASKS_AUTH_URL",
         "https://console.cloud.google.com/apis/credentials",
     ).strip()
 
@@ -306,6 +339,97 @@ def _google_calendar_insert_event(
                 "status": "error",
                 "code": "add_calendar_event_failed",
                 "action": "add_calendar_event",
+                "detail": _truncate_text(str(exc)),
+            }
+        )
+
+
+def _google_tasks_insert_task(title: str, due_date: str | None = None, notes: str = "") -> str:
+    """Insert a task into Google Tasks via API (default task list)."""
+    token, err = _google_access_token()
+    if not token:
+        return _as_json_line(
+            {
+                "status": "error",
+                "code": "auth_required",
+                "action": "add_task",
+                "detail": f"Google Tasks認証が未設定または無効です: {err or 'unknown'}",
+            }
+        )
+
+    body: dict[str, object] = {"title": title}
+    if due_date:
+        body["due"] = f"{due_date}T00:00:00.000Z"
+    if notes:
+        body["notes"] = notes
+
+    req = Request(
+        "https://www.googleapis.com/tasks/v1/lists/@default/tasks",
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "discord-ai-agent/1.0",
+        },
+    )
+
+    timeout_sec = _safe_int("INTERNAL_ACTION_TIMEOUT_SEC", 15)
+    try:
+        with urlopen(req, timeout=timeout_sec) as res:
+            status = int(getattr(res, "status", 200))
+            raw = res.read().decode("utf-8", errors="replace")
+        payload = json.loads(raw) if raw else {}
+        if status not in (200, 201):
+            return _as_json_line(
+                {
+                    "status": "error",
+                    "code": "add_task_failed",
+                    "action": "add_task",
+                    "status_code": status,
+                    "detail": _truncate_text(str(payload)),
+                }
+            )
+        return _as_json_line(
+            {
+                "status": "ok",
+                "action": "add_task",
+                "task_id": payload.get("id"),
+                "title": title,
+                "due_date": due_date,
+                "web_link": f"https://tasks.google.com",
+            }
+        )
+    except HTTPError as exc:
+        try:
+            raw = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            raw = str(exc)
+        code = int(getattr(exc, "code", 500))
+        detail = _truncate_text(raw)
+        if code == 403 and "insufficient" in raw.lower():
+            detail = (
+                "Google Tasks の権限スコープ不足です。"
+                " refresh token を tasks スコープ付きで再発行してください"
+                " (https://www.googleapis.com/auth/tasks)。"
+            )
+        return _as_json_line(
+            {
+                "status": "error",
+                "code": "add_task_failed",
+                "action": "add_task",
+                "status_code": code,
+                "detail": detail,
+                "auth_url": _google_tasks_auth_url(),
+            }
+        )
+    except Exception as exc:
+        return _as_json_line(
+            {
+                "status": "error",
+                "code": "add_task_failed",
+                "action": "add_task",
                 "detail": _truncate_text(str(exc)),
             }
         )
@@ -695,6 +819,37 @@ def _handle_add_calendar_event(payload: dict[str, object]) -> str:
         all_day_end_date_exclusive=None,
         calendar_id_override=calendar_id_override,
     )
+
+
+def _handle_add_task(payload: dict[str, object]) -> str:
+    """Add a task to Google Tasks."""
+    title = str(payload.get("title", "")).strip()
+    if not title:
+        return _as_json_line(
+            {
+                "status": "error",
+                "code": "missing_title",
+                "action": "add_task",
+                "detail": "タスクのタイトルは必須です。",
+            }
+        )
+
+    due_date_text = str(payload.get("due_date", "")).strip() or str(payload.get("date", "")).strip()
+    due_date = None
+    if due_date_text:
+        due_date = _parse_date_only(due_date_text)
+        if not due_date:
+            return _as_json_line(
+                {
+                    "status": "error",
+                    "code": "invalid_date_format",
+                    "action": "add_task",
+                    "detail": f"期限の日付形式が不正です: {due_date_text}",
+                }
+            )
+
+    notes = str(payload.get("notes", "")).strip() or str(payload.get("description", "")).strip()
+    return _google_tasks_insert_task(title=title, due_date=due_date, notes=notes)
 
 
 def _handle_get_calendar_events(payload: dict[str, object]) -> str:
@@ -1088,6 +1243,9 @@ def execute_internal_action(action: str, payload_json: str = "{}") -> str:
     if not isinstance(payload, dict):
         return _as_json_line({"status": "error", "code": "invalid_payload_type", "detail": "payload_json はJSONオブジェクトで指定してください。"})
 
+    if clean_action == "add_calendar_event":
+        payload = _normalize_add_calendar_payload(payload)
+
     allowed = _allowed_actions()
     if clean_action not in allowed:
         return _as_json_line(
@@ -1144,6 +1302,9 @@ def execute_internal_action(action: str, payload_json: str = "{}") -> str:
 
     if clean_action == "get_calendar_events":
         return _handle_get_calendar_events(payload)
+
+    if clean_action == "add_task":
+        return _handle_add_task(payload)
 
     if clean_action == "send_email":
         return _handle_send_email(payload)

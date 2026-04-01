@@ -312,13 +312,92 @@ def _extract_date_base(text: str, now_jst: datetime) -> datetime | None:
 
 
 def _extract_title(text: str) -> str:
+    # Pattern: "タイトル: D月D日" or "D月D日: タイトル"
+    # Try format 1: タイトル: D月D日（終日）
+    pattern1 = re.search(r"^([^:：\d\n]+?)\s*[:：]\s*\d{1,2}\s*月\s*\d{1,2}\s*日", text)
+    if pattern1:
+        title = pattern1.group(1).strip()
+        if title:
+            return title
+
+    # Try format 2: D月D日: タイトル（終日）
+    pattern2 = re.search(r"\d{1,2}\s*月\s*\d{1,2}\s*日\s*[:：]\s*([^\n]+)", text)
+    if pattern2:
+        raw = pattern2.group(1).strip()
+        raw = re.sub(r"\s*[（(]\s*終日\s*[)）]\s*", " ", raw).strip()
+        raw = re.sub(r"\s*(?:を)?(?:登録|追加|入れて|作成)(?:して|してください|して下さい)?\s*$", "", raw).strip()
+        if raw:
+            return raw
+
+    # Try quoted format: 「タイトル」
     quoted = re.search(r"[「\"]([^\"」]+)[」\"]", text)
     if quoted:
         return quoted.group(1).strip()
-    key_match = re.search(r"(?:内容|件名|タイトル)[:：]\s*([^\n]+)", text)
+
+    # Try key format: 内容: X / タイトルは X
+    key_match = re.search(r"(?:内容|件名|タイトル)\s*(?:[:：]|は)\s*([^\n]+)", text)
     if key_match:
         return key_match.group(1).strip()
+
+    # Try task phrasing: "タスクリストへ 面接準備 を追加して"
+    task_list_match = re.search(
+        r"(?:タスクリスト|やること(?:リスト)?|todo|to\s*do|to-do)\s*(?:へ|に|として)?\s*([^\n]+?)\s*(?:を)?(?:追加|登録|入れ|作成)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if task_list_match:
+        raw = task_list_match.group(1).strip()
+        raw = re.sub(r"^(?:タイトル|件名)\s*(?:[:：]|は)\s*", "", raw).strip()
+        if raw:
+            return raw
+
+    # Try task phrasing: "やることとして課題を追加して"
+    task_as_match = re.search(r"(?:として)\s*([^\n]+?)\s*(?:を)?(?:追加|登録|入れ|作成)", text)
+    if task_as_match:
+        raw = task_as_match.group(1).strip()
+        raw = re.sub(r"^(?:タイトル|件名)\s*(?:[:：]|は)\s*", "", raw).strip()
+        if raw:
+            return raw
+
+    # Try command-tail format: "...追加して <title>"
+    tail_match = re.search(r"(?:追加して|登録して|入れて|作成して)\s*([^\n]+)$", text)
+    if tail_match:
+        raw = tail_match.group(1).strip()
+        raw = re.sub(r"^(?:タイトル|件名)\s*(?:[:：]|は)\s*", "", raw).strip()
+        raw = re.sub(r"\s*[（(]\s*終日\s*[)）]\s*$", "", raw).strip()
+        if raw:
+            return raw
+
     return "予定"
+
+
+def _is_task_intent(text: str) -> bool:
+    lowered = text.lower()
+    direct_keywords = (
+        "タスク",
+        "タスクリスト",
+        "todo",
+        "to do",
+        "to-do",
+        "やること",
+        "やることリスト",
+        "チェックリスト",
+    )
+    if any(key in lowered for key in direct_keywords):
+        return True
+
+    # 「課題」単独はタスク確定にしない。文脈でタスク管理意図があるときだけtrue。
+    if "課題" in text:
+        contextual_patterns = [
+            r"課題.*(?:として|で).*(?:管理|記録|整理)",
+            r"(?:管理|記録|整理).*(?:課題)",
+            r"(?:やること|todo|to do|to-do).*(?:課題)",
+        ]
+        for pattern in contextual_patterns:
+            if re.search(pattern, lowered):
+                return True
+
+    return False
 
 
 def build_quick_calendar_action(question: str) -> tuple[str, dict[str, object]] | None:
@@ -363,7 +442,10 @@ def build_quick_calendar_action(question: str) -> tuple[str, dict[str, object]] 
         }
 
     # Quick add intents.
-    add_intent = any(k in text for k in ("予定追加", "追加して", "登録して", "カレンダーに", "入れて", "タスク"))
+    add_intent = any(
+        k in text for k in ("予定追加", "追加して", "登録して", "カレンダーに", "入れて", "タスク", "todo", "ToDo", "やること")
+    )
+    is_task = _is_task_intent(text)
     if not add_intent:
         add_intent = (
             ("内容" in text and "日時" in text)
@@ -378,7 +460,18 @@ def build_quick_calendar_action(question: str) -> tuple[str, dict[str, object]] 
             sh, sm, eh, em = time_range
             if sh == 0 and sm == 0 and eh == 23 and em in {59, 60}:
                 all_day = True
-        if date_base is None or (time_range is None and not all_day):
+        if date_base is None:
+            return None
+
+        # Task intent detected -> add_task action
+        if is_task:
+            return "add_task", {
+                "title": _extract_title(text),
+                "due_date": date_base.strftime("%Y-%m-%d"),
+            }
+
+        # Calendar event intent
+        if time_range is None and not all_day:
             return None
 
         if all_day:
@@ -554,6 +647,7 @@ def main() -> None:
     mention_ask_enabled = os.getenv("MENTION_ASK_ENABLED", "true").strip().lower() == "true"
     mention_require_prefix = os.getenv("MENTION_REQUIRE_PREFIX", "true").strip().lower() == "true"
     mention_quick_calendar_enabled = os.getenv("MENTION_QUICK_CALENDAR_ENABLED", "true").strip().lower() == "true"
+    deepdive_use_research_agent = os.getenv("DEEPDIVE_USE_RESEARCH_AGENT", "true").strip().lower() == "true"
     logsearch_default_scope = os.getenv("LOGSEARCH_DEFAULT_SCOPE", "guild").strip().lower()
     if logsearch_default_scope not in {"channel", "guild"}:
         logsearch_default_scope = "guild"
@@ -1061,11 +1155,18 @@ def main() -> None:
         await interaction.response.defer(thinking=True)
         try:
             source_value = source.value if source is not None else "auto"
-            result = await orchestrator.execute_tool_job(
-                tool_name="source_deep_dive",
-                args={"topic": topic, "source": source_value},
-                task_label="deepdive",
-            )
+            if deepdive_use_research_agent:
+                result = await orchestrator.execute_tool_job(
+                    tool_name="dispatch_research_job",
+                    args={"topic": topic, "source": source_value, "wait": "true"},
+                    task_label="deepdive:research",
+                )
+            else:
+                result = await orchestrator.execute_tool_job(
+                    tool_name="source_deep_dive",
+                    args={"topic": topic, "source": source_value},
+                    task_label="deepdive",
+                )
             await send_response(interaction, result, max_message_len=max_message_len)
         except Exception:
             logger.exception("Failed to handle /deepdive")

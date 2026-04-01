@@ -11,3 +11,15 @@ services:
       - ./data/profiles:/app/data/profiles
       - ./data/runtime:/app/data/runtime
     restart: unless-stopped
+
+  research-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: research-agent
+    command: ["python", "-m", "discord_ai_agent.research_agent_server"]
+    env_file:
+      - ./.env
+    volumes:
+      - ./data/runtime:/app/data/runtime
+    restart: unless-stopped

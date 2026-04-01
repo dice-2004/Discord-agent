@@ -93,12 +93,26 @@
 * **LLMエンジン:** `Gemini 3.1 Flash Lite` API (軽量・高速・1日500リクエストの無料枠を使用)。
 * **役割:** 数秒〜20秒で完結するタスク（簡単な検索、URL要約、ローカル状態確認）を実行し即答する。重いタスクを検知した場合は、後述のResearch Agent等に処理を丸投げする。
 
-### 2.2. Research Agent (非同期・深掘り調査担当 / 将来実装)
+### 2.2. Research Agent (非同期・深掘り調査担当 / 段階実装)
 
 * **インターフェース:** Main Agentからサブプロセス（バックグラウンドジョブ）として起動される。
 * **LLMエンジン:** Google公式 `gemini CLI` ツール。
 * **認証基盤:** "Sign in with Google" (OAuth) 済みのトークンを使用（巨大な無料枠で上位モデルを利用）。
 * **役割:** 1分〜1時間程度かかるタスク（複数サイトの横断、Reddit/GitHubの深掘り）を実行。完了後、Discordに長文レポートを非同期で通知して終了する。
+
+#### 2.2.2. 現行の最小実装（2026-04-01追記）
+
+* Research Agentは `research-agent` サービスとして別コンテナ起動する。
+* Main Agentは `dispatch_research_job` ツールで `POST /v1/jobs` にジョブ投入し、`GET /v1/jobs/{job_id}` で状態取得する。
+* 通信は `X-Research-Token` ヘッダで共有トークン認証する。
+* 研究ジョブ状態は `RESEARCH_AGENT_DB_PATH`（SQLite）に `queued/running/done/failed` で保存する。
+* 初期実装では、Research Agent内の調査実行は `source_deep_dive` ベースを既定とし、`RESEARCH_AGENT_USE_GEMINI_CLI=true` のときのみGemini CLI実行を試みる。
+
+#### 2.2.3. Gemini CLI配置方針（2026-04-01追記）
+
+* 既定推奨: **Research Agentコンテナ内にGemini CLIを同梱**して実行環境を固定する。
+* 代替案: ホスト側Gemini CLIを使う場合は、Research Agentへバインドマウント等で実行可能パスを渡す。
+* 互換のため `RESEARCH_AGENT_GEMINI_COMMAND` で実行コマンドを上書き可能にする（例: `gemini`, `/usr/local/bin/gemini`）。
 
 #### 2.2.1. 配置方針（2026-04-01追記）
 
