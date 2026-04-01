@@ -54,7 +54,10 @@
 - `research-agent` サービスを `docker-compose.yml` に追加し、Main/Researchの別コンテナ分離を実装した
 - `src/discord_ai_agent/research_agent_server.py` を追加し、`POST /v1/jobs` / `GET /v1/jobs/{job_id}` とSQLiteジョブ状態管理を実装した
 - `dispatch_research_job` ツールを追加し、Main AgentからResearch Agentへジョブ投入・ポーリング取得できるようにした
+- `get_research_job_status` ツールを追加し、Main AgentからResearchジョブ状態を参照できるようにした
 - `deepdive` コマンドに Research Agent 経由モード（`DEEPDIVE_USE_RESEARCH_AGENT=true`）を追加した
+- `deepdive` のResearch経由時を非同期投入に変更し、完了/失敗を同一チャンネルへ自動通知するバックグラウンドポーラーを実装した
+- Main起動時に `research_job` チェックポイント（queued）から通知ポーラーを再開する処理を追加した
 - `.env.example` に `RESEARCH_AGENT_*` / `DEEPDIVE_USE_RESEARCH_AGENT` 設定を追加した
 - `/n8n_action` 互換コマンドを削除し、`/action` のみを正式コマンドとして運用するようにした
 - `/action` を `debug_action`（デバッグ専用）へ移行し、通常運用は `/ask` 中心とする方針へ更新した

@@ -648,6 +648,13 @@ def main() -> None:
     mention_require_prefix = os.getenv("MENTION_REQUIRE_PREFIX", "true").strip().lower() == "true"
     mention_quick_calendar_enabled = os.getenv("MENTION_QUICK_CALENDAR_ENABLED", "true").strip().lower() == "true"
     deepdive_use_research_agent = os.getenv("DEEPDIVE_USE_RESEARCH_AGENT", "true").strip().lower() == "true"
+    research_notify_on_complete = os.getenv("RESEARCH_NOTIFY_ON_COMPLETE", "true").strip().lower() == "true"
+    research_notify_timeout_sec = int(os.getenv("RESEARCH_NOTIFY_TIMEOUT_SEC", "600"))
+    research_notify_poll_sec = int(os.getenv("RESEARCH_NOTIFY_POLL_SEC", "3"))
+    if research_notify_timeout_sec < 30:
+        research_notify_timeout_sec = 30
+    if research_notify_poll_sec < 1:
+        research_notify_poll_sec = 1
     logsearch_default_scope = os.getenv("LOGSEARCH_DEFAULT_SCOPE", "guild").strip().lower()
     if logsearch_default_scope not in {"channel", "guild"}:
         logsearch_default_scope = "guild"
@@ -702,6 +709,148 @@ def main() -> None:
     intents.message_content = enable_message_content_intent
     client = discord.Client(intents=intents)
     tree = app_commands.CommandTree(client)
+    research_notify_tasks: set[asyncio.Task[None]] = set()
+
+    async def _resolve_channel(channel_id: int) -> discord.abc.Messageable | None:
+        channel = client.get_channel(channel_id)
+        if channel is not None:
+            return channel  # type: ignore[return-value]
+        try:
+            fetched = await client.fetch_channel(channel_id)
+            return fetched  # type: ignore[return-value]
+        except Exception:
+            logger.exception("Failed to resolve channel: channel_id=%s", channel_id)
+            return None
+
+    async def _start_research_notification(
+        *,
+        job_id: str,
+        topic: str,
+        source: str,
+        channel_id: int,
+    ) -> None:
+        async def _runner() -> None:
+            started = datetime.now(timezone.utc)
+            await orchestrator.save_workflow_checkpoint(
+                workflow="research_job",
+                status="queued",
+                payload={
+                    "job_id": job_id,
+                    "topic": topic,
+                    "source": source,
+                    "channel_id": channel_id,
+                    "started_at": started.isoformat(),
+                },
+                job_id=job_id,
+            )
+
+            elapsed = 0
+            while elapsed <= research_notify_timeout_sec:
+                try:
+                    raw = await orchestrator.execute_tool_job(
+                        tool_name="get_research_job_status",
+                        args={"job_id": job_id},
+                        task_label=f"research_status:{job_id}",
+                    )
+                    status_payload = json.loads(raw)
+                    if not isinstance(status_payload, dict):
+                        status_payload = {"status": "error", "detail": str(status_payload)}
+                except Exception as exc:
+                    logger.exception("Failed polling research job status: job_id=%s", job_id)
+                    await orchestrator.save_workflow_checkpoint(
+                        workflow="research_job",
+                        status="failed",
+                        payload={
+                            "job_id": job_id,
+                            "topic": topic,
+                            "source": source,
+                            "channel_id": channel_id,
+                            "error": str(exc)[:600],
+                        },
+                        job_id=job_id,
+                    )
+                    return
+
+                status = str(status_payload.get("status", "")).strip().lower()
+                if status == "done":
+                    report = str(status_payload.get("report", "")).strip() or "(レポート本文なし)"
+                    channel = await _resolve_channel(channel_id)
+                    if channel is not None:
+                        summary = (
+                            "Research Agent の調査が完了しました。\n"
+                            f"job_id: {job_id}\n"
+                            f"topic: {topic}\n"
+                            f"source: {source}"
+                        )
+                        await channel.send(summary)
+                        for chunk in chunk_text(report, max_message_len):
+                            await channel.send(chunk)
+
+                    await orchestrator.save_workflow_checkpoint(
+                        workflow="research_job",
+                        status="done",
+                        payload={
+                            "job_id": job_id,
+                            "topic": topic,
+                            "source": source,
+                            "channel_id": channel_id,
+                            "finished_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                        job_id=job_id,
+                    )
+                    return
+
+                if status == "failed":
+                    detail = str(status_payload.get("error") or status_payload.get("detail") or "unknown")
+                    channel = await _resolve_channel(channel_id)
+                    if channel is not None:
+                        await channel.send(
+                            "Research Agent の調査が失敗しました。\n"
+                            f"job_id: {job_id}\n"
+                            f"topic: {topic}\n"
+                            f"detail: {detail[:700]}"
+                        )
+                    await orchestrator.save_workflow_checkpoint(
+                        workflow="research_job",
+                        status="failed",
+                        payload={
+                            "job_id": job_id,
+                            "topic": topic,
+                            "source": source,
+                            "channel_id": channel_id,
+                            "error": detail[:600],
+                        },
+                        job_id=job_id,
+                    )
+                    return
+
+                await orchestrator.save_workflow_checkpoint(
+                    workflow="research_job",
+                    status=status or "running",
+                    payload={
+                        "job_id": job_id,
+                        "topic": topic,
+                        "source": source,
+                        "channel_id": channel_id,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                    job_id=job_id,
+                )
+
+                await asyncio.sleep(research_notify_poll_sec)
+                elapsed = int((datetime.now(timezone.utc) - started).total_seconds())
+
+            channel = await _resolve_channel(channel_id)
+            if channel is not None:
+                await channel.send(
+                    "Research Agent の調査が長時間実行中です。\n"
+                    f"job_id: {job_id}\n"
+                    "しばらくしてから再確認します。"
+                )
+
+        task = asyncio.create_task(_runner(), name=f"research-notify-{job_id}")
+        research_notify_tasks.add(task)
+        task.add_done_callback(lambda t: research_notify_tasks.discard(t))
 
     class CliApprovalView(View):
         def __init__(
@@ -1158,9 +1307,32 @@ def main() -> None:
             if deepdive_use_research_agent:
                 result = await orchestrator.execute_tool_job(
                     tool_name="dispatch_research_job",
-                    args={"topic": topic, "source": source_value, "wait": "true"},
+                    args={"topic": topic, "source": source_value, "wait": "false"},
                     task_label="deepdive:research",
                 )
+                try:
+                    payload = json.loads(result)
+                except Exception:
+                    payload = {}
+
+                if (
+                    research_notify_on_complete
+                    and isinstance(payload, dict)
+                    and str(payload.get("status", "")).strip().lower() == "queued"
+                ):
+                    job_id = str(payload.get("job_id", "")).strip()
+                    if job_id:
+                        await _start_research_notification(
+                            job_id=job_id,
+                            topic=topic,
+                            source=source_value,
+                            channel_id=int(interaction.channel_id),
+                        )
+                        result = (
+                            "Research Agent にジョブを投入しました。\n"
+                            f"job_id: {job_id}\n"
+                            "完了したらこのチャンネルへ自動通知します。"
+                        )
             else:
                 result = await orchestrator.execute_tool_job(
                     tool_name="source_deep_dive",
@@ -1399,6 +1571,36 @@ def main() -> None:
             logger.warning("Command sync failed for guilds: %s", failed)
         if skipped_targets:
             logger.warning("Command sync skipped (bot has no access) for guilds: %s", skipped_targets)
+
+        if research_notify_on_complete:
+            try:
+                checkpoints = await orchestrator.list_workflow_checkpoints(
+                    workflow="research_job",
+                    status="queued",
+                    limit=20,
+                )
+                resumed = 0
+                for cp in checkpoints:
+                    payload = cp.get("payload", {}) if isinstance(cp, dict) else {}
+                    if not isinstance(payload, dict):
+                        continue
+                    job_id = str(cp.get("job_id", "")).strip() or str(payload.get("job_id", "")).strip()
+                    topic = str(payload.get("topic", "")).strip()
+                    source = str(payload.get("source", "auto")).strip() or "auto"
+                    channel_id = int(payload.get("channel_id", 0) or 0)
+                    if not job_id or not topic or channel_id <= 0:
+                        continue
+                    await _start_research_notification(
+                        job_id=job_id,
+                        topic=topic,
+                        source=source,
+                        channel_id=channel_id,
+                    )
+                    resumed += 1
+                if resumed > 0:
+                    logger.info("Resumed research notify tasks from checkpoints: %s", resumed)
+            except Exception:
+                logger.exception("Failed to resume research notify tasks")
 
         if bootstrap_on_ready:
             if not enable_message_content_intent:

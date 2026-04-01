@@ -24,6 +24,76 @@ def _research_token() -> str:
     return os.getenv("RESEARCH_AGENT_SHARED_TOKEN", "change_me").strip() or "change_me"
 
 
+def _request_json(path: str, method: str = "GET", body: dict[str, object] | None = None) -> tuple[dict[str, object], str | None, int | None]:
+    headers = {
+        "Accept": "application/json",
+        "X-Research-Token": _research_token(),
+        "User-Agent": "discord-ai-agent/1.0",
+    }
+    payload_bytes = None
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        payload_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
+
+    req = Request(
+        f"{_research_base_url()}{path}",
+        data=payload_bytes,
+        method=method,
+        headers=headers,
+    )
+
+    http_timeout = max(5, _safe_int("RESEARCH_AGENT_HTTP_TIMEOUT_SEC", 10))
+    try:
+        with urlopen(req, timeout=http_timeout) as res:
+            status_code = int(getattr(res, "status", 200))
+            raw = res.read().decode("utf-8", errors="replace")
+        payload = json.loads(raw) if raw else {}
+        if not isinstance(payload, dict):
+            payload = {"status": "error", "code": "invalid_payload_type", "detail": str(payload)[:1200]}
+        return payload, None, status_code
+    except HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            detail = str(exc)
+        return {}, detail[:1200], int(getattr(exc, "code", 500))
+    except URLError as exc:
+        return {}, str(exc), None
+    except Exception as exc:
+        return {}, str(exc)[:1200], None
+
+
+def get_research_job_status(job_id: str) -> str:
+    clean_job_id = (job_id or "").strip()
+    if not clean_job_id:
+        return json.dumps(
+            {
+                "status": "error",
+                "code": "invalid_job_id",
+                "action": "get_research_job_status",
+                "detail": "job_id が空です。",
+            },
+            ensure_ascii=False,
+        )
+
+    payload, err, status_code = _request_json(path=f"/v1/jobs/{quote(clean_job_id)}", method="GET")
+    if err is not None:
+        return json.dumps(
+            {
+                "status": "error",
+                "code": "research_agent_http_error",
+                "action": "get_research_job_status",
+                "job_id": clean_job_id,
+                "status_code": status_code,
+                "detail": err,
+            },
+            ensure_ascii=False,
+        )
+
+    payload["action"] = "get_research_job_status"
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def dispatch_research_job(
     topic: str,
     source: str = "auto",
@@ -55,66 +125,23 @@ def dispatch_research_job(
         except ValueError:
             pass
 
-    req_body = json.dumps(
-        {
+    created, err, status_code = _request_json(
+        path="/v1/jobs",
+        method="POST",
+        body={
             "topic": clean_topic,
             "source": clean_source,
             "mode": clean_mode,
         },
-        ensure_ascii=False,
-    ).encode("utf-8")
-
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "X-Research-Token": _research_token(),
-        "User-Agent": "discord-ai-agent/1.0",
-    }
-
-    http_timeout = max(5, _safe_int("RESEARCH_AGENT_HTTP_TIMEOUT_SEC", 10))
-    create_req = Request(
-        f"{_research_base_url()}/v1/jobs",
-        data=req_body,
-        method="POST",
-        headers=headers,
     )
-
-    try:
-        with urlopen(create_req, timeout=http_timeout) as res:
-            raw = res.read().decode("utf-8", errors="replace")
-        created = json.loads(raw) if raw else {}
-    except HTTPError as exc:
-        try:
-            detail = exc.read().decode("utf-8", errors="replace")
-        except Exception:
-            detail = str(exc)
+    if err is not None:
         return json.dumps(
             {
                 "status": "error",
                 "code": "research_agent_http_error",
                 "action": "dispatch_research_job",
-                "status_code": int(getattr(exc, "code", 500)),
-                "detail": detail[:1200],
-            },
-            ensure_ascii=False,
-        )
-    except URLError as exc:
-        return json.dumps(
-            {
-                "status": "error",
-                "code": "research_agent_unreachable",
-                "action": "dispatch_research_job",
-                "detail": str(exc),
-            },
-            ensure_ascii=False,
-        )
-    except Exception as exc:
-        return json.dumps(
-            {
-                "status": "error",
-                "code": "research_agent_request_failed",
-                "action": "dispatch_research_job",
-                "detail": str(exc)[:1200],
+                "status_code": status_code,
+                "detail": err,
             },
             ensure_ascii=False,
         )
@@ -144,27 +171,16 @@ def dispatch_research_job(
 
     started = time.time()
     while (time.time() - started) <= wait_timeout:
-        get_req = Request(
-            f"{_research_base_url()}/v1/jobs/{quote(job_id)}",
-            method="GET",
-            headers={
-                "Accept": "application/json",
-                "X-Research-Token": _research_token(),
-                "User-Agent": "discord-ai-agent/1.0",
-            },
-        )
-        try:
-            with urlopen(get_req, timeout=http_timeout) as res:
-                raw = res.read().decode("utf-8", errors="replace")
-            snapshot = json.loads(raw) if raw else {}
-        except Exception as exc:
+        snapshot, poll_err, poll_status = _request_json(path=f"/v1/jobs/{quote(job_id)}", method="GET")
+        if poll_err is not None:
             return json.dumps(
                 {
                     "status": "error",
                     "code": "research_agent_poll_failed",
                     "action": "dispatch_research_job",
                     "job_id": job_id,
-                    "detail": str(exc)[:1200],
+                    "status_code": poll_status,
+                    "detail": poll_err,
                 },
                 ensure_ascii=False,
             )

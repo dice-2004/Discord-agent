@@ -7,7 +7,7 @@ from typing import Any, Callable
 from discord_ai_agent.tools.action_tools import execute_internal_action
 from discord_ai_agent.tools.cli_tools import run_local_cli
 from discord_ai_agent.tools.deep_dive_tools import source_deep_dive
-from discord_ai_agent.tools.research_tools import dispatch_research_job
+from discord_ai_agent.tools.research_tools import dispatch_research_job, get_research_job_status
 from discord_ai_agent.tools.reader_tools import read_url_markdown
 from discord_ai_agent.tools.search_tools import web_search
 
@@ -142,6 +142,13 @@ def build_default_tool_registry() -> ToolRegistry:
             },
             required_args=["topic"],
             func=dispatch_research_job,
+        ),
+        ToolSpec(
+            name="get_research_job_status",
+            description="Research Agentジョブの現在状態を取得する",
+            args_schema={"job_id": "string"},
+            required_args=["job_id"],
+            func=get_research_job_status,
         ),
         ToolSpec(
             name="run_local_cli",

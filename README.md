@@ -87,6 +87,7 @@ docker compose logs -f research-agent
 - `RESEARCH_AGENT_DB_PATH` / `RESEARCH_AGENT_POLL_INTERVAL_SEC` / `RESEARCH_AGENT_WAIT_TIMEOUT_SEC`
 - `RESEARCH_AGENT_USE_GEMINI_CLI` / `RESEARCH_AGENT_GEMINI_COMMAND`
 - `DEEPDIVE_USE_RESEARCH_AGENT`
+- `RESEARCH_NOTIFY_ON_COMPLETE` / `RESEARCH_NOTIFY_TIMEOUT_SEC` / `RESEARCH_NOTIFY_POLL_SEC`
 
 ### 2. Discord からの実行
 
@@ -116,6 +117,7 @@ docker compose logs -f research-agent
 - 初期実装は `POST /v1/jobs` と `GET /v1/jobs/{job_id}` の軽量HTTP通信です。
 - `X-Research-Token` でコンテナ間通信を保護します。
 - Researchジョブの状態は `data/runtime/research_jobs.sqlite3` に保存されます。
+- `/deepdive` は既定でジョブを非同期投入し、完了時に同じチャンネルへ自動通知します。
 
 Gemini CLI の利用方針:
 
