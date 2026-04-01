@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import math
 import os
 import re
+import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -25,6 +28,183 @@ class MemoryRecord:
     user_id: str
     message_id: str | None = None
     metadata: dict[str, Any] | None = None
+
+
+class TaskCheckpointStore:
+    """SQLite-backed checkpoint store for resumable long-running workflows."""
+
+    def __init__(self, db_path: str) -> None:
+        self._db_path = Path(db_path)
+        self._initialize()
+
+    def _initialize(self) -> None:
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self._db_path, timeout=5.0) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS workflow_checkpoints (
+                    job_id TEXT PRIMARY KEY,
+                    workflow TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_workflow_checkpoints_workflow_status
+                ON workflow_checkpoints (workflow, status, updated_at)
+                """
+            )
+
+    async def upsert_checkpoint(
+        self,
+        job_id: str,
+        workflow: str,
+        status: str,
+        payload: dict[str, Any],
+    ) -> None:
+        await asyncio.to_thread(
+            self._upsert_checkpoint_sync,
+            job_id,
+            workflow,
+            status,
+            payload,
+        )
+
+    def _upsert_checkpoint_sync(
+        self,
+        job_id: str,
+        workflow: str,
+        status: str,
+        payload: dict[str, Any],
+    ) -> None:
+        clean_job_id = (job_id or "").strip()
+        clean_workflow = (workflow or "").strip() or "unspecified"
+        clean_status = (status or "").strip() or "running"
+        if not clean_job_id:
+            return
+
+        now = datetime.now(timezone.utc).isoformat()
+        payload_json = json.dumps(payload or {}, ensure_ascii=False)
+
+        with sqlite3.connect(self._db_path, timeout=5.0) as conn:
+            conn.execute(
+                """
+                INSERT INTO workflow_checkpoints(job_id, workflow, status, payload_json, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                    workflow=excluded.workflow,
+                    status=excluded.status,
+                    payload_json=excluded.payload_json,
+                    updated_at=excluded.updated_at
+                """,
+                (clean_job_id, clean_workflow, clean_status, payload_json, now),
+            )
+
+    async def get_checkpoint(self, job_id: str) -> dict[str, Any] | None:
+        return await asyncio.to_thread(self._get_checkpoint_sync, job_id)
+
+    def _get_checkpoint_sync(self, job_id: str) -> dict[str, Any] | None:
+        clean_job_id = (job_id or "").strip()
+        if not clean_job_id:
+            return None
+
+        with sqlite3.connect(self._db_path, timeout=5.0) as conn:
+            row = conn.execute(
+                """
+                SELECT job_id, workflow, status, payload_json, updated_at
+                FROM workflow_checkpoints
+                WHERE job_id = ?
+                """,
+                (clean_job_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        payload: dict[str, Any]
+        try:
+            payload = json.loads(str(row[3]))
+            if not isinstance(payload, dict):
+                payload = {}
+        except Exception:
+            payload = {}
+
+        return {
+            "job_id": str(row[0]),
+            "workflow": str(row[1]),
+            "status": str(row[2]),
+            "payload": payload,
+            "updated_at": str(row[4]),
+        }
+
+    async def list_checkpoints(
+        self,
+        workflow: str,
+        status: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._list_checkpoints_sync, workflow, status, limit)
+
+    def _list_checkpoints_sync(
+        self,
+        workflow: str,
+        status: str | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        clean_workflow = (workflow or "").strip() or "unspecified"
+        clean_status = (status or "").strip() or None
+        fetch_limit = max(1, min(int(limit), 200))
+
+        query = (
+            "SELECT job_id, workflow, status, payload_json, updated_at "
+            "FROM workflow_checkpoints "
+            "WHERE workflow = ?"
+        )
+        params: list[Any] = [clean_workflow]
+        if clean_status is not None:
+            query += " AND status = ?"
+            params.append(clean_status)
+        query += " ORDER BY updated_at DESC LIMIT ?"
+        params.append(fetch_limit)
+
+        with sqlite3.connect(self._db_path, timeout=5.0) as conn:
+            rows = conn.execute(query, tuple(params)).fetchall()
+
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                payload = json.loads(str(row[3]))
+                if not isinstance(payload, dict):
+                    payload = {}
+            except Exception:
+                payload = {}
+            results.append(
+                {
+                    "job_id": str(row[0]),
+                    "workflow": str(row[1]),
+                    "status": str(row[2]),
+                    "payload": payload,
+                    "updated_at": str(row[4]),
+                }
+            )
+        return results
+
+    async def delete_checkpoint(self, job_id: str) -> int:
+        return await asyncio.to_thread(self._delete_checkpoint_sync, job_id)
+
+    def _delete_checkpoint_sync(self, job_id: str) -> int:
+        clean_job_id = (job_id or "").strip()
+        if not clean_job_id:
+            return 0
+        with sqlite3.connect(self._db_path, timeout=5.0) as conn:
+            cur = conn.execute(
+                "DELETE FROM workflow_checkpoints WHERE job_id = ?",
+                (clean_job_id,),
+            )
+            return int(cur.rowcount or 0)
 
 
 class ChannelMemoryStore:

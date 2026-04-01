@@ -6,6 +6,13 @@
 
 ### 仕様更新
 
+- n8n中継方式を非推奨化し、外部アクションをBotコード内で直接実行する方針へ更新した
+- `/n8n_action` 中心の運用方針を `/action` 中心へ更新し、`/n8n_action` は互換コマンドとして扱う方針へ変更した
+- `.env` 仕様を `N8N_*` 系から `INTERNAL_*` 系へ移行し、認証誘導URL（`GITHUB_AUTH_URL` / `SMTP_AUTH_URL`）を追加した
+- フェーズ分割前提を廃止し、全機能を設計対象とする統一方針へ更新した
+- 本運用必須4要件（キュー制御・チェックポイント・JSON強制・疑似成功禁止）を追加した
+- 未実装機能の扱いを `not_implemented_action` エラー返却へ統一する方針を追加した
+- `.env` 仕様へ `MAX_CONCURRENT_HEAVY_TASKS` / `HEAVY_TASK_TIMEOUT_SEC` / `CHECKPOINT_DB_PATH` を追加した
 - `docs/DESIGN.md` から Phase 前提の記述を外し、継続実装前提の文書へ再編
 - Tool章を「4本柱」から「6本柱」へ更新し、将来実装枠として「Discord過去ログ検索ツール」「n8n Webhookツール」を追加
 - データベース設計章へ将来拡張枠として「カスタムドキュメントRAG（PDF/テキスト）」「SQLite（権限/承認待ち管理）」を追加
@@ -42,6 +49,34 @@
 
 ### 実装
 
+- `/n8n_action` 互換コマンドを削除し、`/action` のみを正式コマンドとして運用するようにした
+- `/action` を `debug_action`（デバッグ専用）へ移行し、通常運用は `/ask` 中心とする方針へ更新した
+- `/auth_status` コマンドを追加し、外部連携の認証状態と導線URLをDiscord上で確認できるようにした
+- 起動時にグローバル/ギルドのコマンド再同期前に clear を実行し、旧コマンドの残留を自動クリーンアップするようにした
+- `backup_server_data` の内部アクション実装を追加し、許可ルート配下のみを `.tar.gz` へバックアップできるようにした
+- `append_sheet_row` の内部アクション実装を追加し、`SHEET_STORAGE_DIR` 配下のCSVへ行追加できるようにした
+- `add_notion_memo` の内部アクション実装を追加し、`NOTION_MEMO_STORAGE_PATH` へJSON Lines形式で記録できるようにした
+- `execute_internal_action` ツールを追加し、Webhook中継なしで action をコード内実行する方式へ移行した
+- メンション高速カレンダールーターで和文日付（例: `2026年4月7日`）を解釈できるようにし、定型入力の取りこぼしを削減した
+- メンション高速カレンダールーターで終日表現（`終日` / `全日` / `一日中`）を `00:00-23:59` として処理できるようにした
+- メンション高速カレンダールーターで「内容/日時」形式の箇条書き文（追加キーワードなし）も予定追加意図として判定できるようにした
+- `add_calendar_event` / `get_calendar_events` の日時パーサーを強化し、ISO8601に加えて和文・簡易日付時刻フォーマットを受理するよう改善した
+- 内部アクション日時でタイムゾーン未指定時は `TZ`（既定: `Asia/Tokyo`）を補完するようにし、時刻形式エラーの発生率を低減した
+- `add_calendar_event` に終日イベントのネイティブ登録（`all_day=true`, `date`, `end_date`）を追加し、00:00-23:59擬似登録に依存しない運用へ改善した
+- メンション高速ルーターで `00:00-23:59` 指定を終日として自動解釈する補正を追加した
+- オーケストレーター方針文を更新し、終日指定時に時刻確認を要求せず `all_day + date` 形式で実行するよう明示した
+- `execute_internal_action` に action別名の正規化を追加し、`calendar_add_event` / `calendar_get_events` を `add_calendar_event` / `get_calendar_events` へ自動変換できるようにした
+- メンション高速ルーターで `4月5日` のような和文月日入力を解釈できるようにし、終日登録の取りこぼしを低減した
+- オーケストレーター方針文を更新し、入力が明確な予定追加は確認質問を省略して実行するルールを強化した
+- `docs/DESIGN.md` を更新し、Research Agent/Eternal Explorer の別コンテナ分離推奨方針を追記した
+- `docs/DESIGN.md` と `.env.example` の `INTERNAL_ACTION_REQUIRED_FIELDS` を更新し、`add_calendar_event` は `title` を共通必須として timed/all-day の二方式を許可した
+- `create_github_issue` と `send_email` の内部アクション実装を追加し、認証未設定時は `auth_required` と `auth_url` を返すようにした
+- `docker-compose.yml` から n8n サービスを外し、Bot単体 + runtime永続ボリューム構成へ変更した
+- `docs/N8N_DEPLOYMENT_BEGINNER_GUIDE.md` を非推奨ガイドへ更新し、現行運用導線を `README.md` / `docs/DESIGN.md` へ統一した
+- オーケストレーターに重い処理の同時実行制限（`asyncio.Semaphore`）を追加し、`/ask` と重いツール実行をキュー制御下へ移行した
+- オーケストレーターへ SQLite ベースのチェックポイント保存API（save/load/list）を追加した
+- Gemini意思決定系の呼び出しで `response_mime_type=application/json` を指定し、JSONパース安定性を強化した
+- n8n未実装アクションの `stub-success` 応答を廃止し、`not_implemented_action` + HTTP 501 を返すよう変更した
 - `create_github_issue` アクションを n8n 側で stub 応答から実API呼び出しへ更新し、`GITHUB_TOKEN` 未設定時は 503 を返す安全分岐を追加した
 - n8n の `create_github_issue` で GitHub API 応答を判定し、成功時（201）と失敗時（4xx/5xx）でJSONレスポンスを分離した
 - `trigger_n8n_webhook` に再試行設定（`N8N_RETRY_COUNT` / `N8N_RETRY_BACKOFF_SEC`）を追加し、HTTPエラー時のデバッグ情報を強化した
@@ -67,7 +102,7 @@
 
 ### 仕様策定・明確化
 
-- Phase 1の未定義事項A〜Gを具体仕様として明文化
+- `add_calendar_event` / `get_calendar_events` の内部アクション実装を追加し、`CALENDAR_EVENTS_STORAGE_PATH` へJSON Lines形式で記録・期間検索できるようにした
 - initial_profileの欠損時挙動、サイズ上限、推奨テンプレートを追加
 - Web検索の件数、タイムアウト、再試行、出力フォーマットを固定
 - ChromaDBの分離キー、命名規則、保存スキーマ、検索件数を固定

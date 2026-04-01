@@ -6,7 +6,7 @@ import json
 import logging
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -258,6 +258,153 @@ def _safe_float_env(name: str, default: float) -> float:
         return default
 
 
+def _extract_time_range(text: str) -> tuple[int, int, int, int] | None:
+    match = re.search(r"(\d{1,2})(?::(\d{2}))?\s*[-~〜]\s*(\d{1,2})(?::(\d{2}))?", text)
+    if not match:
+        return None
+    sh = int(match.group(1))
+    sm = int(match.group(2) or "0")
+    eh = int(match.group(3))
+    em = int(match.group(4) or "0")
+    if sh > 23 or eh > 23 or sm > 59 or em > 59:
+        return None
+    return sh, sm, eh, em
+
+
+def _extract_date_base(text: str, now_jst: datetime) -> datetime | None:
+    jp_date_match = re.search(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日", text)
+    if jp_date_match:
+        try:
+            y = int(jp_date_match.group(1))
+            m = int(jp_date_match.group(2))
+            d = int(jp_date_match.group(3))
+            return datetime(y, m, d, tzinfo=now_jst.tzinfo)
+        except Exception:
+            return None
+
+    date_match = re.search(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})", text)
+    if date_match:
+        try:
+            y = int(date_match.group(1))
+            m = int(date_match.group(2))
+            d = int(date_match.group(3))
+            return datetime(y, m, d, tzinfo=now_jst.tzinfo)
+        except Exception:
+            return None
+
+    md_match = re.search(r"(\d{1,2})\s*月\s*(\d{1,2})\s*日", text)
+    if md_match:
+        try:
+            m = int(md_match.group(1))
+            d = int(md_match.group(2))
+            base = datetime(now_jst.year, m, d, tzinfo=now_jst.tzinfo)
+            # Past date in current year is treated as next year for natural scheduling intent.
+            if base.date() < now_jst.date() - timedelta(days=1):
+                base = base.replace(year=base.year + 1)
+            return base
+        except Exception:
+            return None
+    if "明日" in text:
+        return (now_jst + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    if "今日" in text:
+        return now_jst.replace(hour=0, minute=0, second=0, microsecond=0)
+    return None
+
+
+def _extract_title(text: str) -> str:
+    quoted = re.search(r"[「\"]([^\"」]+)[」\"]", text)
+    if quoted:
+        return quoted.group(1).strip()
+    key_match = re.search(r"(?:内容|件名|タイトル)[:：]\s*([^\n]+)", text)
+    if key_match:
+        return key_match.group(1).strip()
+    return "予定"
+
+
+def build_quick_calendar_action(question: str) -> tuple[str, dict[str, object]] | None:
+    text = (question or "").strip()
+    if not text:
+        return None
+
+    jst = timezone(timedelta(hours=9))
+    now_jst = datetime.now(jst)
+
+    # Quick retrieval intents.
+    if "予定" in text and any(k in text for k in ("今月", "来月", "今日", "明日", "今週")) and "追加" not in text:
+        if "今月" in text:
+            start = now_jst.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            if start.month == 12:
+                end = start.replace(year=start.year + 1, month=1)
+            else:
+                end = start.replace(month=start.month + 1)
+        elif "来月" in text:
+            this_month = now_jst.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            if this_month.month == 12:
+                start = this_month.replace(year=this_month.year + 1, month=1)
+            else:
+                start = this_month.replace(month=this_month.month + 1)
+            if start.month == 12:
+                end = start.replace(year=start.year + 1, month=1)
+            else:
+                end = start.replace(month=start.month + 1)
+        elif "今週" in text:
+            start = (now_jst - timedelta(days=now_jst.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+            end = start + timedelta(days=7)
+        elif "明日" in text:
+            start = (now_jst + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            end = start + timedelta(days=1)
+        else:
+            start = now_jst.replace(hour=0, minute=0, second=0, microsecond=0)
+            end = start + timedelta(days=1)
+
+        return "get_calendar_events", {
+            "time_min": start.isoformat(),
+            "time_max": end.isoformat(),
+        }
+
+    # Quick add intents.
+    add_intent = any(k in text for k in ("予定追加", "追加して", "登録して", "カレンダーに", "入れて", "タスク"))
+    if not add_intent:
+        add_intent = (
+            ("内容" in text and "日時" in text)
+            and bool(re.search(r"\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日|\d{4}[/-]\d{1,2}[/-]\d{1,2}", text))
+        )
+
+    if add_intent:
+        date_base = _extract_date_base(text, now_jst)
+        time_range = _extract_time_range(text)
+        all_day = any(k in text for k in ("終日", "全日", "一日中", "1日中"))
+        if time_range is not None:
+            sh, sm, eh, em = time_range
+            if sh == 0 and sm == 0 and eh == 23 and em in {59, 60}:
+                all_day = True
+        if date_base is None or (time_range is None and not all_day):
+            return None
+
+        if all_day:
+            return "add_calendar_event", {
+                "title": _extract_title(text),
+                "all_day": True,
+                "date": date_base.strftime("%Y-%m-%d"),
+            }
+
+        if time_range is None:
+            return None
+        sh, sm, eh, em = time_range
+        start = date_base.replace(hour=sh, minute=sm)
+        end = date_base.replace(hour=eh, minute=em)
+        if end <= start:
+            end = end + timedelta(days=1)
+
+        return "add_calendar_event", {
+            "title": _extract_title(text),
+            "start_time": start.isoformat(),
+            "end_time": end.isoformat(),
+        }
+
+    return None
+
+
 def _parse_int_set_env(name: str) -> set[int]:
     raw = os.getenv(name, "").strip()
     values: set[int] = set()
@@ -405,6 +552,8 @@ def main() -> None:
     )
     bootstrap_archived_limit_per_parent = int(os.getenv("MEMORY_BOOTSTRAP_ARCHIVED_LIMIT_PER_PARENT", "0"))
     mention_ask_enabled = os.getenv("MENTION_ASK_ENABLED", "true").strip().lower() == "true"
+    mention_require_prefix = os.getenv("MENTION_REQUIRE_PREFIX", "true").strip().lower() == "true"
+    mention_quick_calendar_enabled = os.getenv("MENTION_QUICK_CALENDAR_ENABLED", "true").strip().lower() == "true"
     logsearch_default_scope = os.getenv("LOGSEARCH_DEFAULT_SCOPE", "guild").strip().lower()
     if logsearch_default_scope not in {"channel", "guild"}:
         logsearch_default_scope = "guild"
@@ -876,10 +1025,10 @@ def main() -> None:
 
         await interaction.response.defer(thinking=True)
         try:
-            result = await asyncio.to_thread(
-                orchestrator.tool_registry.execute,
-                "read_url_markdown",
-                {"url": url},
+            result = await orchestrator.execute_tool_job(
+                tool_name="read_url_markdown",
+                args={"url": url},
+                task_label="readurl",
             )
             await send_response(interaction, result, max_message_len=max_message_len)
         except Exception:
@@ -912,10 +1061,10 @@ def main() -> None:
         await interaction.response.defer(thinking=True)
         try:
             source_value = source.value if source is not None else "auto"
-            result = await asyncio.to_thread(
-                orchestrator.tool_registry.execute,
-                "source_deep_dive",
-                {"topic": topic, "source": source_value},
+            result = await orchestrator.execute_tool_job(
+                tool_name="source_deep_dive",
+                args={"topic": topic, "source": source_value},
+                task_label="deepdive",
             )
             await send_response(interaction, result, max_message_len=max_message_len)
         except Exception:
@@ -993,9 +1142,81 @@ def main() -> None:
             logger.exception("Failed to handle /logsearch")
             await interaction.followup.send("ログ検索に失敗しました。", ephemeral=True)
 
-    @tree.command(name="n8n_action", description="許可済みn8n webhook actionを実行します")
+    debug_operator_user_ids = {
+        int(part.strip())
+        for part in os.getenv("DEBUG_OPERATOR_USER_IDS", os.getenv("CLI_APPROVER_USER_IDS", "")).split(",")
+        if part.strip().isdigit()
+    }
+    command_allowlist = {
+        part.strip()
+        for part in os.getenv("DISCORD_COMMAND_ALLOWLIST", "ask,auth_status,debug_action").split(",")
+        if part.strip()
+    }
+
+    @tree.command(name="auth_status", description="外部連携の認証設定状況を表示します")
+    async def auth_status(interaction: discord.Interaction) -> None:
+        if interaction.guild_id is None or interaction.guild_id not in allowed_guild_ids:
+            await interaction.response.send_message(
+                "このサーバーではこのBotを利用できません。",
+                ephemeral=True,
+            )
+            return
+
+        enabled_actions = {
+            part.strip()
+            for part in os.getenv("INTERNAL_ALLOWED_ACTIONS", "").split(",")
+            if part.strip()
+        }
+        calendar_provider = (os.getenv("CALENDAR_PROVIDER", "google").strip().lower() or "google")
+        calendar_id = os.getenv("GOOGLE_CALENDAR_ID", "primary").strip() or "primary"
+        calendar_creds_ready = all(
+            bool(os.getenv(key, "").strip())
+            for key in [
+                "GOOGLE_CALENDAR_CLIENT_ID",
+                "GOOGLE_CALENDAR_CLIENT_SECRET",
+                "GOOGLE_CALENDAR_REFRESH_TOKEN",
+            ]
+        )
+        calendar_auth_url = os.getenv(
+            "GOOGLE_CALENDAR_AUTH_URL",
+            "https://console.cloud.google.com/apis/credentials",
+        ).strip()
+
+        github_token_set = bool(os.getenv("GITHUB_TOKEN", "").strip())
+        smtp_ready = all(
+            bool(os.getenv(key, "").strip())
+            for key in ["SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD", "SMTP_FROM"]
+        )
+        smtp_enabled = "send_email" in enabled_actions
+        github_auth_url = os.getenv("GITHUB_AUTH_URL", "https://github.com/settings/tokens").strip()
+        smtp_auth_url = os.getenv("SMTP_AUTH_URL", "").strip() or "(未設定)"
+
+        smtp_line = (
+            f"- SMTP credentials (optional): {'configured' if smtp_ready else 'missing'}\n"
+            f"- SMTP auth URL: {smtp_auth_url}\n"
+            f"- SMTP action enabled: {'yes' if smtp_enabled else 'no'}\n"
+        )
+        calendar_line = (
+            f"- Calendar provider: {calendar_provider}\n"
+            f"- Calendar ID: {calendar_id}\n"
+            f"- Google Calendar credentials: {'configured' if calendar_creds_ready else 'missing'}\n"
+            f"- Google Calendar auth URL: {calendar_auth_url}\n"
+        )
+
+        body = (
+            "認証設定ステータス\n"
+            f"- GitHub token: {'configured' if github_token_set else 'missing'}\n"
+            f"- GitHub auth URL: {github_auth_url}\n"
+            f"{calendar_line}"
+            f"{smtp_line}"
+            "\n"
+            "通常運用は /ask を使ってください。"
+        )
+        await interaction.response.send_message(body, ephemeral=True)
+
+    @tree.command(name="debug_action", description="デバッグ用: actionを手動実行します")
     @app_commands.describe(action="action名", payload_json="JSONオブジェクト文字列")
-    async def n8n_action(
+    async def debug_action_command(
         interaction: discord.Interaction,
         action: str,
         payload_json: str = "{}",
@@ -1007,28 +1228,64 @@ def main() -> None:
             )
             return
 
+        if debug_operator_user_ids and interaction.user.id not in debug_operator_user_ids:
+            await interaction.response.send_message(
+                "このコマンドはデバッグ担当者のみ利用できます。通常は /ask を使ってください。",
+                ephemeral=True,
+            )
+            return
+
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            result = await asyncio.to_thread(
-                orchestrator.tool_registry.execute,
-                "trigger_n8n_webhook",
-                {"action": action, "payload_json": payload_json},
+            result = await orchestrator.execute_tool_job(
+                tool_name="execute_internal_action",
+                args={"action": action, "payload_json": payload_json},
+                task_label="debug_action",
             )
             for chunk in chunk_text(result, 1800):
                 await interaction.followup.send(chunk, ephemeral=True)
         except Exception:
-            logger.exception("Failed to handle /n8n_action")
-            await interaction.followup.send("n8n action の実行に失敗しました。", ephemeral=True)
+            logger.exception("Failed to handle /debug_action")
+            await interaction.followup.send("action の実行に失敗しました。", ephemeral=True)
 
     @client.event
     async def on_ready() -> None:
         logger.info("Logged in as %s (%s)", client.user, client.user.id if client.user else "unknown")
+
+        removed_global_defs: list[str] = []
+        for command in list(tree.get_commands(guild=None)):
+            if command.name in command_allowlist:
+                continue
+            tree.remove_command(command.name)
+            removed_global_defs.append(command.name)
+        if removed_global_defs:
+            logger.info("Pruned local commands by allowlist: %s", sorted(set(removed_global_defs)))
+
+        try:
+            app_id = client.application_id
+            if app_id is not None:
+                await tree._http.bulk_upsert_global_commands(app_id, payload=[])
+                logger.info("Global commands purged before guild sync")
+            else:
+                logger.warning("Skip global purge: application_id is None")
+        except Exception:
+            logger.exception("Failed to purge global commands")
+
         synced: list[int] = []
         failed: list[int] = []
-        for guild_id in sorted(allowed_guild_ids):
+        connected_guild_ids = {g.id for g in client.guilds}
+        sync_targets = sorted(gid for gid in allowed_guild_ids if gid in connected_guild_ids)
+        skipped_targets = sorted(gid for gid in allowed_guild_ids if gid not in connected_guild_ids)
+
+        for guild_id in sync_targets:
             try:
                 guild = discord.Object(id=guild_id)
+                tree.clear_commands(guild=guild)
                 tree.copy_global_to(guild=guild)
+                for command in list(tree.get_commands(guild=guild)):
+                    if command.name in command_allowlist:
+                        continue
+                    tree.remove_command(command.name, guild=guild)
                 await tree.sync(guild=guild)
                 synced.append(guild_id)
             except Exception:
@@ -1039,6 +1296,8 @@ def main() -> None:
             logger.info("Command sync completed for guilds: %s", synced)
         if failed:
             logger.warning("Command sync failed for guilds: %s", failed)
+        if skipped_targets:
+            logger.warning("Command sync skipped (bot has no access) for guilds: %s", skipped_targets)
 
         if bootstrap_on_ready:
             if not enable_message_content_intent:
@@ -1125,9 +1384,37 @@ def main() -> None:
         if client.user not in message.mentions:
             return
 
-        question = (message.content or "").replace(client.user.mention, "").strip()
-        if not question:
+        bot_id = int(client.user.id)
+        mention_prefix_pattern = re.compile(rf"^\s*<@!?{bot_id}>\s*")
+        mention_any_pattern = re.compile(rf"<@!?{bot_id}>")
+        if mention_require_prefix and mention_prefix_pattern.search(content) is None:
             return
+
+        question = mention_any_pattern.sub("", message.content or "").strip()
+        if not question:
+            try:
+                await message.reply("メンションの後ろに質問内容を書いてください。", mention_author=False)
+            except Exception:
+                logger.exception("Failed to send mention usage hint")
+            return
+
+        if mention_quick_calendar_enabled:
+            quick_action = build_quick_calendar_action(question)
+            if quick_action is not None:
+                action_name, payload = quick_action
+                try:
+                    result = await orchestrator.execute_tool_job(
+                        tool_name="execute_internal_action",
+                        args={
+                            "action": action_name,
+                            "payload_json": json.dumps(payload, ensure_ascii=False),
+                        },
+                        task_label=f"mention_quick:{action_name}",
+                    )
+                    await send_message_response(message, result, max_message_len=max_message_len)
+                    return
+                except Exception:
+                    logger.exception("Failed to handle mention quick calendar action")
 
         try:
             answer = await orchestrator.answer(

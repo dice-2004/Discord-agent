@@ -1,12 +1,14 @@
-# Discord AI Agent Bot (Phase 1)
+# Discord AI Agent Bot
 
 Discordをインターフェースにした、低リソース向けのAIエージェントです。
-Phase 1では以下を提供します。
+現在の標準構成では以下を提供します。
 
 - `/ask` での質問応答
 - Gemini 3.1 Flash Lite を使った回答生成
 - DuckDuckGo検索ツール（必要時のみ利用）
 - ChromaDBによるチャンネル分離メモリ
+- 重い処理の同時実行制限（キュー制御）
+- SQLiteによる長時間タスクのチェックポイント基盤
 - Dockerコンテナでの実運用前提
 
 ## ディレクトリ構成
@@ -58,145 +60,44 @@ docker compose up -d
 docker compose logs -f discord-ai-agent
 ```
 
-## n8nセットアップ（Docker / セルフホスト）
+## 外部アクション実行（コード内）
 
-このプロジェクトでは、n8nを同じ `docker compose` で起動し、Botは内部ネットワーク経由でWebhookを呼び出します。
+このプロジェクトは n8n 中継を使わず、Botコード内で action を直接実行します。
 
-本番運用を含む詳細手順は次を参照してください。
+### 1. 主要な環境変数
 
-- `docs/N8N_DEPLOYMENT_BEGINNER_GUIDE.md`（初心者向け。クリック手順付き）
+- `INTERNAL_ALLOWED_ACTIONS`
+- `INTERNAL_ACTION_REQUIRED_FIELDS`
+- `INTERNAL_ACTION_TIMEOUT_SEC`
+- `CALENDAR_PROVIDER` / `GOOGLE_CALENDAR_ID` / `GOOGLE_CALENDAR_CLIENT_ID` / `GOOGLE_CALENDAR_CLIENT_SECRET` / `GOOGLE_CALENDAR_REFRESH_TOKEN`
+- `GITHUB_TOKEN` / `GITHUB_AUTH_URL`
+- `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` / `SMTP_FROM` / `SMTP_AUTH_URL`（メール送信を使う場合のみ）
+- `BACKUP_OUTPUT_DIR` / `BACKUP_ALLOWED_ROOTS`
+- `SHEET_STORAGE_DIR`
+- `NOTION_MEMO_STORAGE_PATH`
+- `CALENDAR_EVENTS_STORAGE_PATH` / `CALENDAR_EVENTS_LIST_LIMIT`
 
-### 1. n8n用の .env を設定
+### 2. Discord からの実行
 
-最低限、以下を `.env` で設定してください。
+- 通常運用は `/ask` を使います（AIが必要なツールを自律的に選択して実行）
+- 認証状態確認: `/auth_status`
+- デバッグ用手動実行: `/debug_action action:<name> payload_json:<json>`
 
-- `N8N_BASIC_AUTH_USER`
-- `N8N_BASIC_AUTH_PASSWORD`
-- `N8N_ENCRYPTION_KEY`（32文字以上推奨）
-- `N8N_WEBHOOK_TOKEN`
+### 3. 認証未設定時の運用
 
-補足:
+認証未設定で実行すると、`auth_required` と `auth_url` を返します。Discordに返ったURLを開き、資格情報を準備してから再実行してください。
 
-- Bot→n8n 呼び出し先は `N8N_WEBHOOK_BASE_URL=http://n8n:5678/webhook/execute_n8n_workflow`（コンテナ間通信）
-- ブラウザからの管理UIは `http://localhost:5678`
+例:
 
-### 2. n8nを起動
+- GitHub: `GITHUB_AUTH_URL`（既定: `https://github.com/settings/tokens`）
+- Google Calendar: `GOOGLE_CALENDAR_AUTH_URL`（OAuth クライアント + refresh token の作成先）
+- SMTP: `SMTP_AUTH_URL`（運用サービスの設定ページURLを指定）
 
-```bash
-docker compose up -d n8n
-docker compose logs -f n8n
-```
+### 4. 注意点
 
-### 3. n8n Web UI にログイン
-
-1. ブラウザで `http://localhost:5678` を開く
-2. Basic Auth のユーザー/パスワードを入力（`.env` の `N8N_BASIC_AUTH_USER/PASSWORD`）
-
-### 4. `execute_n8n_workflow` 受け口ワークフローを作成
-
-GUIを使わずCUIで作成する場合（推奨）:
-
-```bash
-docker compose cp n8n/workflows/execute_n8n_workflow.json n8n:/tmp/execute_n8n_workflow.json
-docker compose exec -T n8n n8n import:workflow --input=/tmp/execute_n8n_workflow.json
-docker compose exec -T n8n n8n publish:workflow --id=CQ6P0owt0ZMIzZP6
-docker compose restart n8n
-```
-
-登録確認:
-
-```bash
-docker compose exec -T n8n n8n export:workflow --id=CQ6P0owt0ZMIzZP6
-```
-
-`"active": true` を確認してください。
-
-推奨構成:
-
-1. `Webhook` ノードを追加
-2. Path を `execute_n8n_workflow` に設定
-3. Method は `POST`
-4. `IF` / `Switch` ノードで `action` を分岐
-5. 各分岐で Google Calendar / Email ノードへ接続
-6. 最後に `Respond to Webhook` で JSONを返す
-
-期待する受信JSON:
-
-```json
-{
-  "action": "add_calendar_event",
-  "parameters": {
-    "title": "ゼミ",
-    "start_time": "2026-04-10T15:00:00+09:00",
-    "end_time": "2026-04-10T16:00:00+09:00"
-  }
-}
-```
-
-### 5. Webhookトークン検証（推奨）
-
-Botは `X-Webhook-Token` ヘッダを付与します（`.env` の `N8N_WEBHOOK_TOKEN`）。
-
-1. `Webhook` の直後に `IF` ノードを追加
-2. ヘッダ `x-webhook-token` が期待値と一致するか判定
-3. 不一致なら `Respond to Webhook` で 403 を返す
-
-### 6. Google Calendar連携（n8n内 OAuth）
-
-#### Google Cloud 側
-
-1. Google Cloud Consoleでプロジェクトを作成
-2. `Google Calendar API` を有効化
-3. OAuth 同意画面を設定（External でも可）
-4. OAuth クライアントIDを作成（Web application）
-5. Authorized redirect URI に以下を追加
-
-`http://localhost:5678/rest/oauth2-credential/callback`
-
-#### n8n 側
-
-1. Google Calendar ノードで新規Credential作成
-2. Client ID / Client Secret を入力
-3. `Connect my account` でGoogle認可
-4. 対象Googleアカウントへのアクセスを許可
-
-### 7. Bot連携の最終確認
-
-1. n8nワークフローを `Active` にする
-2. `.env` の `N8N_ALLOWED_ACTIONS` と `N8N_ACTION_REQUIRED_FIELDS` をワークフローに合わせる
-3. Botから `ask` で予定追加/参照要求を出し、n8nログと実データを確認
-
-### 8. メール送信（将来）
-
-SMTP利用時:
-
-- SMTP host / port / user / password
-
-API型利用時（SendGrid等）:
-
-- APIキー
-
-### 9. セキュリティ推奨
-
-- `N8N_BASIC_AUTH_PASSWORD` を強力な値へ変更
-- `N8N_ENCRYPTION_KEY` を32文字以上のランダム文字列へ変更
-- `N8N_WEBHOOK_TOKEN` を十分長いランダム値へ変更
-- 公開時はリバースプロキシでIP制限または認証を追加
-- 開発中も `127.0.0.1:5678` バインドを維持（外部公開しない）
-
-## 本番環境について（要点）
-
-結論として、**本番でも同様の設定思想は必要**です。
-ただし、以下は必ず本番専用値に置き換えてください。
-
-- `N8N_BASIC_AUTH_USER` / `N8N_BASIC_AUTH_PASSWORD`（強固な本番用資格情報）
-- `N8N_ENCRYPTION_KEY`（本番専用の固定値。再生成で既存Credentialが読めなくなる可能性あり）
-- `N8N_WEBHOOK_TOKEN`（十分長いランダム値）
-- `WEBHOOK_URL`（本番FQDN + HTTPS）
-
-本番の具体的な手順（DNS/TLS/リバースプロキシ/バックアップ/復旧）は以下を参照。
-
-- `docs/N8N_DEPLOYMENT_BEGINNER_GUIDE.md` の「本番環境への移行手順」
+- 実装済み action: `create_github_issue`, `backup_server_data`, `append_sheet_row`, `add_notion_memo`, `add_calendar_event`, `get_calendar_events`（`send_email` は任意）
+- `add_calendar_event` / `get_calendar_events` は payload に `calendar_id` を指定すると参照先カレンダーを上書きできます（未指定時は `GOOGLE_CALENDAR_ID`）。
+- `stub-success` のような疑似成功は返しません。
 
 ## Discord Botセットアップ手順（初学者向け）
 
@@ -216,7 +117,7 @@ API型利用時（SendGrid等）:
 
 4. Privileged Gateway Intents
 
-- Phase 1はスラッシュコマンド中心なので、基本はデフォルトで可
+- 現行構成はスラッシュコマンド中心なので、基本はデフォルトで可
 - メンション応答などを拡張する際は必要に応じて有効化
 
 5. Botをサーバーへ招待
@@ -239,6 +140,13 @@ API型利用時（SendGrid等）:
 
 - Bot起動後、サーバーで `/ask` を実行
 - 応答が返ればセットアップ完了
+
+8. `@メンション` での質問（任意）
+
+- `.env` で `DISCORD_ENABLE_MESSAGE_CONTENT_INTENT=true` と `MENTION_ASK_ENABLED=true` を有効化
+- `@agent-bot 今日の予定を教えて` のようにメンション先頭で送ると、`/ask` 相当として処理されます
+- `MENTION_REQUIRE_PREFIX=true` の場合、文中メンションでは発火せず先頭メンションのみ反応します
+- `MENTION_QUICK_CALENDAR_ENABLED=true` の場合、カレンダー系の定型依頼はLLMを経由せず直接 action 実行します（高速・安定化）
 
 ## 運用メモ
 

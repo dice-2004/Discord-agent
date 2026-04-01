@@ -10,11 +10,12 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
+from uuid import uuid4
 
 import google.generativeai as genai
 
-from discord_ai_agent.core.memory import ChannelMemoryStore
+from discord_ai_agent.core.memory import ChannelMemoryStore, TaskCheckpointStore
 from discord_ai_agent.tools import ToolRegistry, build_default_tool_registry
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,19 @@ class DiscordOrchestrator:
         self.personal_guild_id: int | None = None
         self.family_guild_ids: set[int] = set()
 
+        self.max_concurrent_heavy_tasks = max(1, int(os.getenv("MAX_CONCURRENT_HEAVY_TASKS", "1")))
+        self.heavy_task_timeout_sec = max(30, int(os.getenv("HEAVY_TASK_TIMEOUT_SEC", "180")))
+        self._heavy_task_semaphore = asyncio.Semaphore(self.max_concurrent_heavy_tasks)
+        self._queued_task_count = 0
+        self._queued_task_lock = asyncio.Lock()
+
+        checkpoint_path = os.getenv("CHECKPOINT_DB_PATH", "./data/runtime/checkpoints.sqlite3").strip()
+        self._checkpoint_store: TaskCheckpointStore | None = None
+        try:
+            self._checkpoint_store = TaskCheckpointStore(checkpoint_path)
+        except Exception:
+            logger.exception("Failed to initialize checkpoint store: path=%s", checkpoint_path)
+
         genai.configure(api_key=config.gemini_api_key)
         self.model = genai.GenerativeModel(model_name=config.gemini_model)
 
@@ -86,6 +100,117 @@ class DiscordOrchestrator:
         return [guild_id]
 
     async def answer(
+        self,
+        question: str,
+        guild_id: int | None,
+        channel_id: int,
+        user_id: int,
+        message_id: int | None,
+    ) -> str:
+        async def _job() -> str:
+            return await self._answer_impl(
+                question=question,
+                guild_id=guild_id,
+                channel_id=channel_id,
+                user_id=user_id,
+                message_id=message_id,
+            )
+
+        return await self._run_heavy_task("ask", _job)
+
+    async def execute_tool_job(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        task_label: str | None = None,
+    ) -> str:
+        label = task_label or f"tool:{tool_name}"
+
+        async def _job() -> str:
+            return await asyncio.to_thread(self.tool_registry.execute, tool_name, args)
+
+        return await self._run_heavy_task(label, _job)
+
+    async def _run_heavy_task(
+        self,
+        task_label: str,
+        work: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        queue_depth = 0
+        async with self._queued_task_lock:
+            self._queued_task_count += 1
+            queue_depth = max(0, self._queued_task_count - self.max_concurrent_heavy_tasks)
+
+        loop = asyncio.get_running_loop()
+        wait_started = loop.time()
+
+        try:
+            async with self._heavy_task_semaphore:
+                waited_sec = loop.time() - wait_started
+                logger.info(
+                    "Heavy task start: label=%s waited_sec=%.3f queue_depth=%s concurrency=%s",
+                    task_label,
+                    waited_sec,
+                    queue_depth,
+                    self.max_concurrent_heavy_tasks,
+                )
+                return await asyncio.wait_for(work(), timeout=self.heavy_task_timeout_sec)
+        except asyncio.TimeoutError:
+            logger.warning("Heavy task timed out: label=%s timeout=%s", task_label, self.heavy_task_timeout_sec)
+            raise
+        finally:
+            async with self._queued_task_lock:
+                self._queued_task_count = max(0, self._queued_task_count - 1)
+
+    async def save_workflow_checkpoint(
+        self,
+        workflow: str,
+        status: str,
+        payload: dict[str, Any],
+        job_id: str | None = None,
+    ) -> str:
+        effective_job_id = (job_id or "").strip() or f"{workflow}-{uuid4().hex[:12]}"
+        if self._checkpoint_store is None:
+            return effective_job_id
+        try:
+            await self._checkpoint_store.upsert_checkpoint(
+                job_id=effective_job_id,
+                workflow=workflow,
+                status=status,
+                payload=payload,
+            )
+        except Exception:
+            logger.exception("Failed to save workflow checkpoint: workflow=%s job_id=%s", workflow, effective_job_id)
+        return effective_job_id
+
+    async def load_workflow_checkpoint(self, job_id: str) -> dict[str, Any] | None:
+        if self._checkpoint_store is None:
+            return None
+        try:
+            return await self._checkpoint_store.get_checkpoint(job_id)
+        except Exception:
+            logger.exception("Failed to load workflow checkpoint: job_id=%s", job_id)
+            return None
+
+    async def list_workflow_checkpoints(
+        self,
+        workflow: str,
+        status: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        if self._checkpoint_store is None:
+            return []
+        try:
+            return await self._checkpoint_store.list_checkpoints(
+                workflow=workflow,
+                status=status,
+                limit=limit,
+            )
+        except Exception:
+            logger.exception("Failed to list workflow checkpoints: workflow=%s", workflow)
+            return []
+
+    async def _answer_impl(
         self,
         question: str,
         guild_id: int | None,
@@ -268,6 +393,20 @@ class DiscordOrchestrator:
                 turn=turn,
             )
             action = str(decision.get("action", "respond")).strip().lower()
+            tool_names = self.tool_registry.tool_names()
+            if action in tool_names:
+                decision = {
+                    "action": "tool",
+                    "tool": action,
+                    "args": decision.get("args", {}) if isinstance(decision.get("args", {}), dict) else {},
+                    "reason": decision.get("reason", "fallback:action_as_tool_name"),
+                }
+                action = "tool"
+
+            if action != "tool":
+                alias_tool = str(decision.get("tool", "")).strip()
+                if alias_tool in tool_names and not str(decision.get("action", "")).strip().lower() == "respond":
+                    action = "tool"
             logger.info(
                 "Agent decision: turn=%s action=%s tool=%s reason=%s",
                 turn,
@@ -279,13 +418,44 @@ class DiscordOrchestrator:
             if action == "tool":
                 tool_name = str(decision.get("tool", "")).strip()
                 args = decision.get("args", {})
+
+                # Fallback for malformed model outputs:
+                # {"action":"execute_internal_action","parameters":{...}}
+                if not tool_name:
+                    maybe_action = str(decision.get("action", "")).strip()
+                    if maybe_action in tool_names:
+                        tool_name = maybe_action
+                    elif maybe_action:
+                        tool_name = "execute_internal_action"
+                        raw_payload = decision.get("parameters")
+                        if not isinstance(raw_payload, dict):
+                            raw_payload = decision.get("payload") if isinstance(decision.get("payload"), dict) else {}
+                        args = {
+                            "action": maybe_action,
+                            "payload_json": json.dumps(raw_payload, ensure_ascii=False),
+                        }
+                if not isinstance(args, dict):
+                    args = {}
+                if not args:
+                    for key in ("parameters", "payload", "params"):
+                        candidate = decision.get(key)
+                        if isinstance(candidate, dict):
+                            args = candidate
+                            break
+
                 if not tool_name or not isinstance(args, dict):
                     scratchpad.append("[Agent] 不正なツール要求を検知したため無視しました。")
                     continue
 
                 logger.info("Tool execution: %s (%s/%s)", tool_name, turn, self.max_tool_turns)
                 tool_output = await asyncio.to_thread(self.tool_registry.execute, tool_name, args)
-                logger.info("Tool result summary: tool=%s chars=%s", tool_name, len(tool_output))
+                preview = (tool_output or "").replace("\n", " ")[:180]
+                logger.info(
+                    "Tool result summary: tool=%s chars=%s preview=%s",
+                    tool_name,
+                    len(tool_output),
+                    preview,
+                )
                 scratchpad.append(
                     f"[Tool:{tool_name}] args={json.dumps(args, ensure_ascii=False)}\n{tool_output}"
                 )
@@ -388,7 +558,11 @@ class DiscordOrchestrator:
             "[Available Tools]\n"
             f"{self.tool_registry.render_catalog()}"
         )
-        raw = await self._invoke_with_retry(prompt, max_output_tokens=420)
+        raw = await self._invoke_with_retry(
+            prompt,
+            max_output_tokens=420,
+            response_mime_type="application/json",
+        )
         parsed = self._extract_json_object(raw)
         if parsed:
             return parsed
@@ -416,6 +590,9 @@ class DiscordOrchestrator:
             "- 回答可能なら即座に回答する\n"
             "- ツール呼び出しは具体的引数を与える\n"
             "- ツール引数はカタログ記載の必須キーをすべて含める\n"
+            "- 予定の追加/参照依頼（今月の予定、明日の予定、カレンダー確認等）では必ず execute_internal_action を使う\n"
+            "- add_calendar_event は2方式を許可: 1) timed(start_time,end_time) 2) all_day(true)+date(YYYY-MM-DD)。終日指定時は時刻確認を要求しない\n"
+            "- 入力が明確な場合（例: 面接 4月5日 00:00-23:59）は確認質問せず実行する。曖昧なときだけ追加質問する\n"
             "- 出力はJSONのみ\n"
             "- 形式1: {\"action\":\"tool\",\"tool\":\"...\",\"args\":{...},\"reason\":\"...\"}\n"
             "- 形式2: {\"action\":\"respond\",\"response\":\"...\"}\n\n"
@@ -424,7 +601,11 @@ class DiscordOrchestrator:
             "[Observed Tool Results]\n"
             f"{observation}"
         )
-        raw = await self._invoke_with_retry(prompt, max_output_tokens=380)
+        raw = await self._invoke_with_retry(
+            prompt,
+            max_output_tokens=380,
+            response_mime_type="application/json",
+        )
         parsed = self._extract_json_object(raw)
         if parsed:
             return parsed
@@ -481,7 +662,12 @@ class DiscordOrchestrator:
         except Exception:
             return None
 
-    async def _invoke_with_retry(self, prompt: str, max_output_tokens: int = 2048) -> str:
+    async def _invoke_with_retry(
+        self,
+        prompt: str,
+        max_output_tokens: int = 2048,
+        response_mime_type: str | None = None,
+    ) -> str:
         retries = 2
         last_error: Exception | None = None
 
@@ -492,10 +678,17 @@ class DiscordOrchestrator:
                         self.model.generate_content,
                         prompt,
                         generation_config=genai.types.GenerationConfig(
-                            temperature=0.2,
-                            top_p=0.95,
-                            top_k=40,
-                            max_output_tokens=max_output_tokens,
+                            **{
+                                "temperature": 0.2,
+                                "top_p": 0.95,
+                                "top_k": 40,
+                                "max_output_tokens": max_output_tokens,
+                                **(
+                                    {"response_mime_type": response_mime_type}
+                                    if response_mime_type
+                                    else {}
+                                ),
+                            }
                         ),
                     ),
                     timeout=self.config.gemini_timeout_sec,

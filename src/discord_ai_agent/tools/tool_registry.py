@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from discord_ai_agent.tools.action_tools import execute_internal_action
 from discord_ai_agent.tools.cli_tools import run_local_cli
 from discord_ai_agent.tools.deep_dive_tools import source_deep_dive
-from discord_ai_agent.tools.n8n_tools import trigger_n8n_webhook
 from discord_ai_agent.tools.reader_tools import read_url_markdown
 from discord_ai_agent.tools.search_tools import web_search
 
@@ -39,6 +40,9 @@ class ToolRegistry:
             )
         return "\n".join(lines)
 
+    def tool_names(self) -> set[str]:
+        return set(self._specs.keys())
+
     def execute(self, tool_name: str, args: dict[str, Any]) -> str:
         spec = self._specs.get(tool_name)
         if spec is None:
@@ -58,6 +62,20 @@ class ToolRegistry:
     def _normalize_args(self, spec: ToolSpec, args: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
         if not isinstance(args, dict):
             return {}, "argsはオブジェクト形式で指定してください"
+
+        # Compatibility shim for model output drift when calling execute_internal_action.
+        # Accept parameters/payload dict and convert to payload_json.
+        if spec.name == "execute_internal_action":
+            working = dict(args)
+            if "payload_json" not in working:
+                for alt_key in ("parameters", "payload", "params"):
+                    candidate = working.get(alt_key)
+                    if isinstance(candidate, dict):
+                        working["payload_json"] = json.dumps(candidate, ensure_ascii=False)
+                        break
+            elif isinstance(working.get("payload_json"), dict):
+                working["payload_json"] = json.dumps(working["payload_json"], ensure_ascii=False)
+            args = working
 
         normalized: dict[str, Any] = {}
         required = spec.required_args or list(spec.args_schema.keys())
@@ -119,11 +137,11 @@ def build_default_tool_registry() -> ToolRegistry:
             func=run_local_cli,
         ),
         ToolSpec(
-            name="trigger_n8n_webhook",
-            description="許可済みactionのみn8n webhookへJSONをPOSTする",
+            name="execute_internal_action",
+            description="許可済みactionをコード内で直接実行する",
             args_schema={"action": "string", "payload_json": "string(JSON object)"},
             required_args=["action"],
-            func=trigger_n8n_webhook,
+            func=execute_internal_action,
         ),
     ]
     return ToolRegistry(specs)
