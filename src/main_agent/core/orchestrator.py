@@ -67,6 +67,8 @@ class DiscordOrchestrator:
         except Exception:
             logger.exception("Failed to initialize checkpoint store: path=%s", checkpoint_path)
 
+        self.last_tool_executions: list[dict[str, object]] = []
+
         genai.configure(api_key=config.gemini_api_key)
         self.model = genai.GenerativeModel(model_name=config.gemini_model)
 
@@ -456,6 +458,10 @@ class DiscordOrchestrator:
                     len(tool_output),
                     preview,
                 )
+                self.last_tool_executions.append({
+                    "tool": tool_name,
+                    "output": tool_output,
+                })
                 scratchpad.append(
                     f"[Tool:{tool_name}] args={json.dumps(args, ensure_ascii=False)}\n{tool_output}"
                 )
@@ -517,6 +523,10 @@ class DiscordOrchestrator:
                 args = review_decision.get("args", {})
                 if tool_name and isinstance(args, dict):
                     tool_output = await asyncio.to_thread(self.tool_registry.execute, tool_name, args)
+                    self.last_tool_executions.append({
+                        "tool": tool_name,
+                        "output": tool_output,
+                    })
                     working_scratchpad.append(
                         f"[ReviewTool:{tool_name}] args={json.dumps(args, ensure_ascii=False)}\n{tool_output}"
                     )

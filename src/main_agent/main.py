@@ -1206,6 +1206,33 @@ def main() -> None:
                 user_id=interaction.user.id,
                 message_id=interaction.id,
             )
+
+            # Check if dispatch_research_job was executed and trigger notification if needed
+            for tool_info in orchestrator.last_tool_executions:
+                if tool_info.get("tool") == "dispatch_research_job":
+                    try:
+                        result = json.loads(str(tool_info.get("output", "{}")))
+                        if result.get("status") == "queued":
+                            job_id = str(result.get("job_id", "")).strip()
+                            topic = str(result.get("topic", "")).strip()
+                            source = str(result.get("source", "")).strip()
+                            if job_id:
+                                logger.info(
+                                    "[main-agent][dispatch] research job queued job_id=%s topic=%s",
+                                    job_id,
+                                    topic,
+                                )
+                                asyncio.create_task(
+                                    _start_research_notification(
+                                        job_id=job_id,
+                                        topic=topic,
+                                        source=source,
+                                        channel_id=int(interaction.channel_id),
+                                    )
+                                )
+                    except (json.JSONDecodeError, ValueError, TypeError):
+                        logger.debug("Failed to parse dispatch_research_job result")
+
             await send_response(interaction, answer, max_message_len=max_message_len)
         except Exception:
             logger.exception("Failed to handle /ask")

@@ -7,13 +7,14 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import google.generativeai as genai
 
-from research_agent.tools.registry import ResearchToolRegistry, build_research_tool_registry
+from tools import ToolRegistry, build_default_tool_registry
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,7 @@ class OrchestratorConfig:
 class ResearchOrchestrator:
     def __init__(self, config: OrchestratorConfig | None = None) -> None:
         self.config = config or OrchestratorConfig()
-        self.tool_registry = build_research_tool_registry()
+        self.tool_registry = build_default_tool_registry()
         self.model = genai.GenerativeModel(model_name=self.config.gemini_model)
         self.max_tool_turns = 2
 
@@ -35,18 +36,27 @@ class ResearchOrchestrator:
         self,
         topic: str,
         source: str = "auto",
+        timeout_sec: int = 60,
     ) -> tuple[str, list[dict[str, Any]]]:
         """
         Research answer with tool-calling support.
+        Continues research for at least timeout_sec seconds.
         Returns: (answer_text, decision_log)
         """
         await asyncio.sleep(0)
 
+        # Dynamically set max_tool_turns based on timeout_sec
+        # Estimate: each tool turn takes ~5-10 seconds, so allow more turns for longer timeouts
+        self.max_tool_turns = max(2, min(8, timeout_sec // 10))
+
+        start_time = time.time()
         turn = 0
         scratchpad: list[str] = []
         decision_log: list[dict[str, Any]] = []
 
         for turn in range(1, self.max_tool_turns + 1):
+            elapsed = time.time() - start_time
+
             now_jst = (datetime.now(timezone.utc) + timedelta(hours=9)).strftime("%Y-%m-%d %H:%M:%S")
             question = f"topic: {topic}\nsource: {source}"
 
@@ -67,9 +77,26 @@ class ResearchOrchestrator:
                 }
             )
 
+            # Early respond: only if at max turns, ignore early completion otherwise
             if decision.get("action") == "respond":
                 response_text = str(decision.get("response", "")).strip()
-                return response_text, decision_log
+                # ALWAYS continue if not at max turns, force deeper research
+                if turn < self.max_tool_turns:
+                    logger.info(
+                        "Early completion at turn=%d/%d elapsed=%.1f/%d: forcing deeper research",
+                        turn,
+                        self.max_tool_turns,
+                        elapsed,
+                        timeout_sec,
+                    )
+                    scratchpad.append(
+                        f"[Proposed Response - Turn {turn}]\n{response_text[:250]}...\n"
+                        f"[Continuing] Time budget: {elapsed:.0f}s/{timeout_sec}s | Turns: {turn}/{self.max_tool_turns}"
+                    )
+                    continue  # Force continuation
+                else:
+                    # At max turns, return response
+                    return response_text, decision_log
 
             if decision.get("action") == "tool":
                 tool_name = str(decision.get("tool", "")).strip()

@@ -194,7 +194,7 @@ def _run_gemini_cli(topic: str, source: str) -> tuple[str, str | None]:
     return out, None
 
 
-def _run_research(topic: str, source: str, mode: str) -> tuple[str, str | None, str, list[dict[str, Any]]]:
+def _run_research(topic: str, source: str, mode: str, timeout_sec: int = 60) -> tuple[str, str | None, str, list[dict[str, Any]]]:
     clean_mode = (mode or "auto").strip().lower() or "auto"
     gemini_enabled = os.getenv("RESEARCH_AGENT_USE_GEMINI_CLI", "false").strip().lower() == "true"
     orchestrator_enabled = bool(os.getenv("RESEARCH_GEMINI_API_KEY", "").strip())
@@ -219,7 +219,7 @@ def _run_research(topic: str, source: str, mode: str) -> tuple[str, str | None, 
 
         if orchestrator_enabled and _check_need_orchestrator(report):
             try:
-                orch_report, orch_decision_log = asyncio.run(_run_orchestrator_deepdive(topic, source, report))
+                orch_report, orch_decision_log = asyncio.run(_run_orchestrator_deepdive(topic, source, report, timeout_sec))
                 if orch_report:
                     logger.info("[research-agent][run] route=gemini_cli+orchestrator")
                     combined = f"[Gemini CLI Initial]\n{report}\n\n[Management AI Deepdive]\n{orch_report}"
@@ -234,7 +234,7 @@ def _run_research(topic: str, source: str, mode: str) -> tuple[str, str | None, 
             initial_report = report
             try:
                 if orchestrator_enabled and _check_need_orchestrator(report):
-                    orch_report, orch_decision_log = asyncio.run(_run_orchestrator_deepdive(topic, source, report))
+                    orch_report, orch_decision_log = asyncio.run(_run_orchestrator_deepdive(topic, source, report, timeout_sec))
                     if orch_report:
                         logger.info("[research-agent][run] route=gemini_cli+orchestrator")
                         combined = f"[Gemini CLI Initial]\n{report}\n\n[Management AI Deepdive]\n{orch_report}"
@@ -252,7 +252,7 @@ def _run_research(topic: str, source: str, mode: str) -> tuple[str, str | None, 
     if clean_mode in {"auto", "fallback"} and orchestrator_enabled:
         try:
             orch_report, orch_decision_log = asyncio.run(
-                _run_orchestrator_deepdive(topic, source, initial_report)
+                _run_orchestrator_deepdive(topic, source, initial_report, timeout_sec)
             )
             if orch_report:
                 if initial_report:
@@ -293,15 +293,16 @@ def _check_need_orchestrator(report: str) -> bool:
 
 
 async def _run_orchestrator_deepdive(
-    topic: str, source: str, initial_report: str
+    topic: str, source: str, initial_report: str, timeout_sec: int = 60
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Run management AI (orchestrator) for deeper research."""
+    """Run management AI (orchestrator) for deeper research with time budget."""
     try:
-        logger.info("[research-agent][orchestrator] start topic=%s source=%s", topic, source)
+        logger.info("[research-agent][orchestrator] start topic=%s source=%s timeout_sec=%s", topic, source, timeout_sec)
         orchestrator = await build_research_orchestrator()
+        # Pass timeout_sec to orchestrator for decision loop planning
         question = f"{topic}\n\n[Initial Gemini CLI report]\n{initial_report}"
-        answer, decision_log = await orchestrator.answer(topic=question, source=source)
-        logger.info("[research-agent][orchestrator] done decision_log_len=%s", len(decision_log))
+        answer, decision_log = await orchestrator.answer(topic=question, source=source, timeout_sec=timeout_sec)
+        logger.info("[research-agent][orchestrator] done decision_log_len=%s timeout_sec=%s", len(decision_log), timeout_sec)
         return answer, decision_log
     except Exception as exc:
         logger.exception("Orchestrator deepdive failed: %s", exc)
@@ -372,6 +373,13 @@ class ResearchHandler(BaseHTTPRequestHandler):
         topic = str(payload.get("topic", "")).strip()
         source = str(payload.get("source", "auto")).strip().lower() or "auto"
         mode = str(payload.get("mode", "auto")).strip().lower() or "auto"
+        timeout_sec = max(10, _safe_int("_request_timeout_sec", _safe_int("RESEARCH_AGENT_JOB_TIMEOUT_SEC", 60)))
+        try:
+            raw_timeout = str(payload.get("timeout_sec", "")).strip()
+            if raw_timeout:
+                timeout_sec = max(10, int(raw_timeout))
+        except ValueError:
+            pass
         if not topic:
             self._send_json(400, {"status": "error", "code": "invalid_topic"})
             return
@@ -385,13 +393,13 @@ class ResearchHandler(BaseHTTPRequestHandler):
 
         def _worker() -> None:
             assert self.store is not None
-            job_timeout = max(30, _safe_int("RESEARCH_AGENT_JOB_TIMEOUT_SEC", 600))
+            job_timeout = timeout_sec + 30  # Add buffer for cleanup
             start_time = time.time()
 
-            logger.info("[research-agent][job] start job_id=%s topic=%s source=%s mode=%s", job_id, topic, source, mode)
+            logger.info("[research-agent][job] start job_id=%s topic=%s source=%s mode=%s timeout_sec=%s", job_id, topic, source, mode, timeout_sec)
             self.store.update_job(job_id, status="running", engine="")
             try:
-                report, err, engine, decision_log = _run_research(topic=topic, source=source, mode=mode)
+                report, err, engine, decision_log = _run_research(topic=topic, source=source, mode=mode, timeout_sec=timeout_sec)
                 elapsed = time.time() - start_time
                 if elapsed > job_timeout:
                     self.store.update_job(

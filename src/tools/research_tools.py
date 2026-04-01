@@ -127,11 +127,13 @@ def dispatch_research_job(
         )
     wait_enabled = str(wait or "true").strip().lower() not in {"false", "0", "no", "off"}
 
-    poll_interval = max(1, _safe_int("RESEARCH_AGENT_POLL_INTERVAL_SEC", 2))
-    wait_timeout = max(10, _safe_int("RESEARCH_AGENT_WAIT_TIMEOUT_SEC", 90))
+    poll_interval = max(0.5, _safe_int("RESEARCH_AGENT_POLL_INTERVAL_SEC", 1))  # Shortened to 0.5-1 sec
+    # Use timeout_sec as wait_timeout, with minimum of 30 seconds
+    wait_timeout = max(30, _safe_int("RESEARCH_AGENT_WAIT_TIMEOUT_SEC", 90))
     if str(timeout_sec or "").strip():
         try:
-            wait_timeout = max(10, int(str(timeout_sec).strip()))
+            # timeout_sec is the research time; polling timeout should be longer
+            wait_timeout = max(timeout_sec, int(str(timeout_sec).strip()) + 30)
         except ValueError:
             pass
 
@@ -142,6 +144,7 @@ def dispatch_research_job(
             "topic": clean_topic,
             "source": clean_source,
             "mode": clean_mode,
+            "timeout_sec": str(wait_timeout),
         },
     )
     if err is not None:
