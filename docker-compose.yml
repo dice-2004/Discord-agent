@@ -2,7 +2,7 @@ services:
   main-agent:
     build:
       context: .
-      dockerfile: Dockerfile.main
+      dockerfile: docker/Dockerfile.main
     container_name: main-agent
     env_file:
       - ./.env
@@ -15,7 +15,7 @@ services:
   research-agent:
     build:
       context: .
-      dockerfile: Dockerfile.research
+      dockerfile: docker/Dockerfile.research
     container_name: research-agent
     env_file:
       - ./.env

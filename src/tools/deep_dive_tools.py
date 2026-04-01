@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 
-from main_agent.tools.search_tools import web_search
+from tools.search_tools import web_search
 
 
 def _safe_int(env_key: str, default_value: int) -> int:
@@ -22,7 +22,7 @@ def source_deep_dive(topic: str, source: str = "auto") -> str:
 
     query_plan = _build_query_plan(clean_topic, clean_source)
     max_queries = _safe_int("DEEP_DIVE_MAX_QUERIES", 3)
-    query_plan = query_plan[:max_queries]
+    query_plan = _dedupe_queries(query_plan)[:max_queries]
 
     outputs: list[str] = []
     for idx, query in enumerate(query_plan, start=1):
@@ -69,3 +69,15 @@ def _build_query_plan(topic: str, source: str) -> list[str]:
         f"{topic} official",
         f"{topic} latest updates",
     ]
+
+
+def _dedupe_queries(queries: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for query in queries:
+        normalized = " ".join((query or "").strip().lower().split())
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        unique.append(query)
+    return unique

@@ -4,6 +4,22 @@
 
 ## 2026-04-01
 
+## 2026-04-02
+
+### 仕様更新
+
+- Research Agent の `mode=fallback` を「Gemini CLIを使わず、管理AI（Gemini API Orchestrator）を優先するモード」として明確化した
+- `mode=auto` は「Gemini CLI先行 + 必要時に管理AIを追加」の方針を明確化し、管理AI失敗時のみ `source_deep_dive` へフォールバックする仕様に整理した
+
+### 実装
+
+- `src/research_agent/research_agent_server.py` の実行フローを更新し、`mode=fallback` で Orchestrator を優先実行するようにした
+- Research Job 完了時に `decision_log` を SQLite へ保存して API レスポンスで返せるようにした
+- `src/tools/deep_dive_tools.py` と `src/main_agent/tools/deep_dive_tools.py` にクエリ重複除去を追加し、同一テーマの重複検索を抑制した
+- `RESEARCH_AGENT_GEMINI_MODEL` を導入し、Gemini CLI 起動時に `--model` を明示指定することで Manual 設定依存を回避した
+- ツール実装を `src/tools/` へ完全集約し、`src/main_agent/tools/` の重複実装を削除した
+- Dockerfile を `docker/` 配下へ移設し、`docker-compose.yml` の build 参照先を更新した
+
 ### 仕様更新
 
 - Main Agentの実装ディレクトリ表記を `src/main_agent/` へ更新した（旧 `src/discord_ai_agent/` は互換shimとして残置）

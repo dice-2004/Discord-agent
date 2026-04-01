@@ -1,15 +1,14 @@
+"""Research Agent tool registry - subset of shared tools."""
+
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from main_agent.tools.action_tools import execute_internal_action
-from main_agent.tools.cli_tools import run_local_cli
-from main_agent.tools.deep_dive_tools import source_deep_dive
-from main_agent.tools.research_tools import dispatch_research_job, get_research_job_status
-from main_agent.tools.reader_tools import read_url_markdown
-from main_agent.tools.search_tools import web_search
+from tools.reader_tools import read_url_markdown
+from tools.search_tools import web_search
+from tools.deep_dive_tools import source_deep_dive
 
 
 ToolFunc = Callable[..., str]
@@ -24,7 +23,7 @@ class ToolSpec:
     func: ToolFunc
 
 
-class ToolRegistry:
+class ResearchToolRegistry:
     def __init__(self, specs: list[ToolSpec]) -> None:
         self._specs = {spec.name: spec for spec in specs}
 
@@ -64,20 +63,6 @@ class ToolRegistry:
         if not isinstance(args, dict):
             return {}, "argsはオブジェクト形式で指定してください"
 
-        # Compatibility shim for model output drift when calling execute_internal_action.
-        # Accept parameters/payload dict and convert to payload_json.
-        if spec.name == "execute_internal_action":
-            working = dict(args)
-            if "payload_json" not in working:
-                for alt_key in ("parameters", "payload", "params"):
-                    candidate = working.get(alt_key)
-                    if isinstance(candidate, dict):
-                        working["payload_json"] = json.dumps(candidate, ensure_ascii=False)
-                        break
-            elif isinstance(working.get("payload_json"), dict):
-                working["payload_json"] = json.dumps(working["payload_json"], ensure_ascii=False)
-            args = working
-
         normalized: dict[str, Any] = {}
         required = spec.required_args or list(spec.args_schema.keys())
 
@@ -107,7 +92,7 @@ class ToolRegistry:
         return normalized, None
 
 
-def build_default_tool_registry() -> ToolRegistry:
+def build_research_tool_registry() -> ResearchToolRegistry:
     specs = [
         ToolSpec(
             name="web_search",
@@ -130,39 +115,5 @@ def build_default_tool_registry() -> ToolRegistry:
             required_args=["topic"],
             func=source_deep_dive,
         ),
-        ToolSpec(
-            name="dispatch_research_job",
-            description="Research Agentへ重い調査ジョブを委譲する",
-            args_schema={
-                "topic": "string",
-                "source": "string(auto/github/reddit/youtube/x)",
-                "wait": "string(true/false)",
-                "mode": "string(auto/gemini_cli/fallback)",
-                "timeout_sec": "string(int seconds)",
-            },
-            required_args=["topic"],
-            func=dispatch_research_job,
-        ),
-        ToolSpec(
-            name="get_research_job_status",
-            description="Research Agentジョブの現在状態を取得する",
-            args_schema={"job_id": "string"},
-            required_args=["job_id"],
-            func=get_research_job_status,
-        ),
-        ToolSpec(
-            name="run_local_cli",
-            description="承認トークン付きで許可コマンドのみ実行する",
-            args_schema={"command": "string", "approval_token": "string"},
-            required_args=["command", "approval_token"],
-            func=run_local_cli,
-        ),
-        ToolSpec(
-            name="execute_internal_action",
-            description="許可済みactionをコード内で直接実行する",
-            args_schema={"action": "string", "payload_json": "string(JSON object)"},
-            required_args=["action"],
-            func=execute_internal_action,
-        ),
     ]
-    return ToolRegistry(specs)
+    return ResearchToolRegistry(specs)

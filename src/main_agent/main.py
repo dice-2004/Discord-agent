@@ -80,6 +80,101 @@ def chunk_text(text: str, max_len: int) -> list[str]:
     return [chunk for chunk in chunks if chunk]
 
 
+def _extract_research_controls(text: str) -> tuple[str | None, int | None]:
+    raw = (text or "").strip()
+    if not raw:
+        return None, None
+
+    lowered = raw.lower()
+    mode: str | None = None
+    if re.search(r"gemini(?:\s*cli)?|geminiで|geminiを", lowered):
+        mode = "gemini_cli"
+    elif re.search(r"fallback|フォールバック|geminiなし|deep\s*diveのみ", lowered):
+        mode = "fallback"
+
+    timeout_sec: int | None = None
+    sec_match = re.search(r"(\d{1,4})\s*(?:秒|sec|secs|second|seconds)\b", lowered)
+    min_match = re.search(r"(\d{1,3})\s*(?:分|min|mins|minute|minutes)\b", lowered)
+    if sec_match is not None:
+        timeout_sec = int(sec_match.group(1))
+    elif min_match is not None:
+        timeout_sec = int(min_match.group(1)) * 60
+
+    if timeout_sec is not None:
+        timeout_sec = max(10, min(timeout_sec, 1800))
+
+    return mode, timeout_sec
+
+
+def _inject_research_controls_hint(question: str) -> str:
+    mode, timeout_sec = _extract_research_controls(question)
+    if mode is None and timeout_sec is None:
+        return question
+
+    lines = [
+        "",
+        "[Research Controls]",
+        "- dispatch_research_job を使う場合のみ、以下を反映すること",
+    ]
+    if mode is not None:
+        lines.append(f"- mode: {mode}")
+    if timeout_sec is not None:
+        lines.append(f"- timeout_sec: {timeout_sec}")
+    lines.append("- dispatch_research_job を使わない場合は、この指定を無視してよい")
+    return (question or "").rstrip() + "\n" + "\n".join(lines)
+
+
+def _extract_research_engine(status_payload: dict[str, object], report: str) -> str:
+    engine = str(status_payload.get("engine", "")).strip().lower()
+    if engine:
+        return engine
+    first_line = (report.splitlines()[0] if report else "").strip()
+    marker = "[Research Engine]"
+    if first_line.startswith(marker):
+        return first_line[len(marker) :].strip().lower()
+    return "unknown"
+
+
+def _strip_engine_header(report: str) -> str:
+    lines = report.splitlines()
+    if lines and lines[0].strip().startswith("[Research Engine]"):
+        return "\n".join(lines[1:]).strip()
+    return report.strip()
+
+
+def _build_research_digest(report: str) -> str:
+    lines = [ln.strip() for ln in report.splitlines() if ln.strip()]
+    if not lines:
+        return "(要約対象の本文がありません)"
+
+    query_count = len([ln for ln in lines if ln.startswith("[DeepDive Query")])
+    items: list[tuple[str, str]] = []
+    for idx, line in enumerate(lines):
+        if not line.startswith("URL: "):
+            continue
+        url = line[5:].strip()
+        title = lines[idx - 1] if idx > 0 else "(title unknown)"
+        if title.startswith("URL: ") or title.startswith("概要:"):
+            title = "(title unknown)"
+        items.append((title, url))
+        if len(items) >= 6:
+            break
+
+    digest_lines: list[str] = []
+    if query_count > 0:
+        digest_lines.append(f"- deepdive_queries: {query_count}")
+    if items:
+        digest_lines.append("- 主な情報源:")
+        for i, (title, url) in enumerate(items, start=1):
+            digest_lines.append(f"  {i}. {title} | {url}")
+        return "\n".join(digest_lines)
+
+    head = report.strip().replace("\n\n", "\n")
+    if len(head) > 700:
+        head = head[:700] + "..."
+    return head
+
+
 async def send_response(
     interaction: discord.Interaction,
     response_text: str,
@@ -754,6 +849,13 @@ def main() -> None:
     ) -> None:
         async def _runner() -> None:
             started = datetime.now(timezone.utc)
+            logger.info(
+                "[main-agent][research-notify] start job_id=%s topic=%s source=%s channel_id=%s",
+                job_id,
+                topic,
+                source,
+                channel_id,
+            )
             await orchestrator.save_workflow_checkpoint(
                 workflow="research_job",
                 status="queued",
@@ -778,6 +880,7 @@ def main() -> None:
             )
 
             elapsed = 0
+            previous_status = ""
             while elapsed <= research_notify_timeout_sec:
                 try:
                     raw = await orchestrator.execute_tool_job(
@@ -816,26 +919,41 @@ def main() -> None:
                     return
 
                 status = str(status_payload.get("status", "")).strip().lower()
+                if status != previous_status:
+                    logger.info(
+                        "[main-agent][research-notify] job_id=%s status=%s elapsed_sec=%s",
+                        job_id,
+                        status,
+                        elapsed,
+                    )
+                    previous_status = status
                 if status == "done":
-                    report = str(status_payload.get("report", "")).strip() or "(レポート本文なし)"
+                    raw_report = str(status_payload.get("report", "")).strip()
+                    report = _strip_engine_header(raw_report) or "(レポート本文なし)"
+                    engine = _extract_research_engine(status_payload, raw_report)
+                    logger.info(
+                        "[main-agent][research-notify] done job_id=%s engine=%s report_chars=%s",
+                        job_id,
+                        engine,
+                        len(report),
+                    )
                     channel = await _resolve_channel(channel_id)
                     if channel is not None:
-                        summary = (
-                            "Research Agent の調査が完了しました。\n"
-                            f"job_id: {job_id}\n"
-                            f"topic: {topic}\n"
-                            f"source: {source}"
-                        )
-                        if len(report) > MAX_TOTAL_INLINE:
+                        summary = "\n".join([
+                            "調査が完了しました。",
+                            "",
+                            "[要約]",
+                            _build_research_digest(report),
+                        ])
+                        should_attach = "[DeepDive Query" in report or len(report) > 1200
+                        if should_attach:
                             file_obj = discord.File(
                                 io.BytesIO(report.encode("utf-8")),
                                 filename=RESEARCH_ATTACHMENT_NAME,
                             )
                             await channel.send(summary + "\n\n(全文は添付ファイルを参照してください)", file=file_obj)
                         else:
-                            await channel.send(summary)
-                            for chunk in chunk_text(report, max_message_len):
-                                await channel.send(chunk)
+                            await channel.send(summary + "\n\n[全文]\n" + report)
 
                     append_research_audit(
                         research_audit_log_path,
@@ -845,6 +963,7 @@ def main() -> None:
                             "topic": topic,
                             "source": source,
                             "channel_id": channel_id,
+                            "engine": engine,
                             "report_chars": len(report),
                         },
                     )
@@ -865,13 +984,16 @@ def main() -> None:
 
                 if status == "failed":
                     detail = str(status_payload.get("error") or status_payload.get("detail") or "unknown")
+                    logger.warning(
+                        "[main-agent][research-notify] failed job_id=%s detail=%s",
+                        job_id,
+                        detail[:300],
+                    )
                     channel = await _resolve_channel(channel_id)
                     if channel is not None:
                         await channel.send(
-                            "Research Agent の調査が失敗しました。\n"
-                            f"job_id: {job_id}\n"
-                            f"topic: {topic}\n"
-                            f"detail: {detail[:700]}"
+                            "調査中にエラーが発生しました。"
+                            " 少し時間を空けてもう一度お試しください。"
                         )
                     append_research_audit(
                         research_audit_log_path,
@@ -917,9 +1039,8 @@ def main() -> None:
             channel = await _resolve_channel(channel_id)
             if channel is not None:
                 await channel.send(
-                    "Research Agent の調査が長時間実行中です。\n"
-                    f"job_id: {job_id}\n"
-                    "しばらくしてから再確認します。"
+                    "調査に時間がかかっています。"
+                    " しばらくしてから結果をお知らせします。"
                 )
             append_research_audit(
                 research_audit_log_path,
@@ -1077,8 +1198,9 @@ def main() -> None:
 
         await interaction.response.defer(thinking=True)
         try:
+            question_for_orchestrator = _inject_research_controls_hint(question)
             answer = await orchestrator.answer(
-                question=question,
+                question=question_for_orchestrator,
                 guild_id=interaction.guild_id,
                 channel_id=interaction.channel_id,
                 user_id=interaction.user.id,
@@ -1363,7 +1485,12 @@ def main() -> None:
             await interaction.followup.send("URL本文の取得に失敗しました。")
 
     @tree.command(name="deepdive", description="ソース特化で調査します")
-    @app_commands.describe(topic="調査トピック", source="対象ソース")
+    @app_commands.describe(
+        topic="調査トピック",
+        source="対象ソース",
+        mode="調査モード(auto/gemini_cli/fallback)",
+        timeout_sec="最大待機秒数(10-1800)",
+    )
     @app_commands.choices(
         source=[
             app_commands.Choice(name="auto", value="auto"),
@@ -1371,12 +1498,19 @@ def main() -> None:
             app_commands.Choice(name="reddit", value="reddit"),
             app_commands.Choice(name="youtube", value="youtube"),
             app_commands.Choice(name="x", value="x"),
-        ]
+        ],
+        mode=[
+            app_commands.Choice(name="auto", value="auto"),
+            app_commands.Choice(name="gemini_cli", value="gemini_cli"),
+            app_commands.Choice(name="fallback", value="fallback"),
+        ],
     )
     async def deepdive(
         interaction: discord.Interaction,
         topic: str,
         source: app_commands.Choice[str] | None = None,
+        mode: app_commands.Choice[str] | None = None,
+        timeout_sec: app_commands.Range[int, 10, 1800] | None = None,
     ) -> None:
         if interaction.guild_id is None or interaction.guild_id not in allowed_guild_ids:
             await interaction.response.send_message(
@@ -1388,10 +1522,18 @@ def main() -> None:
         await interaction.response.defer(thinking=True)
         try:
             source_value = source.value if source is not None else "auto"
+            mode_value = mode.value if mode is not None else "auto"
+            timeout_value = str(int(timeout_sec)) if timeout_sec is not None else ""
             if deepdive_use_research_agent:
                 result = await orchestrator.execute_tool_job(
                     tool_name="dispatch_research_job",
-                    args={"topic": topic, "source": source_value, "wait": "false"},
+                    args={
+                        "topic": topic,
+                        "source": source_value,
+                        "wait": "false",
+                        "mode": mode_value,
+                        "timeout_sec": timeout_value,
+                    },
                     task_label="deepdive:research",
                 )
                 try:
@@ -1413,6 +1555,8 @@ def main() -> None:
                                 "job_id": job_id,
                                 "topic": topic,
                                 "source": source_value,
+                                "mode": mode_value,
+                                "timeout_sec": timeout_value,
                                 "channel_id": int(interaction.channel_id),
                                 "actor_id": interaction.user.id if interaction.user else 0,
                             },
@@ -1423,10 +1567,17 @@ def main() -> None:
                             source=source_value,
                             channel_id=int(interaction.channel_id),
                         )
+                        logger.info(
+                            "[main-agent][dispatch] queued job_id=%s topic=%s source=%s mode=%s timeout_sec=%s",
+                            job_id,
+                            topic,
+                            source_value,
+                            mode_value,
+                            timeout_value or "default",
+                        )
                         result = (
-                            "Research Agent にジョブを投入しました。\n"
-                            f"job_id: {job_id}\n"
-                            "完了したらこのチャンネルへ自動通知します。"
+                            "調査を開始しました。"
+                            " 完了したらこのチャンネルでお知らせします。"
                         )
             else:
                 result = await orchestrator.execute_tool_job(
@@ -1815,8 +1966,9 @@ def main() -> None:
                     logger.exception("Failed to handle mention quick calendar action")
 
         try:
+            question_for_orchestrator = _inject_research_controls_hint(question)
             answer = await orchestrator.answer(
-                question=question,
+                question=question_for_orchestrator,
                 guild_id=message.guild.id,
                 channel_id=message.channel.id,
                 user_id=message.author.id,

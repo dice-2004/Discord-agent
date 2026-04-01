@@ -100,13 +100,15 @@
 * **認証基盤:** "Sign in with Google" (OAuth) 済みのトークンを使用（巨大な無料枠で上位モデルを利用）。
 * **役割:** 1分〜1時間程度かかるタスク（複数サイトの横断、Reddit/GitHubの深掘り）を実行。完了後、Discordに長文レポートを非同期で通知して終了する。
 
-#### 2.2.2. 現行の最小実装（2026-04-01追記）
+#### 2.2.2. 現行の最小実装（2026-04-02追記）
 
 * Research Agentは `research-agent` サービスとして別コンテナ起動する。
 * Main Agentは `dispatch_research_job` ツールで `POST /v1/jobs` にジョブ投入し、`GET /v1/jobs/{job_id}` で状態取得する。
 * 通信は `X-Research-Token` ヘッダで共有トークン認証する。
 * 研究ジョブ状態は `RESEARCH_AGENT_DB_PATH`（SQLite）に `queued/running/done/failed` で保存する。
-* 初期実装では、Research Agent内の調査実行は `source_deep_dive` ベースを既定とし、`RESEARCH_AGENT_USE_GEMINI_CLI=true` のときのみGemini CLI実行を試みる。
+* `mode=auto` では、`RESEARCH_AGENT_USE_GEMINI_CLI=true` のとき Gemini CLI を先行し、必要時のみ管理AI（Gemini API Orchestrator）を追加実行する。
+* `mode=fallback` では Gemini CLI を使わず、管理AI（Gemini API Orchestrator）を優先実行する。
+* 管理AIが利用不可（APIキー未設定）または失敗時のみ `source_deep_dive` へフォールバックする。
 
 #### 2.2.3. Gemini CLI配置方針（2026-04-01追記）
 
@@ -173,7 +175,7 @@
 
 #### 現時点で必須のツール要件
 
-* `src/main_agent/tools/search_tools.py` に分離すること
+* `src/tools/search_tools.py` に分離すること
 * Orchestrator から呼び出せる独立関数として実装すること（将来のFramework差し替えを容易にする）
 * 検索結果は**上位数件のタイトル / URL / 概要**をテキストとして返すこと
 * 検索失敗時は例外を握りつぶさず、**LLMが扱える安全な失敗メッセージ**を返すこと
@@ -365,8 +367,9 @@ AI-agent-bot/
 ├── README.md
 ├── requirements.txt
 ├── .env.example                 # 実運用では .env を作成（Git管理外）
-├── Dockerfile.main
-├── Dockerfile.research
+├── docker/
+│   ├── Dockerfile.main
+│   └── Dockerfile.research
 ├── docker-compose.yml
 │
 ├── data/
@@ -519,7 +522,7 @@ AI-agent-bot/
 2. `src/main_agent/main.py`
 3. `src/main_agent/core/orchestrator.py`
 4. `src/main_agent/core/memory.py`
-5. `src/main_agent/tools/search_tools.py`
+5. `src/tools/search_tools.py`
 
 ### 9.3. 出力ルール
 
@@ -557,7 +560,7 @@ AI-agent-bot/
    * `src/main_agent/main.py`
    * `src/main_agent/core/orchestrator.py`
    * `src/main_agent/core/memory.py`
-   * `src/main_agent/tools/search_tools.py`
+   * `src/tools/search_tools.py`
      の4つのファイルの完全なPythonコードを出力してください。非同期処理（`async/await`）を適切に使用し、チャンネルIDごとの記憶分離ロジックを必ず含めてください。
 
 > **もしライブラリの最新バージョン差異により LangChain / Gemini 連携実装が不安定な場合は、過剰に抽象化せず、「安定して動作する最小の呼び出し実装」を優先してください。**
@@ -786,7 +789,7 @@ Google AI Studio/Geminiの「検索・地図グラウンディング」は、将
 
 ただし現時点では、以下の理由で**既定採用しない**。
 
-* 仕様上、検索ツールは `src/main_agent/tools/search_tools.py` で独立実装する方針
+* 仕様上、検索ツールは `src/tools/search_tools.py` で独立実装する方針
 * 依存を増やしすぎると、N100運用時の障害切り分けが難しくなる
 * 将来比較検証（DuckDuckGo vs Gemini Grounding）を行う余地を残したい
 
@@ -804,7 +807,7 @@ Google AI Studio/Geminiの「検索・地図グラウンディング」は、将
 
 * 実装・検証・実運用は **Dockerコンテナ内で実行**する
 * 現行では、以下を最小要件とする
-   * `Dockerfile.main` / `Dockerfile.research` を用意し、`python:3.11-slim` 系を利用
+   * `docker/Dockerfile.main` / `docker/Dockerfile.research` を用意し、`python:3.11-slim` 系を利用
    * ルートディレクトリの `.env` を渡して起動可能であること
    * ルートの `data/chromadb` をボリューム永続化できる構成であること
 * 追加の管理基盤（Kubernetes等）は現時点の対象外

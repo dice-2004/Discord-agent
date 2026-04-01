@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import shlex
 import sqlite3
 import subprocess
 import threading
@@ -13,7 +15,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from main_agent.tools.deep_dive_tools import source_deep_dive
+from tools.deep_dive_tools import source_deep_dive
+from research_agent.core.orchestrator import build_research_orchestrator
 
 logger = logging.getLogger(__name__)
 
@@ -35,13 +38,24 @@ class ResearchJobStore:
                     source TEXT NOT NULL,
                     mode TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    engine TEXT NOT NULL,
                     report TEXT NOT NULL,
+                    decision_log TEXT NOT NULL,
                     error TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
                 """
             )
+            cols = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(research_jobs)").fetchall()
+                if isinstance(row, tuple) and len(row) > 1
+            }
+            if "engine" not in cols:
+                conn.execute("ALTER TABLE research_jobs ADD COLUMN engine TEXT NOT NULL DEFAULT ''")
+            if "decision_log" not in cols:
+                conn.execute("ALTER TABLE research_jobs ADD COLUMN decision_log TEXT NOT NULL DEFAULT '[]'")
 
     def create_job(self, job_id: str, topic: str, source: str, mode: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -49,31 +63,51 @@ class ResearchJobStore:
             with sqlite3.connect(self._db_path, timeout=5.0) as conn:
                 conn.execute(
                     """
-                    INSERT INTO research_jobs(job_id, topic, source, mode, status, report, error, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, 'queued', '', '', ?, ?)
+                    INSERT INTO research_jobs(job_id, topic, source, mode, status, engine, report, decision_log, error, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, 'queued', '', '', '[]', '', ?, ?)
                     """,
                     (job_id, topic, source, mode, now, now),
                 )
 
-    def update_job(self, job_id: str, *, status: str, report: str = "", error: str = "") -> None:
+    def update_job(
+        self,
+        job_id: str,
+        *,
+        status: str,
+        report: str = "",
+        error: str = "",
+        engine: str | None = None,
+        decision_log: list[dict[str, Any]] | None = None,
+    ) -> None:
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
             with sqlite3.connect(self._db_path, timeout=5.0) as conn:
-                conn.execute(
-                    """
-                    UPDATE research_jobs
-                    SET status = ?, report = ?, error = ?, updated_at = ?
-                    WHERE job_id = ?
-                    """,
-                    (status, report, error, now, job_id),
-                )
+                log_json = json.dumps(decision_log or [], ensure_ascii=False)
+                if engine is None:
+                    conn.execute(
+                        """
+                        UPDATE research_jobs
+                        SET status = ?, report = ?, error = ?, decision_log = ?, updated_at = ?
+                        WHERE job_id = ?
+                        """,
+                        (status, report, error, log_json, now, job_id),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE research_jobs
+                        SET status = ?, engine = ?, report = ?, error = ?, decision_log = ?, updated_at = ?
+                        WHERE job_id = ?
+                        """,
+                        (status, engine, report, error, log_json, now, job_id),
+                    )
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
         with self._lock:
             with sqlite3.connect(self._db_path, timeout=5.0) as conn:
                 row = conn.execute(
                     """
-                    SELECT job_id, topic, source, mode, status, report, error, created_at, updated_at
+                    SELECT job_id, topic, source, mode, status, engine, report, decision_log, error, created_at, updated_at
                     FROM research_jobs
                     WHERE job_id = ?
                     """,
@@ -81,16 +115,22 @@ class ResearchJobStore:
                 ).fetchone()
         if row is None:
             return None
+        try:
+            decision_log = json.loads(str(row[7]) if row[7] else "[]")
+        except Exception:
+            decision_log = []
         return {
             "job_id": str(row[0]),
             "topic": str(row[1]),
             "source": str(row[2]),
             "mode": str(row[3]),
             "status": str(row[4]),
-            "report": str(row[5]),
-            "error": str(row[6]),
-            "created_at": str(row[7]),
-            "updated_at": str(row[8]),
+            "engine": str(row[5]),
+            "report": str(row[6]),
+            "decision_log": decision_log,
+            "error": str(row[8]),
+            "created_at": str(row[9]),
+            "updated_at": str(row[10]),
         }
 
 
@@ -108,6 +148,7 @@ def _build_job_id() -> str:
 
 def _run_gemini_cli(topic: str, source: str) -> tuple[str, str | None]:
     cmd = os.getenv("RESEARCH_AGENT_GEMINI_COMMAND", "gemini").strip() or "gemini"
+    model = os.getenv("RESEARCH_AGENT_GEMINI_MODEL", "gemini-2.5-flash").strip()
     timeout = max(30, _safe_int("RESEARCH_AGENT_GEMINI_TIMEOUT_SEC", 240))
     prompt = (
         "あなたは調査エージェントです。以下のトピックについて日本語で要点をまとめてください。\n"
@@ -116,10 +157,23 @@ def _run_gemini_cli(topic: str, source: str) -> tuple[str, str | None]:
         "出力: 結論→根拠→次の確認ポイント の順で簡潔に。"
     )
 
+    argv = shlex.split(cmd)
+    if not argv:
+        return "", "gemini_cli_command_empty"
+    if model:
+        argv.extend(["--model", model])
+    argv.extend(["--prompt", prompt])
+    logger.info(
+        "[research-agent][gemini-cli] exec command=%s model=%s topic=%s source=%s",
+        argv[0],
+        model or "(default)",
+        topic,
+        source,
+    )
+
     try:
         completed = subprocess.run(
-            [cmd],
-            input=prompt,
+            argv,
             text=True,
             capture_output=True,
             timeout=timeout,
@@ -140,22 +194,118 @@ def _run_gemini_cli(topic: str, source: str) -> tuple[str, str | None]:
     return out, None
 
 
-def _run_research(topic: str, source: str, mode: str) -> tuple[str, str | None]:
+def _run_research(topic: str, source: str, mode: str) -> tuple[str, str | None, str, list[dict[str, Any]]]:
     clean_mode = (mode or "auto").strip().lower() or "auto"
     gemini_enabled = os.getenv("RESEARCH_AGENT_USE_GEMINI_CLI", "false").strip().lower() == "true"
+    orchestrator_enabled = bool(os.getenv("RESEARCH_GEMINI_API_KEY", "").strip())
+    initial_report = ""
+    logger.info(
+        "[research-agent][run] start topic=%s source=%s mode=%s gemini_cli=%s orchestrator=%s",
+        topic,
+        source,
+        clean_mode,
+        gemini_enabled,
+        orchestrator_enabled,
+    )
+
+    if clean_mode == "gemini_cli":
+        if not gemini_enabled:
+            return "", "gemini_cli_disabled", "gemini_cli", []
+
+        report, err = _run_gemini_cli(topic, source)
+        if err:
+            logger.warning("[research-agent][run] gemini_cli mode failed err=%s", err)
+            return "", err, "gemini_cli", []
+
+        if orchestrator_enabled and _check_need_orchestrator(report):
+            try:
+                orch_report, orch_decision_log = asyncio.run(_run_orchestrator_deepdive(topic, source, report))
+                if orch_report:
+                    logger.info("[research-agent][run] route=gemini_cli+orchestrator")
+                    combined = f"[Gemini CLI Initial]\n{report}\n\n[Management AI Deepdive]\n{orch_report}"
+                    return combined[:12000], None, "gemini_cli+orchestrator", orch_decision_log
+            except Exception as exc:
+                logger.exception("Orchestrator failed in gemini_cli mode: %s", exc)
+        return report, None, "gemini_cli", []
 
     if clean_mode in {"gemini_cli", "auto"} and gemini_enabled:
         report, err = _run_gemini_cli(topic, source)
         if not err and report:
-            return report, None
+            initial_report = report
+            try:
+                if orchestrator_enabled and _check_need_orchestrator(report):
+                    orch_report, orch_decision_log = asyncio.run(_run_orchestrator_deepdive(topic, source, report))
+                    if orch_report:
+                        logger.info("[research-agent][run] route=gemini_cli+orchestrator")
+                        combined = f"[Gemini CLI Initial]\n{report}\n\n[Management AI Deepdive]\n{orch_report}"
+                        return combined[:12000], None, "gemini_cli+orchestrator", orch_decision_log
+                logger.info("[research-agent][run] route=gemini_cli")
+                return report, None, "gemini_cli", []
+            except Exception as exc:
+                logger.exception("Orchestrator failed: %s", exc)
+                return report, None, "gemini_cli", []
+
         logger.warning("Gemini CLI failed; fallback to deep dive. err=%s", err)
         if clean_mode == "gemini_cli":
-            return "", err
+            return "", err, "gemini_cli", []
+
+    if clean_mode in {"auto", "fallback"} and orchestrator_enabled:
+        try:
+            orch_report, orch_decision_log = asyncio.run(
+                _run_orchestrator_deepdive(topic, source, initial_report)
+            )
+            if orch_report:
+                if initial_report:
+                    logger.info("[research-agent][run] route=gemini_cli+orchestrator")
+                    combined = f"[Gemini CLI Initial]\n{initial_report}\n\n[Management AI Deepdive]\n{orch_report}"
+                    return combined[:12000], None, "gemini_cli+orchestrator", orch_decision_log
+                logger.info("[research-agent][run] route=orchestrator")
+                return orch_report[:12000], None, "orchestrator", orch_decision_log
+            logger.warning("Orchestrator returned empty report; fallback to deep dive")
+        except Exception as exc:
+            logger.exception("Orchestrator fallback failed: %s", exc)
 
     try:
-        return source_deep_dive(topic=topic, source=source), None
+        logger.info("[research-agent][run] route=deep_dive")
+        return source_deep_dive(topic=topic, source=source), None, "deep_dive", []
     except Exception as exc:
-        return "", str(exc)
+        return "", str(exc), "deep_dive", []
+
+
+def _check_need_orchestrator(report: str) -> bool:
+    """Check if orchestrator (management AI) is needed for deeper research."""
+    if not report:
+        return False
+    lower = report.lower()
+    if any(
+        marker in lower
+        for marker in [
+            "需要",
+            "必要",
+            "深掘り",
+            "詳細",
+            "more_search",
+            "orchestrator",
+        ]
+    ):
+        return True
+    return False
+
+
+async def _run_orchestrator_deepdive(
+    topic: str, source: str, initial_report: str
+) -> tuple[str, list[dict[str, Any]]]:
+    """Run management AI (orchestrator) for deeper research."""
+    try:
+        logger.info("[research-agent][orchestrator] start topic=%s source=%s", topic, source)
+        orchestrator = await build_research_orchestrator()
+        question = f"{topic}\n\n[Initial Gemini CLI report]\n{initial_report}"
+        answer, decision_log = await orchestrator.answer(topic=question, source=source)
+        logger.info("[research-agent][orchestrator] done decision_log_len=%s", len(decision_log))
+        return answer, decision_log
+    except Exception as exc:
+        logger.exception("Orchestrator deepdive failed: %s", exc)
+        return "", []
 
 
 class ResearchHandler(BaseHTTPRequestHandler):
@@ -235,12 +385,58 @@ class ResearchHandler(BaseHTTPRequestHandler):
 
         def _worker() -> None:
             assert self.store is not None
-            self.store.update_job(job_id, status="running")
-            report, err = _run_research(topic=topic, source=source, mode=mode)
-            if err:
-                self.store.update_job(job_id, status="failed", error=err[:1200])
-                return
-            self.store.update_job(job_id, status="done", report=(report or "")[:12000])
+            job_timeout = max(30, _safe_int("RESEARCH_AGENT_JOB_TIMEOUT_SEC", 600))
+            start_time = time.time()
+
+            logger.info("[research-agent][job] start job_id=%s topic=%s source=%s mode=%s", job_id, topic, source, mode)
+            self.store.update_job(job_id, status="running", engine="")
+            try:
+                report, err, engine, decision_log = _run_research(topic=topic, source=source, mode=mode)
+                elapsed = time.time() - start_time
+                if elapsed > job_timeout:
+                    self.store.update_job(
+                        job_id,
+                        status="failed",
+                        error=f"Job timeout exceeded: {elapsed:.1f}s > {job_timeout}s",
+                        engine="timeout",
+                        decision_log=decision_log,
+                    )
+                    return
+                if err:
+                    logger.warning(
+                        "[research-agent][job] failed job_id=%s engine=%s elapsed_sec=%.1f err=%s",
+                        job_id,
+                        engine,
+                        elapsed,
+                        err[:300],
+                    )
+                    self.store.update_job(
+                        job_id,
+                        status="failed",
+                        error=err[:1200],
+                        engine=engine,
+                        decision_log=decision_log,
+                    )
+                    return
+                decorated_report = f"[Research Engine] {engine}\n{report}" if report else f"[Research Engine] {engine}"
+                self.store.update_job(
+                    job_id,
+                    status="done",
+                    report=decorated_report[:12000],
+                    engine=engine,
+                    decision_log=decision_log,
+                )
+                logger.info(
+                    "[research-agent][job] done job_id=%s engine=%s elapsed_sec=%.1f report_chars=%s decision_log_len=%s",
+                    job_id,
+                    engine,
+                    elapsed,
+                    len(report),
+                    len(decision_log),
+                )
+            except Exception as exc:
+                logger.exception("Job worker error: %s", exc)
+                self.store.update_job(job_id, status="failed", error=str(exc)[:1200], engine="error")
 
         threading.Thread(target=_worker, name=f"research-job-{job_id}", daemon=True).start()
 

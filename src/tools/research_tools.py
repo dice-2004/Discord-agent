@@ -115,6 +115,16 @@ def dispatch_research_job(
 
     clean_source = (source or "auto").strip().lower() or "auto"
     clean_mode = (mode or "auto").strip().lower() or "auto"
+    if clean_mode not in {"auto", "gemini_cli", "fallback"}:
+        return json.dumps(
+            {
+                "status": "error",
+                "code": "invalid_mode",
+                "action": "dispatch_research_job",
+                "detail": "mode は auto / gemini_cli / fallback のいずれかを指定してください。",
+            },
+            ensure_ascii=False,
+        )
     wait_enabled = str(wait or "true").strip().lower() not in {"false", "0", "no", "off"}
 
     poll_interval = max(1, _safe_int("RESEARCH_AGENT_POLL_INTERVAL_SEC", 2))
@@ -164,6 +174,8 @@ def dispatch_research_job(
                 "status": "queued",
                 "action": "dispatch_research_job",
                 "job_id": job_id,
+                "mode": clean_mode,
+                "timeout_sec": wait_timeout,
                 "detail": "Research Agent にジョブを投入しました。",
             },
             ensure_ascii=False,

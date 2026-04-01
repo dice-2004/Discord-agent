@@ -16,7 +16,7 @@ from uuid import uuid4
 import google.generativeai as genai
 
 from main_agent.core.memory import ChannelMemoryStore, TaskCheckpointStore
-from main_agent.tools import ToolRegistry, build_default_tool_registry
+from tools import ToolRegistry, build_default_tool_registry
 
 logger = logging.getLogger(__name__)
 
@@ -591,8 +591,12 @@ class DiscordOrchestrator:
             "- ツール呼び出しは具体的引数を与える\n"
             "- ツール引数はカタログ記載の必須キーをすべて含める\n"
             "- 予定/タスク追加依頼では必ず execute_internal_action を使う\n"
+            "- プロンプト内に [Research Controls] ブロックがあれば、dispatch_research_job を優先して使う（ユーザーが調査を明示指示の証）\n"
             "- 重い調査（比較、深掘り、複数観点の調査、長文レポート要求）は dispatch_research_job を優先して使う\n"
-            "- ユーザーが『deepdiveして』『深掘り調査して』等を明示した場合は dispatch_research_job を優先する\n"
+            "- ユーザーが『deepdiveして』『深掘り調査して』『調べて』『調べてきて』等を明示した場合は dispatch_research_job を優先する\n"
+            "- ユーザーが Gemini CLI 利用を明示した場合、dispatch_research_job の mode に gemini_cli を設定する\n"
+            "- ユーザーがフォールバック/非Geminiを明示した場合、dispatch_research_job の mode に fallback を設定する\n"
+            "- ユーザーが調査時間（秒/分）を指定した場合、dispatch_research_job の timeout_sec に秒換算した値を設定する\n"
             "- 区別ルール: 「タスク」「TODO」「やること」等の明示キーワード→add_task、「予定」「会議」「面接」等→add_calendar_event\n"
             "- add_calendar_event は2方式を許可: 1) timed(start_time,end_time) 2) all_day(true)+date(YYYY-MM-DD)\n"
             "- add_task は必須: title, optional: due_date(YYYY-MM-DD)\n"
