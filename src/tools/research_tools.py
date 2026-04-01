@@ -128,14 +128,19 @@ def dispatch_research_job(
     wait_enabled = str(wait or "true").strip().lower() not in {"false", "0", "no", "off"}
 
     poll_interval = max(0.5, _safe_int("RESEARCH_AGENT_POLL_INTERVAL_SEC", 1))  # Shortened to 0.5-1 sec
-    # Use timeout_sec as wait_timeout, with minimum of 30 seconds
-    wait_timeout = max(30, _safe_int("RESEARCH_AGENT_WAIT_TIMEOUT_SEC", 90))
+
+    # Research time (actual research budget, not polling timeout)
+    # Default is intentionally short for normal (non time-specified) requests.
+    research_time_sec = max(10, _safe_int("RESEARCH_AGENT_DEFAULT_TIMEOUT_SEC", 45))
     if str(timeout_sec or "").strip():
         try:
-            # timeout_sec is the research time; polling timeout should be longer
-            wait_timeout = max(timeout_sec, int(str(timeout_sec).strip()) + 30)
-        except ValueError:
+            research_time_sec = int(str(timeout_sec).strip())
+        except (ValueError, TypeError):
             pass
+    research_time_sec = max(10, min(research_time_sec, 1800))  # Clamp: 10s - 30min
+
+    # Polling timeout = research time + buffer for async cleanup
+    wait_timeout = max(30, research_time_sec + 30)
 
     created, err, status_code = _request_json(
         path="/v1/jobs",
@@ -144,7 +149,7 @@ def dispatch_research_job(
             "topic": clean_topic,
             "source": clean_source,
             "mode": clean_mode,
-            "timeout_sec": str(wait_timeout),
+            "timeout_sec": str(research_time_sec),  # Send actual research time to Agent
         },
     )
     if err is not None:

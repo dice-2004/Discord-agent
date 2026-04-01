@@ -198,6 +198,8 @@ def _run_research(topic: str, source: str, mode: str, timeout_sec: int = 60) -> 
     clean_mode = (mode or "auto").strip().lower() or "auto"
     gemini_enabled = os.getenv("RESEARCH_AGENT_USE_GEMINI_CLI", "false").strip().lower() == "true"
     orchestrator_enabled = bool(os.getenv("RESEARCH_GEMINI_API_KEY", "").strip())
+    auto_prefer_orchestrator = os.getenv("RESEARCH_AGENT_AUTO_PREFER_ORCHESTRATOR", "true").strip().lower() == "true"
+    orchestrator_attempted = False
     initial_report = ""
     logger.info(
         "[research-agent][run] start topic=%s source=%s mode=%s gemini_cli=%s orchestrator=%s",
@@ -228,7 +230,20 @@ def _run_research(topic: str, source: str, mode: str, timeout_sec: int = 60) -> 
                 logger.exception("Orchestrator failed in gemini_cli mode: %s", exc)
         return report, None, "gemini_cli", []
 
-    if clean_mode in {"gemini_cli", "auto"} and gemini_enabled:
+    if clean_mode == "auto" and auto_prefer_orchestrator and orchestrator_enabled:
+        try:
+            orchestrator_attempted = True
+            orch_report, orch_decision_log = asyncio.run(
+                _run_orchestrator_deepdive(topic, source, initial_report, timeout_sec)
+            )
+            if orch_report:
+                logger.info("[research-agent][run] route=orchestrator(auto_preferred)")
+                return orch_report[:12000], None, "orchestrator", orch_decision_log
+            logger.warning("Orchestrator returned empty report in auto-preferred mode; fallback to other routes")
+        except Exception as exc:
+            logger.exception("Orchestrator auto-preferred path failed: %s", exc)
+
+    if clean_mode == "auto" and gemini_enabled:
         report, err = _run_gemini_cli(topic, source)
         if not err and report:
             initial_report = report
@@ -249,7 +264,7 @@ def _run_research(topic: str, source: str, mode: str, timeout_sec: int = 60) -> 
         if clean_mode == "gemini_cli":
             return "", err, "gemini_cli", []
 
-    if clean_mode in {"auto", "fallback"} and orchestrator_enabled:
+    if clean_mode in {"auto", "fallback"} and orchestrator_enabled and not orchestrator_attempted:
         try:
             orch_report, orch_decision_log = asyncio.run(
                 _run_orchestrator_deepdive(topic, source, initial_report, timeout_sec)

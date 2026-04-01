@@ -85,7 +85,8 @@ def _extract_research_controls(text: str) -> tuple[str | None, int | None]:
     if not raw:
         return None, None
 
-    lowered = raw.lower()
+    digit_map = str.maketrans("０１２３４５６７８９", "0123456789")
+    lowered = raw.translate(digit_map).lower()
     mode: str | None = None
     if re.search(r"gemini(?:\s*cli)?|geminiで|geminiを", lowered):
         mode = "gemini_cli"
@@ -93,8 +94,8 @@ def _extract_research_controls(text: str) -> tuple[str | None, int | None]:
         mode = "fallback"
 
     timeout_sec: int | None = None
-    sec_match = re.search(r"(\d{1,4})\s*(?:秒|sec|secs|second|seconds)\b", lowered)
-    min_match = re.search(r"(\d{1,3})\s*(?:分|min|mins|minute|minutes)\b", lowered)
+    sec_match = re.search(r"(\d{1,4})\s*(?:秒(?:間)?|sec|secs|second|seconds)", lowered)
+    min_match = re.search(r"(\d{1,3})\s*(?:分(?:間)?|min|mins|minute|minutes)", lowered)
     if sec_match is not None:
         timeout_sec = int(sec_match.group(1))
     elif min_match is not None:
@@ -108,6 +109,14 @@ def _extract_research_controls(text: str) -> tuple[str | None, int | None]:
 
 def _inject_research_controls_hint(question: str) -> str:
     mode, timeout_sec = _extract_research_controls(question)
+    return _inject_research_controls_hint_with_values(question, mode, timeout_sec)
+
+
+def _inject_research_controls_hint_with_values(
+    question: str,
+    mode: str | None,
+    timeout_sec: int | None,
+) -> str:
     if mode is None and timeout_sec is None:
         return question
 
@@ -120,8 +129,86 @@ def _inject_research_controls_hint(question: str) -> str:
         lines.append(f"- mode: {mode}")
     if timeout_sec is not None:
         lines.append(f"- timeout_sec: {timeout_sec}")
+        lines.append("- timeout_sec は指定秒数を厳守（加算・減算・丸め禁止）")
     lines.append("- dispatch_research_job を使わない場合は、この指定を無視してよい")
     return (question or "").rstrip() + "\n" + "\n".join(lines)
+
+
+async def _build_recent_conversation_context(
+    channel: object,
+    *,
+    limit: int = 8,
+    before_message_id: int | None = None,
+) -> str:
+    history_method = getattr(channel, "history", None)
+    if history_method is None:
+        return ""
+
+    before_obj: discord.Object | None = None
+    if before_message_id is not None:
+        try:
+            before_obj = discord.Object(id=int(before_message_id))
+        except Exception:
+            before_obj = None
+
+    lines: list[str] = []
+    try:
+        kwargs: dict[str, object] = {"limit": max(3, min(int(limit), 20))}
+        if before_obj is not None:
+            kwargs["before"] = before_obj
+        async for msg in history_method(**kwargs):
+            text = (getattr(msg, "content", "") or "").strip()
+            if not text:
+                continue
+            if len(text) > 200:
+                text = text[:197] + "..."
+            text = text.replace("\n", " ").strip()
+            author_obj = getattr(msg, "author", None)
+            author = "assistant" if bool(getattr(author_obj, "bot", False)) else str(
+                getattr(author_obj, "display_name", getattr(author_obj, "name", "user"))
+            )
+            created_at = getattr(msg, "created_at", None)
+            if created_at is not None:
+                ts = created_at.astimezone(timezone(timedelta(hours=9))).strftime("%m-%d %H:%M")
+            else:
+                ts = "unknown"
+            lines.append(f"- [{ts}] {author}: {text}")
+    except Exception:
+        logging.getLogger(__name__).debug("Failed to build recent conversation context", exc_info=True)
+        return ""
+
+    if not lines:
+        return ""
+    lines.reverse()
+    return "[Recent Conversation]\n" + "\n".join(lines)
+
+
+def _inject_recent_conversation_hint(question: str, recent_context: str) -> str:
+    if not recent_context:
+        return question
+    guidance = "- 『さっき』『前回』『先ほど』等は上記履歴を優先参照して解釈すること"
+    return (question or "").rstrip() + "\n\n" + recent_context + "\n" + guidance
+
+
+def _is_recall_question(question: str) -> bool:
+    text = (question or "").strip().lower()
+    if not text:
+        return False
+    patterns = [
+        r"さっき",
+        r"先ほど",
+        r"前回",
+        r"前に",
+        r"何について",
+        r"何と言",
+        r"何て言",
+        r"言っていた",
+        r"言ってた",
+        r"覚えて",
+        r"会話履歴",
+        r"ログ",
+    ]
+    return any(re.search(p, text) for p in patterns)
 
 
 def _extract_research_engine(status_payload: dict[str, object], report: str) -> str:
@@ -256,6 +343,16 @@ def save_ingest_cursor(chromadb_path: str, cursor_map: dict[str, int]) -> None:
 
 def _cursor_key(guild_id: int | None, channel_id: int) -> str:
     return f"{guild_id or 0}:{channel_id}"
+
+
+def _drop_guild_cursor_entries(cursor_map: dict[str, int], guild_id: int) -> int:
+    prefix = f"{guild_id}:"
+    removed = 0
+    for key in list(cursor_map.keys()):
+        if key.startswith(prefix):
+            cursor_map.pop(key, None)
+            removed += 1
+    return removed
 
 
 def _utc_now_iso() -> str:
@@ -691,44 +788,64 @@ async def bootstrap_channel_history(
     ingested = 0
     latest_seen = after_id or 0
 
-    try:
-        async for msg in channel.history(limit=limit, oldest_first=True, after=after_obj):
-            text = (msg.content or "").strip()
-            if not text:
-                continue
-            payload.append(
-                {
-                    "message_id": int(msg.id),
-                    "author_id": int(msg.author.id),
-                    "is_bot": bool(getattr(msg.author, "bot", False)),
-                    "content": text,
-                    "created_at": msg.created_at.astimezone(timezone.utc).isoformat(),
-                    "channel_name": str(getattr(msg.channel, "name", "") or ""),
-                }
-            )
-            latest_seen = max(latest_seen, int(msg.id))
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async for msg in channel.history(limit=limit, oldest_first=True, after=after_obj):
+                text = (msg.content or "").strip()
+                if not text:
+                    continue
+                payload.append(
+                    {
+                        "message_id": int(msg.id),
+                        "author_id": int(msg.author.id),
+                        "is_bot": bool(getattr(msg.author, "bot", False)),
+                        "content": text,
+                        "created_at": msg.created_at.astimezone(timezone.utc).isoformat(),
+                        "channel_name": str(getattr(msg.channel, "name", "") or ""),
+                    }
+                )
+                latest_seen = max(latest_seen, int(msg.id))
 
-            if len(payload) >= batch_size:
+                if len(payload) >= batch_size:
+                    ingested += await orchestrator.ingest_channel_history(
+                        guild_id=guild_id,
+                        channel_id=channel_id,
+                        messages=payload,
+                    )
+                    payload = []
+
+            if payload:
                 ingested += await orchestrator.ingest_channel_history(
                     guild_id=guild_id,
                     channel_id=channel_id,
                     messages=payload,
                 )
-                payload = []
-
-        if payload:
-            ingested += await orchestrator.ingest_channel_history(
-                guild_id=guild_id,
-                channel_id=channel_id,
-                messages=payload,
+            break
+        except discord.DiscordServerError:
+            if attempt >= max_attempts:
+                logging.getLogger(__name__).exception(
+                    "Failed bootstrap history after retries: guild=%s channel=%s attempts=%s",
+                    guild_id,
+                    channel_id,
+                    attempt,
+                )
+                return ingested
+            logging.getLogger(__name__).warning(
+                "Retry bootstrap history due to DiscordServerError: guild=%s channel=%s attempt=%s/%s",
+                guild_id,
+                channel_id,
+                attempt,
+                max_attempts,
             )
-    except Exception:
-        logging.getLogger(__name__).exception(
-            "Failed bootstrap history: guild=%s channel=%s",
-            guild_id,
-            channel_id,
-        )
-        return ingested
+            await asyncio.sleep(min(5, attempt * 2))
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Failed bootstrap history: guild=%s channel=%s",
+                guild_id,
+                channel_id,
+            )
+            return ingested
 
     if latest_seen > (after_id or 0):
         cursor_map[key] = latest_seen
@@ -1198,7 +1315,13 @@ def main() -> None:
 
         await interaction.response.defer(thinking=True)
         try:
-            question_for_orchestrator = _inject_research_controls_hint(question)
+            mode, timeout_sec = _extract_research_controls(question)
+            question_with_controls = _inject_research_controls_hint_with_values(question, mode, timeout_sec)
+            recent_context = ""
+            if interaction.channel is not None:
+                recent_limit = 40 if _is_recall_question(question) else 8
+                recent_context = await _build_recent_conversation_context(interaction.channel, limit=recent_limit)
+            question_for_orchestrator = _inject_recent_conversation_hint(question_with_controls, recent_context)
             answer = await orchestrator.answer(
                 question=question_for_orchestrator,
                 guild_id=interaction.guild_id,
@@ -1888,6 +2011,22 @@ def main() -> None:
                 if guild.id not in allowed_guild_ids:
                     continue
 
+                if not bootstrap_force_reindex and ingest_cursor:
+                    try:
+                        stats = await orchestrator.memory.get_guild_memory_stats(guild.id)
+                        total_records = int(stats.get("total_records", 0) or 0)
+                        if total_records <= 0:
+                            removed = _drop_guild_cursor_entries(ingest_cursor, guild.id)
+                            if removed > 0:
+                                save_ingest_cursor(orchestrator_config.chromadb_path, ingest_cursor)
+                                logger.warning(
+                                    "Reset ingest cursor because memory is empty: guild=%s removed=%s",
+                                    guild.id,
+                                    removed,
+                                )
+                    except Exception:
+                        logger.exception("Failed to validate memory state before bootstrap: guild=%s", guild.id)
+
                 targets: list[discord.abc.MessageableChannel] = list(iter_bootstrap_channels(guild))
                 if bootstrap_include_archived:
                     archived_threads = await iter_archived_threads(
@@ -1993,7 +2132,15 @@ def main() -> None:
                     logger.exception("Failed to handle mention quick calendar action")
 
         try:
-            question_for_orchestrator = _inject_research_controls_hint(question)
+            mode, timeout_sec = _extract_research_controls(question)
+            question_with_controls = _inject_research_controls_hint_with_values(question, mode, timeout_sec)
+            recent_limit = 40 if _is_recall_question(question) else 10
+            recent_context = await _build_recent_conversation_context(
+                message.channel,
+                limit=recent_limit,
+                before_message_id=message.id,
+            )
+            question_for_orchestrator = _inject_recent_conversation_hint(question_with_controls, recent_context)
             answer = await orchestrator.answer(
                 question=question_for_orchestrator,
                 guild_id=message.guild.id,

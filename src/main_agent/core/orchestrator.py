@@ -15,7 +15,7 @@ from uuid import uuid4
 
 import google.generativeai as genai
 
-from main_agent.core.memory import ChannelMemoryStore, TaskCheckpointStore
+from main_agent.core.memory import ChannelMemoryStore, MemoryRecord, TaskCheckpointStore
 from tools import ToolRegistry, build_default_tool_registry
 
 logger = logging.getLogger(__name__)
@@ -220,21 +220,34 @@ class DiscordOrchestrator:
         user_id: int,
         message_id: int | None,
     ) -> str:
+        retrieval_question = self._strip_runtime_hints(question)
+        if not retrieval_question:
+            retrieval_question = (question or "").strip()
+
+        recall_intent = self._is_history_recall_query(retrieval_question)
+        retrieval_limit = max(self.memory_top_k, 24) if recall_intent else self.memory_top_k
+        retrieval_scope = "guild" if recall_intent else self.memory_scope
+
         retrieval_guild_ids = self._resolve_retrieval_guild_ids(guild_id)
-        if retrieval_guild_ids is not None and len(retrieval_guild_ids) > 1 and self.memory_scope == "guild":
+        if retrieval_guild_ids is not None and len(retrieval_guild_ids) > 1 and retrieval_scope == "guild":
             history_records = await self.memory.fetch_relevant_messages_multi_guild(
                 guild_ids=retrieval_guild_ids,
                 channel_id=channel_id,
-                query_text=question,
-                limit=self.memory_top_k,
+                query_text=retrieval_question,
+                limit=retrieval_limit,
             )
         else:
             history_records = await self.memory.fetch_relevant_messages(
                 guild_id=guild_id,
                 channel_id=channel_id,
-                query_text=question,
-                limit=self.memory_top_k,
-                scope=self.memory_scope,
+                query_text=retrieval_question,
+                limit=retrieval_limit,
+                scope=retrieval_scope,
+            )
+        if recall_intent:
+            history_records = self._rerank_records_for_recall(
+                question=retrieval_question,
+                records=history_records,
             )
         hit_channels = sorted(
             {
@@ -245,7 +258,7 @@ class DiscordOrchestrator:
         )
         logger.info(
             "Memory retrieval: scope=%s hits=%s channels=%s",
-            self.memory_scope,
+            retrieval_scope,
             len(history_records),
             hit_channels,
         )
@@ -291,7 +304,7 @@ class DiscordOrchestrator:
             guild_id=guild_id,
             channel_id=channel_id,
             user_id=user_id,
-            question=question,
+            question=retrieval_question,
             answer=answer_text,
             request_message_id=message_id,
         )
@@ -449,6 +462,22 @@ class DiscordOrchestrator:
                     scratchpad.append("[Agent] 不正なツール要求を検知したため無視しました。")
                     continue
 
+                if tool_name == "dispatch_research_job":
+                    explicit_timeout = self._extract_timeout_from_research_controls(question)
+                    if explicit_timeout is None:
+                        explicit_timeout = self._extract_timeout_from_user_text(question)
+                    requested_timeout = str(args.get("timeout_sec", "")).strip()
+                    if explicit_timeout is not None:
+                        args["timeout_sec"] = explicit_timeout
+                    else:
+                        args.pop("timeout_sec", None)
+                    logger.info(
+                        "dispatch_research_job timeout policy: explicit=%s requested=%s effective=%s",
+                        explicit_timeout is not None,
+                        requested_timeout or "(none)",
+                        str(args.get("timeout_sec", "")).strip() or "(default)",
+                    )
+
                 logger.info("Tool execution: %s (%s/%s)", tool_name, turn, self.max_tool_turns)
                 tool_output = await asyncio.to_thread(self.tool_registry.execute, tool_name, args)
                 preview = (tool_output or "").replace("\n", " ")[:180]
@@ -469,12 +498,31 @@ class DiscordOrchestrator:
 
             response = str(decision.get("response", "")).strip()
             if response:
-                return await self._self_review_response(
+                if self._is_nonfinal_response(response):
+                    had_tool_context = bool(scratchpad)
+                    scratchpad.append(f"[Agent] 非最終応答を検知: {response[:120]}")
+                    if had_tool_context:
+                        continue
+                    fallback_response = await self._compose_final_response(
+                        system_prompt=system_prompt,
+                        question=question,
+                        now_jst=now_jst,
+                        scratchpad=scratchpad,
+                    )
+                    fallback_reviewed = await self._self_review_response(
+                        system_prompt=system_prompt,
+                        question=question,
+                        response=fallback_response,
+                        scratchpad=scratchpad,
+                    )
+                    return self._ensure_sources_in_answer(fallback_reviewed, scratchpad)
+                reviewed = await self._self_review_response(
                     system_prompt=system_prompt,
                     question=question,
                     response=response,
                     scratchpad=scratchpad,
                 )
+                return self._ensure_sources_in_answer(reviewed, scratchpad)
 
         composed = await self._compose_final_response(
             system_prompt=system_prompt,
@@ -482,12 +530,13 @@ class DiscordOrchestrator:
             now_jst=now_jst,
             scratchpad=scratchpad,
         )
-        return await self._self_review_response(
+        reviewed = await self._self_review_response(
             system_prompt=system_prompt,
             question=question,
             response=composed,
             scratchpad=scratchpad,
         )
+        return self._ensure_sources_in_answer(reviewed, scratchpad)
 
     async def _self_review_response(
         self,
@@ -607,6 +656,7 @@ class DiscordOrchestrator:
             "- ユーザーが Gemini CLI 利用を明示した場合、dispatch_research_job の mode に gemini_cli を設定する\n"
             "- ユーザーがフォールバック/非Geminiを明示した場合、dispatch_research_job の mode に fallback を設定する\n"
             "- ユーザーが調査時間（秒/分）を指定した場合、dispatch_research_job の timeout_sec に秒換算した値を設定する\n"
+            "- timeout_sec はユーザー指定値をそのまま使い、増減しない（例: 1分=60, 2分=120）\n"
             "- 区別ルール: 「タスク」「TODO」「やること」等の明示キーワード→add_task、「予定」「会議」「面接」等→add_calendar_event\n"
             "- add_calendar_event は2方式を許可: 1) timed(start_time,end_time) 2) all_day(true)+date(YYYY-MM-DD)\n"
             "- add_task は必須: title, optional: due_date(YYYY-MM-DD)\n"
@@ -646,6 +696,7 @@ class DiscordOrchestrator:
             f"{system_prompt}\n\n"
             "[Final Response Policy]\n"
             "- 結論を先に書く（簡潔・実用的）\n"
+            "- 参照したURLがある場合は必ず最後に [参考URL] セクションとして列挙する\n"
             "- カレンダー/タスク操作完了時: 実行完了を伝え、詳細（日時、タイトル等）は簡潔に記載\n"
             "- 確認質問や了解待ちレスポンス（「よろしいですか？」「許可しますか？」等）は**絶対に出さない**\n"
             "- ツール実行エラー時のみ、簡潔なエラー説明+再試行オプション提示\n"
@@ -656,6 +707,234 @@ class DiscordOrchestrator:
             f"{observation}"
         )
         return await self._invoke_with_retry(prompt)
+
+    def _extract_urls_from_text(self, text: str) -> list[str]:
+        if not text:
+            return []
+        urls = re.findall(r"https?://[^\s\]\)\">]+", text)
+        seen: set[str] = set()
+        out: list[str] = []
+        for url in urls:
+            clean = url.rstrip(".,;)")
+            if clean in seen:
+                continue
+            seen.add(clean)
+            out.append(clean)
+        return out
+
+    def _collect_urls_from_scratchpad(self, scratchpad: list[str]) -> list[str]:
+        seen: set[str] = set()
+        out: list[str] = []
+        for item in scratchpad:
+            for url in self._extract_urls_from_text(item):
+                if url in seen:
+                    continue
+                seen.add(url)
+                out.append(url)
+        return out
+
+    def _ensure_sources_in_answer(self, answer_text: str, scratchpad: list[str]) -> str:
+        body = (answer_text or "").strip()
+        urls = self._collect_urls_from_scratchpad(scratchpad)
+        if not urls:
+            return body
+        if "参考URL" in body or "[参考にした情報源]" in body:
+            return body
+        src = "\n".join(f"- {u}" for u in urls[:12])
+        return body + "\n\n[参考URL]\n" + src
+
+    @staticmethod
+    def _is_nonfinal_response(text: str) -> bool:
+        body = (text or "").strip()
+        if not body:
+            return True
+        patterns = [
+            "回答を組み立て中に形式エラーが発生しました",
+            "質問を短くして再試行してください",
+            "回答を生成できませんでした",
+            "現在AI応答で問題が発生しています",
+        ]
+        return any(p in body for p in patterns)
+
+    @staticmethod
+    def _extract_timeout_from_research_controls(question: str) -> str | None:
+        text = question or ""
+        if "[Research Controls]" not in text:
+            return None
+        match = re.search(r"^\s*-\s*timeout_sec:\s*(\d{1,4})\s*$", text, flags=re.MULTILINE)
+        if match is None:
+            return None
+        try:
+            value = int(match.group(1))
+        except Exception:
+            return None
+        if value < 10 or value > 1800:
+            return None
+        return str(value)
+
+    @staticmethod
+    def _extract_timeout_from_user_text(question: str) -> str | None:
+        text = DiscordOrchestrator._strip_runtime_hints(question)
+        if not text:
+            return None
+
+        digit_map = str.maketrans("０１２３４５６７８９", "0123456789")
+        normalized = text.translate(digit_map).lower()
+
+        sec_match = re.search(r"(\d{1,4})\s*(?:秒(?:間)?|sec|secs|second|seconds)", normalized)
+        min_match = re.search(r"(\d{1,3})\s*(?:分(?:間)?|min|mins|minute|minutes)", normalized)
+
+        value: int | None = None
+        if sec_match is not None:
+            value = int(sec_match.group(1))
+        elif min_match is not None:
+            value = int(min_match.group(1)) * 60
+
+        if value is None:
+            return None
+        value = max(10, min(value, 1800))
+        return str(value)
+
+    @staticmethod
+    def _strip_runtime_hints(question: str) -> str:
+        text = (question or "").strip()
+        if not text:
+            return ""
+
+        markers = [
+            "\n\n[Research Controls]",
+            "\n[Research Controls]",
+            "\n\n[Recent Conversation]",
+            "\n[Recent Conversation]",
+        ]
+        cut_positions = [text.find(m) for m in markers if text.find(m) >= 0]
+        if cut_positions:
+            text = text[: min(cut_positions)].strip()
+
+        text = re.sub(r"\n?-\s*『さっき』.*$", "", text).strip()
+        return text
+
+    @staticmethod
+    def _is_history_recall_query(question: str) -> bool:
+        text = (question or "").strip().lower()
+        if not text:
+            return False
+        patterns = [
+            r"さっき",
+            r"先ほど",
+            r"前回",
+            r"前に",
+            r"何について",
+            r"何と言",
+            r"何て言",
+            r"言っていた",
+            r"言ってた",
+            r"覚えて",
+            r"会話履歴",
+            r"ログ",
+        ]
+        return any(re.search(p, text) for p in patterns)
+
+    @staticmethod
+    def _rerank_records_for_recall(question: str, records: list[MemoryRecord]) -> list[MemoryRecord]:
+        if not records:
+            return records
+
+        request_cues = ("調べて", "調査", "比較", "教えて", "まとめ", "説明")
+        recall_cues = ("何について", "何て言", "言ってた", "言っていた", "覚えて", "前回", "さっき", "先ほど")
+        denial_cues = ("見当たりません", "確認しましたが", "申し訳ありません", "わかりません")
+
+        normalized_question = (question or "").strip().lower()
+        time_pattern = re.compile(r"\d+\s*(?:分|秒)(?:間)?")
+        focus_tokens = DiscordOrchestrator._extract_focus_tokens_for_recall(normalized_question)
+        question_has_time = bool(time_pattern.search(normalized_question))
+
+        ranked: list[tuple[int, float, int, MemoryRecord]] = []
+        for idx, record in enumerate(records):
+            content = (record.content or "").strip()
+            lowered = content.lower()
+            score = 0
+            focus_overlap = sum(1 for token in focus_tokens if token and token in lowered)
+
+            if record.role == "user":
+                score += 5
+            else:
+                score -= 1
+
+            if focus_overlap > 0:
+                score += focus_overlap * 6
+            elif focus_tokens:
+                score -= 4
+
+            if any(cue in lowered for cue in request_cues) and (focus_overlap > 0 or not focus_tokens):
+                score += 3
+            if question_has_time and time_pattern.search(lowered):
+                score += 2
+            if any(cue in lowered for cue in recall_cues):
+                score -= 4
+            if any(cue in lowered for cue in denial_cues):
+                score -= 6
+            if normalized_question and normalized_question in lowered:
+                score -= 3
+
+            ts_value = DiscordOrchestrator._timestamp_sort_key(record.timestamp)
+            ranked.append((score, ts_value, -idx, record))
+
+        ranked.sort(reverse=True)
+        return [row[3] for row in ranked]
+
+    @staticmethod
+    def _extract_focus_tokens_for_recall(question: str) -> list[str]:
+        text = (question or "").strip().lower()
+        if not text:
+            return []
+
+        tokens = re.findall(r"[a-z0-9_\-]+|[一-龥]{2,}|[ぁ-ん]{2,}|[ァ-ンー]{2,}", text)
+        time_pattern = re.compile(r"\d+\s*(?:分|秒)(?:間)?")
+        ignore_tokens = {
+            "さっき",
+            "先ほど",
+            "前回",
+            "前に",
+            "何について",
+            "何と言",
+            "何て言",
+            "言っていた",
+            "言ってた",
+            "覚えて",
+            "会話履歴",
+            "ログ",
+            "調べて",
+            "調査",
+            "比較",
+            "教えて",
+            "まとめ",
+            "説明",
+        }
+
+        out: list[str] = []
+        for token in tokens:
+            if len(token) < 2:
+                continue
+            if token in ignore_tokens:
+                continue
+            if time_pattern.search(token):
+                continue
+            if token not in out:
+                out.append(token)
+        return out[:8]
+
+    @staticmethod
+    def _timestamp_sort_key(timestamp_text: str) -> float:
+        if not timestamp_text:
+            return 0.0
+        try:
+            parsed = datetime.fromisoformat(str(timestamp_text).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        except Exception:
+            return 0.0
 
     @staticmethod
     def _extract_json_object(text: str) -> dict[str, Any] | None:

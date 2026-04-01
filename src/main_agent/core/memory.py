@@ -673,7 +673,22 @@ class ChannelMemoryStore:
         metadatas: list[dict[str, Any]],
         distances: list[float],
     ) -> tuple[list[str], list[dict[str, Any]], list[float]]:
-        token_candidates = sorted(query_tokens, key=len, reverse=True)[:3]
+        time_tokens = [
+            t for t in query_tokens
+            if re.search(r"\d", t) or ("分" in t) or ("秒" in t)
+        ]
+        alnum_tokens = [
+            t for t in sorted(query_tokens, key=len, reverse=True)
+            if t not in time_tokens and re.fullmatch(r"[a-z0-9_\-]{2,32}", t)
+        ]
+        other_tokens = [
+            t for t in sorted(query_tokens, key=len, reverse=True)
+            if t not in time_tokens and t not in alnum_tokens
+        ]
+        token_candidates: list[str] = []
+        for token in sorted(time_tokens, key=len, reverse=True)[:3] + alnum_tokens[:4] + other_tokens[:6]:
+            if token and token not in token_candidates:
+                token_candidates.append(token)
         if not token_candidates:
             return docs, metadatas, distances
 
@@ -687,27 +702,34 @@ class ChannelMemoryStore:
         merged_distances = list(distances)
 
         for token in token_candidates:
-            try:
-                res = collection.get(
-                    where_document={"$contains": token},
-                    include=["documents", "metadatas"],
-                    limit=40,
-                )
-            except Exception:
-                continue
+            variants = [token]
+            if re.fullmatch(r"[a-z0-9_\-]{2,32}", token):
+                upper = token.upper()
+                if upper not in variants:
+                    variants.append(upper)
 
-            lex_docs = res.get("documents", []) or []
-            lex_mds = res.get("metadatas", []) or []
-            for idx, content in enumerate(lex_docs):
-                md = lex_mds[idx] if idx < len(lex_mds) else {}
-                key = self._candidate_key(content, md)
-                if key in existing_keys:
+            for variant in variants:
+                try:
+                    res = collection.get(
+                        where_document={"$contains": variant},
+                        include=["documents", "metadatas"],
+                        limit=40,
+                    )
+                except Exception:
                     continue
-                existing_keys.add(key)
-                merged_docs.append(content)
-                merged_mds.append(md)
-                # 文字列一致候補は距離0相当として強めに優先
-                merged_distances.append(0.0)
+
+                lex_docs = res.get("documents", []) or []
+                lex_mds = res.get("metadatas", []) or []
+                for idx, content in enumerate(lex_docs):
+                    md = lex_mds[idx] if idx < len(lex_mds) else {}
+                    key = self._candidate_key(content, md)
+                    if key in existing_keys:
+                        continue
+                    existing_keys.add(key)
+                    merged_docs.append(content)
+                    merged_mds.append(md)
+                    # 文字列一致候補は距離0相当として強めに優先
+                    merged_distances.append(0.0)
 
         return merged_docs, merged_mds, merged_distances
 
@@ -755,10 +777,14 @@ class ChannelMemoryStore:
     def _tokenize(text: str) -> set[str]:
         if not text:
             return set()
+        digit_map = str.maketrans("０１２３４５６７８９", "0123456789")
+        normalized = text.translate(digit_map).lower()
+
         parts = re.findall(
             r"[a-zA-Z0-9_\-]+|[一-龥]{2,}|[ぁ-ん]{2,}|[ァ-ンー]{2,}",
-            text.lower(),
+            normalized,
         )
+        time_parts = re.findall(r"\d{1,4}\s*(?:秒|分)(?:間)?", normalized)
         stopwords = {
             "について",
             "これ",
@@ -778,7 +804,12 @@ class ChannelMemoryStore:
             "過去",
             "最新",
         }
-        return {p for p in parts if len(p) >= 2 and p not in stopwords}
+        tokens = {p for p in parts if len(p) >= 2 and p not in stopwords}
+        for t in time_parts:
+            compact = re.sub(r"\s+", "", t)
+            if len(compact) >= 2:
+                tokens.add(compact)
+        return tokens
 
     @staticmethod
     def _overlap_score(query_tokens: set[str], doc_tokens: set[str]) -> int:
