@@ -95,6 +95,13 @@ class ResearchOrchestrator:
                     "reason": decision.get("reason"),
                 }
             )
+            logger.info(
+                "[AI_THOUGHT] agent=research turn=%s action=%s tool=%s reason=%s",
+                turn,
+                str(decision.get("action", "")),
+                str(decision.get("tool", "")),
+                str(decision.get("reason", ""))[:180],
+            )
 
             # Early respond: only if at max turns, ignore early completion otherwise
             if decision.get("action") == "respond":
@@ -106,6 +113,12 @@ class ResearchOrchestrator:
                         "Early completion at turn=%d/%d elapsed=%.1f/%d: forcing deeper research",
                         turn,
                         self.max_tool_turns,
+                        elapsed,
+                        timeout_sec,
+                    )
+                    logger.info(
+                        "[AI_THOUGHT] agent=research stage=early_respond_override turn=%s elapsed=%.1f timeout_sec=%s",
+                        turn,
                         elapsed,
                         timeout_sec,
                     )
@@ -174,6 +187,12 @@ class ResearchOrchestrator:
                             alt_tool,
                             turn,
                             self.max_tool_turns,
+                        )
+                        logger.info(
+                            "[AI_THOUGHT] agent=research stage=tool_repetition_guard turn=%s from=%s to=%s",
+                            turn,
+                            tool_name,
+                            alt_tool,
                         )
                         tool_name = alt_tool
                         tool_args = alt_args
@@ -326,7 +345,11 @@ class ResearchOrchestrator:
             "[Final Response Policy]\n"
             "- 結論を先に書く（簡潔・実用的）\n"
             "- 必ず参考URLを最後に記載する\n"
-            "- 複数の視点からの情報を含める\n\n"
+            "- 複数の視点からの情報を含める\n"
+            "- GitHub情報は README本文 と About欄(description) を必ず区別して記述する\n"
+            "- 断定時は Tool Results 内の根拠行に一致する内容のみを書く。不明なら不明と書く\n"
+            "- [GitHub Repo Probe] がある場合、about_description/about_contains_kc3hack と README_* を最優先根拠にする\n"
+            "- README_contains_kc3hack=no の場合、『READMEにKc3hack記載がある』とは書かない\n\n"
             "[Research Topic]\n"
             f"{question}\n\n"
             "[Tool Results]\n"
@@ -358,12 +381,27 @@ class ResearchOrchestrator:
         seen = set()
         unique_urls = []
         for url in urls:
-            # Clean up trailing punctuation that often appears in markdown
-            url = url.rstrip('.,;)')
-            if url not in seen:
-                seen.add(url)
-                unique_urls.append(url)
+            clean = self._normalize_extracted_url(url)
+            if not clean:
+                continue
+            if clean not in seen:
+                seen.add(clean)
+                unique_urls.append(clean)
         return unique_urls[:5]  # Return top 5 unique URLs
+
+    @staticmethod
+    def _normalize_extracted_url(url: str) -> str:
+        clean = (url or "").strip()
+        if not clean:
+            return ""
+        for marker in ("\\n", "/n", "\n"):
+            idx = clean.find(marker)
+            if idx >= 0:
+                clean = clean[:idx]
+        clean = clean.rstrip('.,;)-')
+        if not clean.startswith("http://") and not clean.startswith("https://"):
+            return ""
+        return clean
 
     def _collect_source_urls(self, scratchpad: list[str]) -> list[str]:
         seen: set[str] = set()

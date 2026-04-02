@@ -190,6 +190,29 @@ def _inject_recent_conversation_hint(question: str, recent_context: str) -> str:
     return (question or "").rstrip() + "\n\n" + recent_context + "\n" + guidance
 
 
+def _has_followup_marker(question: str) -> bool:
+    text = (question or "").strip().lower()
+    if not text:
+        return False
+    markers = (
+        "それ",
+        "その",
+        "この件",
+        "同じ",
+        "続き",
+        "前の",
+        "先ほど",
+        "さっき",
+        "前回",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _should_attach_recent_context(question: str) -> bool:
+    # Recent conversation is only attached for recall or explicit follow-up queries.
+    return _is_recall_question(question) or _has_followup_marker(question)
+
+
 def _is_recall_question(question: str) -> bool:
     text = (question or "").strip().lower()
     if not text:
@@ -206,7 +229,8 @@ def _is_recall_question(question: str) -> bool:
         r"言ってた",
         r"覚えて",
         r"会話履歴",
-        r"ログ",
+        r"会話ログ",
+        r"履歴ログ",
     ]
     return any(re.search(p, text) for p in patterns)
 
@@ -1318,7 +1342,7 @@ def main() -> None:
             mode, timeout_sec = _extract_research_controls(question)
             question_with_controls = _inject_research_controls_hint_with_values(question, mode, timeout_sec)
             recent_context = ""
-            if interaction.channel is not None:
+            if interaction.channel is not None and _should_attach_recent_context(question):
                 recent_limit = 40 if _is_recall_question(question) else 8
                 recent_context = await _build_recent_conversation_context(interaction.channel, limit=recent_limit)
             question_for_orchestrator = _inject_recent_conversation_hint(question_with_controls, recent_context)
@@ -2134,12 +2158,14 @@ def main() -> None:
         try:
             mode, timeout_sec = _extract_research_controls(question)
             question_with_controls = _inject_research_controls_hint_with_values(question, mode, timeout_sec)
-            recent_limit = 40 if _is_recall_question(question) else 10
-            recent_context = await _build_recent_conversation_context(
-                message.channel,
-                limit=recent_limit,
-                before_message_id=message.id,
-            )
+            recent_context = ""
+            if _should_attach_recent_context(question):
+                recent_limit = 40 if _is_recall_question(question) else 10
+                recent_context = await _build_recent_conversation_context(
+                    message.channel,
+                    limit=recent_limit,
+                    before_message_id=message.id,
+                )
             question_for_orchestrator = _inject_recent_conversation_hint(question_with_controls, recent_context)
             answer = await orchestrator.answer(
                 question=question_for_orchestrator,

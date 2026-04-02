@@ -224,26 +224,41 @@ class DiscordOrchestrator:
         if not retrieval_question:
             retrieval_question = (question or "").strip()
 
+        is_explicit_global_query = self._is_explicit_global_source_query(retrieval_question)
+        has_followup_marker = self._has_followup_marker(retrieval_question)
         recall_intent = self._is_history_recall_query(retrieval_question)
         retrieval_limit = max(self.memory_top_k, 24) if recall_intent else self.memory_top_k
         retrieval_scope = "guild" if recall_intent else self.memory_scope
+        use_history_context = True
+        if is_explicit_global_query and not has_followup_marker:
+            use_history_context = False
+            retrieval_scope = "disabled(explicit_global_query)"
+            self._log_ai_thought(
+                stage="memory_context_policy",
+                action="skip_history_context",
+                reason="explicit_global_source_query_without_followup",
+                question=retrieval_question,
+            )
 
-        retrieval_guild_ids = self._resolve_retrieval_guild_ids(guild_id)
-        if retrieval_guild_ids is not None and len(retrieval_guild_ids) > 1 and retrieval_scope == "guild":
-            history_records = await self.memory.fetch_relevant_messages_multi_guild(
-                guild_ids=retrieval_guild_ids,
-                channel_id=channel_id,
-                query_text=retrieval_question,
-                limit=retrieval_limit,
-            )
+        if use_history_context:
+            retrieval_guild_ids = self._resolve_retrieval_guild_ids(guild_id)
+            if retrieval_guild_ids is not None and len(retrieval_guild_ids) > 1 and retrieval_scope == "guild":
+                history_records = await self.memory.fetch_relevant_messages_multi_guild(
+                    guild_ids=retrieval_guild_ids,
+                    channel_id=channel_id,
+                    query_text=retrieval_question,
+                    limit=retrieval_limit,
+                )
+            else:
+                history_records = await self.memory.fetch_relevant_messages(
+                    guild_id=guild_id,
+                    channel_id=channel_id,
+                    query_text=retrieval_question,
+                    limit=retrieval_limit,
+                    scope=retrieval_scope,
+                )
         else:
-            history_records = await self.memory.fetch_relevant_messages(
-                guild_id=guild_id,
-                channel_id=channel_id,
-                query_text=retrieval_question,
-                limit=retrieval_limit,
-                scope=retrieval_scope,
-            )
+            history_records = []
         if recall_intent:
             history_records = self._rerank_records_for_recall(
                 question=retrieval_question,
@@ -294,6 +309,7 @@ class DiscordOrchestrator:
             answer_text = await self._generate_with_tools(system_prompt, question)
             if not answer_text.strip():
                 answer_text = "回答を生成できませんでした。質問を少し変えて再試行してください。"
+            answer_text = self._sanitize_user_facing_error_phrases(answer_text)
             if self.memory_response_include_evidence:
                 answer_text = self._append_memory_evidence(answer_text, history_records)
         except Exception:
@@ -398,11 +414,46 @@ class DiscordOrchestrator:
     async def _generate_with_tools(self, system_prompt: str, question: str) -> str:
         now_jst = datetime.now().strftime("%Y-%m-%d %H:%M")
         scratchpad: list[str] = []
+        runtime_question = question
+        executed_research_signatures: set[str] = set()
+
+        base_question = self._strip_runtime_hints(runtime_question)
+        has_followup_marker = self._has_followup_marker(base_question)
+        if self._is_underspecified_external_research_query(base_question):
+            if has_followup_marker:
+                followup_topic = self._extract_followup_topic_from_recent_context(runtime_question)
+                if followup_topic:
+                    runtime_question = (
+                        runtime_question.rstrip()
+                        + "\n\n[Resolved Follow-up Topic]\n"
+                        + f"- previous_topic: {followup_topic}"
+                    )
+                    self._log_ai_thought(
+                        stage="followup_resolution",
+                        mode="inherit_previous_topic",
+                        previous_topic=followup_topic,
+                    )
+                else:
+                    self._log_ai_thought(
+                        stage="followup_resolution",
+                        mode="clarify_required",
+                        reason="followup_marker_detected_without_recent_topic",
+                    )
+                    return (
+                        "調査対象が曖昧です。どの対象の最新議論を調べるか指定してください。"
+                        "（例: oithxs/yorimichi, Claude Code, あるいはURL）"
+                    )
+            else:
+                self._log_ai_thought(
+                    stage="followup_resolution",
+                    mode="standalone",
+                    reason="underspecified_without_followup_marker",
+                )
 
         for turn in range(1, self.max_tool_turns + 1):
             decision = await self._decide_next_action(
                 system_prompt=system_prompt,
-                question=question,
+                question=runtime_question,
                 now_jst=now_jst,
                 scratchpad=scratchpad,
                 turn=turn,
@@ -422,12 +473,45 @@ class DiscordOrchestrator:
                 alias_tool = str(decision.get("tool", "")).strip()
                 if alias_tool in tool_names and not str(decision.get("action", "")).strip().lower() == "respond":
                     action = "tool"
+
+            if self._should_force_research_job(
+                question=runtime_question,
+                turn=turn,
+                action=action,
+                scratchpad=scratchpad,
+            ):
+                forced_source = self._infer_research_source_from_question(runtime_question)
+                forced_topic = self._resolve_research_topic(runtime_question)
+                decision = {
+                    "action": "tool",
+                    "tool": "dispatch_research_job",
+                    "args": {
+                        "topic": forced_topic,
+                        "source": forced_source,
+                        "mode": "auto",
+                    },
+                    "reason": "guard:external_research_intent",
+                }
+                action = "tool"
+                self._log_ai_thought(
+                    stage="force_dispatch_research_job",
+                    source=forced_source,
+                    topic=forced_topic,
+                    reason="guard_external_research_intent",
+                )
             logger.info(
                 "Agent decision: turn=%s action=%s tool=%s reason=%s",
                 turn,
                 action,
                 str(decision.get("tool", "")),
                 str(decision.get("reason", ""))[:180],
+            )
+            self._log_ai_thought(
+                stage="decision",
+                turn=turn,
+                action=action,
+                tool=str(decision.get("tool", "")),
+                reason=str(decision.get("reason", ""))[:180],
             )
 
             if action == "tool":
@@ -463,6 +547,23 @@ class DiscordOrchestrator:
                     continue
 
                 if tool_name == "dispatch_research_job":
+                    clean_runtime_question = self._strip_runtime_hints(runtime_question)
+                    if (
+                        self._is_explicit_global_source_query(clean_runtime_question)
+                        and not self._has_followup_marker(clean_runtime_question)
+                    ):
+                        guarded_topic = self._resolve_research_topic(clean_runtime_question)
+                        guarded_source = self._infer_research_source_from_question(clean_runtime_question)
+                        args["topic"] = guarded_topic
+                        args["source"] = guarded_source
+                        self._log_ai_thought(
+                            stage="dispatch_topic_guard",
+                            action="override_topic_source",
+                            topic=guarded_topic,
+                            source=guarded_source,
+                            reason="explicit_global_source_query_without_followup",
+                        )
+
                     explicit_timeout = self._extract_timeout_from_research_controls(question)
                     if explicit_timeout is None:
                         explicit_timeout = self._extract_timeout_from_user_text(question)
@@ -477,6 +578,28 @@ class DiscordOrchestrator:
                         requested_timeout or "(none)",
                         str(args.get("timeout_sec", "")).strip() or "(default)",
                     )
+                    signature = self._research_dispatch_signature(args)
+                    if signature in executed_research_signatures and scratchpad:
+                        self._log_ai_thought(
+                            stage="duplicate_dispatch_guard",
+                            turn=turn,
+                            signature=signature,
+                            action="compose_final_response",
+                        )
+                        composed = await self._compose_final_response(
+                            system_prompt=system_prompt,
+                            question=runtime_question,
+                            now_jst=now_jst,
+                            scratchpad=scratchpad,
+                        )
+                        reviewed = await self._self_review_response(
+                            system_prompt=system_prompt,
+                            question=runtime_question,
+                            response=composed,
+                            scratchpad=scratchpad,
+                        )
+                        return self._ensure_sources_in_answer(reviewed, scratchpad)
+                    executed_research_signatures.add(signature)
 
                 logger.info("Tool execution: %s (%s/%s)", tool_name, turn, self.max_tool_turns)
                 tool_output = await asyncio.to_thread(self.tool_registry.execute, tool_name, args)
@@ -505,20 +628,20 @@ class DiscordOrchestrator:
                         continue
                     fallback_response = await self._compose_final_response(
                         system_prompt=system_prompt,
-                        question=question,
+                        question=runtime_question,
                         now_jst=now_jst,
                         scratchpad=scratchpad,
                     )
                     fallback_reviewed = await self._self_review_response(
                         system_prompt=system_prompt,
-                        question=question,
+                        question=runtime_question,
                         response=fallback_response,
                         scratchpad=scratchpad,
                     )
                     return self._ensure_sources_in_answer(fallback_reviewed, scratchpad)
                 reviewed = await self._self_review_response(
                     system_prompt=system_prompt,
-                    question=question,
+                    question=runtime_question,
                     response=response,
                     scratchpad=scratchpad,
                 )
@@ -526,13 +649,13 @@ class DiscordOrchestrator:
 
         composed = await self._compose_final_response(
             system_prompt=system_prompt,
-            question=question,
+            question=runtime_question,
             now_jst=now_jst,
             scratchpad=scratchpad,
         )
         reviewed = await self._self_review_response(
             system_prompt=system_prompt,
-            question=question,
+            question=runtime_question,
             response=composed,
             scratchpad=scratchpad,
         )
@@ -557,6 +680,11 @@ class DiscordOrchestrator:
             )
             action = str(review_decision.get("action", "approve")).strip().lower()
             logger.info("Agent self-review: turn=%s action=%s", review_turn, action)
+            self._log_ai_thought(
+                stage="self_review",
+                turn=review_turn,
+                action=action,
+            )
 
             if action == "approve":
                 return current
@@ -681,7 +809,7 @@ class DiscordOrchestrator:
             return parsed
         return {
             "action": "respond",
-            "response": "回答を組み立て中に形式エラーが発生しました。質問を短くして再試行してください。",
+            "response": "回答の内部整形で一時的な問題が発生しました。再構成して続行します。",
         }
 
     async def _compose_final_response(
@@ -715,12 +843,28 @@ class DiscordOrchestrator:
         seen: set[str] = set()
         out: list[str] = []
         for url in urls:
-            clean = url.rstrip(".,;)")
+            clean = self._normalize_extracted_url(url)
+            if not clean:
+                continue
             if clean in seen:
                 continue
             seen.add(clean)
             out.append(clean)
         return out
+
+    @staticmethod
+    def _normalize_extracted_url(url: str) -> str:
+        clean = (url or "").strip()
+        if not clean:
+            return ""
+        for marker in ("\\n", "/n", "\n"):
+            idx = clean.find(marker)
+            if idx >= 0:
+                clean = clean[:idx]
+        clean = clean.rstrip(".,;)-")
+        if not clean.startswith("http://") and not clean.startswith("https://"):
+            return ""
+        return clean
 
     def _collect_urls_from_scratchpad(self, scratchpad: list[str]) -> list[str]:
         seen: set[str] = set()
@@ -755,6 +899,21 @@ class DiscordOrchestrator:
             "現在AI応答で問題が発生しています",
         ]
         return any(p in body for p in patterns)
+
+    @staticmethod
+    def _sanitize_user_facing_error_phrases(text: str) -> str:
+        body = (text or "").strip()
+        if not body:
+            return body
+        body = body.replace(
+            "回答を組み立て中に形式エラーが発生しました。質問を短くして再試行してください。",
+            "回答の内部整形で一時的な問題が発生しました。しばらく待って再試行してください。",
+        )
+        body = body.replace(
+            "質問を短くして再試行してください",
+            "しばらく待って再試行してください",
+        )
+        return body
 
     @staticmethod
     def _extract_timeout_from_research_controls(question: str) -> str | None:
@@ -831,9 +990,249 @@ class DiscordOrchestrator:
             r"言ってた",
             r"覚えて",
             r"会話履歴",
-            r"ログ",
+            r"会話ログ",
+            r"履歴ログ",
         ]
         return any(re.search(p, text) for p in patterns)
+
+    @staticmethod
+    def _should_force_research_job(
+        question: str,
+        turn: int,
+        action: str,
+        scratchpad: list[str],
+    ) -> bool:
+        if turn != 1 or action == "tool" or scratchpad:
+            return False
+
+        text = DiscordOrchestrator._strip_runtime_hints(question).lower()
+        if not text:
+            return False
+
+        source_terms = (
+            "agent-reach",
+            "agent reach",
+            "x.com",
+            "twitter",
+            "ツイッター",
+            "tweet",
+            "youtube",
+            "動画",
+            "github",
+            "issue",
+            "release",
+            "reddit",
+            "subreddit",
+            "news",
+            "フォーラム",
+            "コミュニティ",
+            "sns",
+        )
+        research_terms = (
+            "調べ",
+            "調査",
+            "深掘り",
+            "比較",
+            "分析",
+            "まとめ",
+            "動向",
+            "反応",
+            "議論",
+            "最新",
+            "トレンド",
+            "評判",
+            "口コミ",
+            "出典",
+            "ソース",
+        )
+
+        has_source_term = any(term in text for term in source_terms)
+        has_research_term = any(term in text for term in research_terms)
+        if has_source_term and has_research_term:
+            return True
+
+        # Entity lookup intent (e.g., "yorimichiについて教えて") should be grounded with tools.
+        if re.search(r"[a-z0-9][a-z0-9_.-]{2,}\s*(?:について教えて|とは|って何|を教えて)", text):
+            if not re.search(r"(todo|to-do|to do|タスク|予定|会議|面接|登録|追加|実行)", text):
+                return True
+
+        return False
+
+    @staticmethod
+    def _research_dispatch_signature(args: dict[str, Any]) -> str:
+        source = str(args.get("source", "")).strip().lower()
+        mode = str(args.get("mode", "")).strip().lower()
+        topic = str(args.get("topic", "")).strip().lower()
+        topic = re.sub(r"\s+", " ", topic)
+        return f"{source}|{mode}|{topic}"
+
+    @staticmethod
+    def _truncate_log_value(value: Any, max_len: int = 180) -> str:
+        text = str(value or "").replace("\n", " ").strip()
+        if len(text) <= max_len:
+            return text
+        return text[: max_len - 3] + "..."
+
+    def _log_ai_thought(self, stage: str, **fields: Any) -> None:
+        parts: list[str] = []
+        for key, value in fields.items():
+            trimmed = self._truncate_log_value(value)
+            if not trimmed:
+                continue
+            parts.append(f"{key}={trimmed}")
+        detail = " ".join(parts)
+        if detail:
+            logger.info("[AI_THOUGHT] stage=%s %s", stage, detail)
+        else:
+            logger.info("[AI_THOUGHT] stage=%s", stage)
+
+    @staticmethod
+    def _infer_research_source_from_question(question: str) -> str:
+        text = DiscordOrchestrator._strip_runtime_hints(question).lower()
+        if any(term in text for term in ("x.com", "twitter", "ツイッター", "tweet")):
+            return "x"
+        if any(term in text for term in ("youtube", "動画")):
+            return "youtube"
+        if any(term in text for term in ("github", "issue", "release", "pull request", "pr")):
+            return "github"
+        if any(term in text for term in ("reddit", "subreddit")):
+            return "reddit"
+        return "auto"
+
+    @staticmethod
+    def _has_followup_marker(question: str) -> bool:
+        text = (question or "").strip().lower()
+        if not text:
+            return False
+        markers = (
+            "それ",
+            "その",
+            "この件",
+            "同じ",
+            "続き",
+            "前の",
+            "先ほど",
+            "さっき",
+            "前回",
+        )
+        return any(marker in text for marker in markers)
+
+    @staticmethod
+    def _is_underspecified_external_research_query(question: str) -> bool:
+        text = (question or "").strip().lower()
+        if not text:
+            return False
+
+        if DiscordOrchestrator._is_explicit_global_source_query(text):
+            return False
+
+        source_terms = (
+            "github",
+            "x.com",
+            "twitter",
+            "ツイッター",
+            "youtube",
+            "reddit",
+            "コミュニティ",
+            "フォーラム",
+            "sns",
+        )
+        research_terms = (
+            "調べ",
+            "調査",
+            "議論",
+            "動向",
+            "反応",
+            "最新",
+            "トレンド",
+            "要点",
+            "まとめ",
+            "比較",
+            "分析",
+        )
+        if not any(term in text for term in source_terms):
+            return False
+        if not any(term in text for term in research_terms):
+            return False
+
+        if re.search(
+            r"(github|twitter|youtube|reddit|x\.com|ツイッター)(?:上)?(?:の)?(?:最新)?(?:議論|動向|反応)",
+            text,
+        ):
+            if not re.search(r"https?://", text) and not re.search(r"[a-z0-9_.-]+/[a-z0-9_.-]+", text):
+                return True
+
+        if re.search(r"https?://", text):
+            return False
+        if re.search(r"[a-z0-9_.-]+/[a-z0-9_.-]+", text):
+            return False
+
+        generic_tokens = {
+            "github", "twitter", "youtube", "reddit", "x", "com", "sns",
+            "最新", "議論", "反応", "動向", "調査", "調べ", "分析", "比較", "要点", "まとめ",
+            "上", "について", "を", "の", "で", "に", "と",
+        }
+        tokens = re.findall(r"[a-z0-9_\-]+|[一-龥]{2,}|[ぁ-ん]{2,}|[ァ-ンー]{2,}", text)
+        focus = [t for t in tokens if t not in generic_tokens]
+        return len(focus) == 0
+
+    @staticmethod
+    def _is_explicit_global_source_query(text: str) -> bool:
+        lowered = (text or "").strip().lower()
+        if not lowered:
+            return False
+        if DiscordOrchestrator._has_followup_marker(lowered):
+            return False
+        if re.search(r"https?://", lowered):
+            return False
+        if re.search(r"[a-z0-9_.-]+/[a-z0-9_.-]+", lowered):
+            return False
+
+        has_source = bool(re.search(r"(github|youtube|twitter|x\.com|reddit)", lowered))
+        has_global_scope = any(token in lowered for token in ("全体", "全般", "界隈", "横断", "トレンド"))
+        has_source_latest_phrase = bool(
+            re.search(
+                r"(github|youtube|twitter|x\.com|reddit)(?:上)?(?:の)?(?:最新)?(?:議論|動向|反応|情報|トレンド)",
+                lowered,
+            )
+        )
+        return has_source and (has_global_scope or has_source_latest_phrase)
+
+    @staticmethod
+    def _extract_followup_topic_from_recent_context(question: str) -> str:
+        text = question or ""
+        marker = "[Recent Conversation]"
+        idx = text.find(marker)
+        if idx < 0:
+            return ""
+        block = text[idx + len(marker):]
+        lines = [ln.strip() for ln in block.splitlines() if ln.strip().startswith("-")]
+        user_lines: list[str] = []
+        for ln in lines:
+            lowered = ln.lower()
+            if "] assistant:" in lowered:
+                continue
+            m = re.search(r"\]\s*[^:]+:\s*(.+)$", ln)
+            if not m:
+                continue
+            content = m.group(1).strip()
+            content = re.sub(r"<@!?\d+>", "", content).strip()
+            if content:
+                user_lines.append(content)
+        return user_lines[-1] if user_lines else ""
+
+    @staticmethod
+    def _resolve_research_topic(question: str) -> str:
+        text = question or ""
+        explicit = DiscordOrchestrator._strip_runtime_hints(text).strip()
+        if explicit:
+            m = re.search(r"\[Resolved Follow-up Topic\]\s*-\s*previous_topic:\s*(.+)$", text, flags=re.DOTALL)
+            if m:
+                prior = (m.group(1) or "").strip()
+                if prior and DiscordOrchestrator._has_followup_marker(explicit):
+                    return f"{prior}\n\n[Follow-up Request]\n{explicit}"
+            return explicit
+        return (question or "").strip()
 
     @staticmethod
     def _rerank_records_for_recall(question: str, records: list[MemoryRecord]) -> list[MemoryRecord]:
