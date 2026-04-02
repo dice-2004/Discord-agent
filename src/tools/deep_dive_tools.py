@@ -125,6 +125,19 @@ def _probe_github_repo(owner: str, repo: str) -> str:
         except Exception:
             return None, 0
 
+    def _fetch_list(url: str, timeout: int = 10) -> tuple[list[dict[str, object]], int]:
+        req = Request(url, headers=headers)
+        try:
+            with urlopen(req, timeout=timeout) as res:
+                code = int(getattr(res, "status", 200))
+                payload = json.loads(res.read().decode("utf-8", errors="replace") or "[]")
+                if not isinstance(payload, list):
+                    return [], code
+                rows = [row for row in payload if isinstance(row, dict)]
+                return rows, code
+        except Exception:
+            return [], 0
+
     repo_payload, repo_status = _fetch(base)
     if repo_payload is None:
         return (
@@ -156,12 +169,45 @@ def _probe_github_repo(owner: str, repo: str) -> str:
     default_branch = str(repo_payload.get("default_branch", "") or "")
     stars = int(repo_payload.get("stargazers_count", 0) or 0)
     about_contains_kc3hack = "yes" if "kc3hack" in description.lower() else "no"
+    issue_rows, _ = _fetch_list(f"{base}/issues?state=all&per_page=30")
+    open_issue_count = 0
+    open_pr_count = 0
+    latest_issue_title = ""
+    latest_issue_url = ""
+    latest_issue_updated = ""
+    latest_pr_title = ""
+    latest_pr_url = ""
+    latest_pr_updated = ""
+
+    for row in issue_rows:
+        is_pr = isinstance(row.get("pull_request"), dict)
+        state = str(row.get("state", "") or "").strip().lower()
+        updated_at = str(row.get("updated_at", "") or "").strip()
+        title = str(row.get("title", "") or "").strip()
+        html_url = str(row.get("html_url", "") or "").strip()
+
+        if is_pr:
+            if state == "open":
+                open_pr_count += 1
+            if not latest_pr_updated or updated_at > latest_pr_updated:
+                latest_pr_updated = updated_at
+                latest_pr_title = title[:180]
+                latest_pr_url = html_url
+        else:
+            if state == "open":
+                open_issue_count += 1
+            if not latest_issue_updated or updated_at > latest_issue_updated:
+                latest_issue_updated = updated_at
+                latest_issue_title = title[:180]
+                latest_issue_url = html_url
 
     lines = [
         "[GitHub Repo Probe]",
         f"repo: {owner}/{repo}",
         f"default_branch: {default_branch or '(unknown)'}",
         f"stars: {stars}",
+        f"open_issues: {open_issue_count}",
+        f"open_prs: {open_pr_count}",
         f"about_description: {description[:220] if description else '(none)'}",
         f"about_contains_kc3hack: {about_contains_kc3hack}",
         f"README: {readme_text}",
@@ -173,6 +219,18 @@ def _probe_github_repo(owner: str, repo: str) -> str:
         lines.append(f"README_headline: {readme_headline}")
     if readme_excerpt:
         lines.append(f"README_excerpt: {readme_excerpt}")
+    if latest_issue_title:
+        lines.append(f"latest_issue_title: {latest_issue_title}")
+    if latest_issue_url:
+        lines.append(f"latest_issue_url: {latest_issue_url}")
+    if latest_issue_updated:
+        lines.append(f"latest_issue_updated_at: {latest_issue_updated}")
+    if latest_pr_title:
+        lines.append(f"latest_pr_title: {latest_pr_title}")
+    if latest_pr_url:
+        lines.append(f"latest_pr_url: {latest_pr_url}")
+    if latest_pr_updated:
+        lines.append(f"latest_pr_updated_at: {latest_pr_updated}")
     lines.append("note: about_description はリポジトリAbout欄、README_headline はREADME本文由来")
     return "\n".join(lines)
 

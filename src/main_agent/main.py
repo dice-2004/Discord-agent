@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import io
 import json
 import logging
 import os
 import re
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 import discord
 from discord import app_commands
@@ -23,6 +27,7 @@ RESEARCH_ATTACHMENT_NAME = "research_report.txt"
 CURSOR_FILE_NAME = "memory_ingest_cursor.json"
 RUNCLI_AUDIT_LOG_DEFAULT = "./data/audit/runcli_audit.jsonl"
 RESEARCH_AUDIT_LOG_DEFAULT = "./data/audit/research_audit.jsonl"
+DEBUG_PROBE_AUDIT_LOG_DEFAULT = "./data/audit/debug_probe_audit.jsonl"
 
 
 def setup_logging() -> None:
@@ -213,6 +218,58 @@ def _should_attach_recent_context(question: str) -> bool:
     return _is_recall_question(question) or _has_followup_marker(question)
 
 
+def _is_list_followup_query(question: str) -> bool:
+    text = (question or "").strip().lower()
+    if not text:
+        return False
+    patterns = (
+        r"その\s*\d+\s*つ",
+        r"その三つ",
+        r"その3つ",
+        r"それぞれ",
+        r"各項目",
+        r"上記",
+        r"深掘",
+        r"掘り下げ",
+    )
+    return any(re.search(p, text) for p in patterns)
+
+
+def _extract_latest_assistant_snippet(recent_context: str) -> str:
+    text = (recent_context or "").strip()
+    if not text:
+        return ""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip().startswith("-")]
+    assistant_lines: list[str] = []
+    for ln in lines:
+        if "] assistant:" not in ln.lower():
+            continue
+        m = re.search(r"\]\s*assistant:\s*(.+)$", ln, flags=re.IGNORECASE)
+        if not m:
+            continue
+        content = m.group(1).strip().replace("\n", " ")
+        if content:
+            assistant_lines.append(content)
+    if not assistant_lines:
+        return ""
+    snippet = assistant_lines[-1]
+    return snippet[:500]
+
+
+def _inject_followup_targets_hint(question: str, recent_context: str) -> str:
+    if not _is_list_followup_query(question):
+        return question
+    latest_assistant = _extract_latest_assistant_snippet(recent_context)
+    if not latest_assistant:
+        return question
+    return (
+        (question or "").rstrip()
+        + "\n\n[Resolved Follow-up Context]\n"
+        + f"- latest_assistant_answer: {latest_assistant}"
+        + "\n- 指示語（その/それぞれ/上記）は上記 latest_assistant_answer を参照して解釈すること"
+    )
+
+
 def _is_recall_question(question: str) -> bool:
     text = (question or "").strip().lower()
     if not text:
@@ -399,6 +456,14 @@ def resolve_research_audit_log_path() -> Path:
     return path
 
 
+def resolve_debug_probe_audit_log_path() -> Path:
+    raw = os.getenv("DEBUG_PROBE_AUDIT_LOG_PATH", DEBUG_PROBE_AUDIT_LOG_DEFAULT).strip()
+    path = Path(raw or DEBUG_PROBE_AUDIT_LOG_DEFAULT)
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    return path
+
+
 def append_research_audit(path: Path, payload: dict[str, object]) -> None:
     logger = logging.getLogger(__name__)
     row = {"ts": _utc_now_iso(), **payload}
@@ -408,6 +473,17 @@ def append_research_audit(path: Path, payload: dict[str, object]) -> None:
             fp.write(json.dumps(row, ensure_ascii=False) + "\n")
     except Exception:
         logger.exception("Failed to append research audit log")
+
+
+def append_debug_probe_audit(path: Path, payload: dict[str, object]) -> None:
+    logger = logging.getLogger(__name__)
+    row = {"ts": _utc_now_iso(), **payload}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fp:
+            fp.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        logger.exception("Failed to append debug probe audit log")
 
 
 def append_runcli_audit(path: Path, payload: dict[str, object]) -> None:
@@ -432,6 +508,33 @@ def read_runcli_audit_tail(path: Path, limit: int) -> list[dict[str, object]]:
             lines = fp.readlines()
     except Exception:
         logging.getLogger(__name__).exception("Failed to read runcli audit log")
+        return []
+
+    rows: list[dict[str, object]] = []
+    for row in lines[-limit:]:
+        raw = row.strip()
+        if not raw:
+            continue
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            rows.append(parsed)
+    return rows
+
+
+def read_debug_probe_audit_tail(path: Path, limit: int) -> list[dict[str, object]]:
+    if limit <= 0:
+        return []
+    if not path.exists():
+        return []
+
+    try:
+        with path.open("r", encoding="utf-8") as fp:
+            lines = fp.readlines()
+    except Exception:
+        logging.getLogger(__name__).exception("Failed to read debug probe audit log")
         return []
 
     rows: list[dict[str, object]] = []
@@ -751,6 +854,115 @@ def _parse_int_set_env(name: str) -> set[int]:
     return values
 
 
+def _resolve_discord_token() -> str:
+    primary = os.getenv("DISCORD_TOKEN", "").strip()
+    if primary:
+        return primary
+    secondary = os.getenv("DISCORD_BOT_TOKEN", "").strip()
+    if secondary:
+        return secondary
+    return ""
+
+
+def _build_self_probe_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(add_help=True, description="Temporary self-probe mode for bot-to-bot debugging")
+    parser.add_argument("--debug-self-probe", action="store_true", help="Run the temporary self-probe flow and exit")
+    parser.add_argument("--guild-id", type=int, default=0, help="Target guild id")
+    parser.add_argument("--channel-id", type=int, default=1488500275294502942, help="Target channel id")
+    parser.add_argument("--question", type=str, required=False, default="", help="Question to ask the bot")
+    return parser
+
+
+async def _run_self_probe_once(guild_id: int, channel_id: int, question: str) -> None:
+    load_dotenv()
+    setup_logging()
+    logger = logging.getLogger(__name__)
+
+    if os.getenv("DEBUG_SELF_PROBE_ENABLED", "false").strip().lower() != "true":
+        raise RuntimeError("DEBUG_SELF_PROBE_ENABLED must be true for self-probe mode")
+
+    discord_token = _resolve_discord_token()
+    if not discord_token:
+        raise RuntimeError("DISCORD_TOKEN (or DISCORD_BOT_TOKEN) is required for self-probe mode")
+
+    orchestrator = DiscordOrchestrator(load_orchestrator_config_from_env())
+
+    def _discord_rest_request(method: str, path: str, payload: dict[str, object] | None = None) -> dict[str, object]:
+        url = f"https://discord.com/api/v10{path}"
+        body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers = {
+            "Authorization": f"Bot {discord_token}",
+            "User-Agent": "discord-ai-agent/1.0",
+        }
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        req = Request(url, data=body, headers=headers, method=method)
+        with urlopen(req, timeout=20) as res:
+            raw = res.read().decode("utf-8", errors="replace")
+            parsed = json.loads(raw or "{}")
+            if not isinstance(parsed, dict):
+                return {}
+            return parsed
+
+    bot_user = _discord_rest_request("GET", "/users/@me")
+    bot_user_id = int(bot_user.get("id", 0) or 0)
+    if bot_user_id <= 0:
+        raise RuntimeError("Failed to resolve bot user id")
+
+    probe_text = f"[debug_self_probe] <@{bot_user_id}> {question.strip()}"
+    probe_message = _discord_rest_request(
+        "POST",
+        f"/channels/{channel_id}/messages",
+        {"content": probe_text},
+    )
+    probe_message_id = int(probe_message.get("id", 0) or 0)
+    if probe_message_id <= 0:
+        raise RuntimeError("Failed to post debug probe message")
+
+    logger.info(
+        "debug self-probe posted: guild_id=%s channel_id=%s message_id=%s",
+        guild_id,
+        channel_id,
+        probe_message_id,
+    )
+
+    answer = await orchestrator.answer(
+        question=question.strip(),
+        guild_id=guild_id,
+        channel_id=channel_id,
+        user_id=bot_user_id,
+        message_id=probe_message_id,
+    )
+    reply_message = _discord_rest_request(
+        "POST",
+        f"/channels/{channel_id}/messages",
+        {
+            "content": "[debug_self_probe answer]\n" + answer,
+            "message_reference": {
+                "message_id": str(probe_message_id),
+                "fail_if_not_exists": False,
+            },
+        },
+    )
+    reply_message_id = int(reply_message.get("id", 0) or 0)
+    logger.info(
+        "debug self-probe replied: reply_message_id=%s answer_chars=%s",
+        reply_message_id,
+        len(answer),
+    )
+    print(answer)
+
+
+def _run_self_probe_cli(argv: list[str]) -> None:
+    parser = _build_self_probe_parser()
+    args = parser.parse_args(argv)
+    if not args.debug_self_probe:
+        parser.error("--debug-self-probe is required")
+    if not args.question.strip():
+        parser.error("--question is required")
+    asyncio.run(_run_self_probe_once(args.guild_id, args.channel_id, args.question))
+
+
 def iter_bootstrap_channels(guild: discord.Guild) -> list[discord.abc.MessageableChannel]:
     by_id: dict[int, discord.abc.MessageableChannel] = {}
     for channel in guild.text_channels:
@@ -883,10 +1095,10 @@ def main() -> None:
     setup_logging()
     logger = logging.getLogger(__name__)
 
-    discord_token = os.getenv("DISCORD_TOKEN", "").strip()
+    discord_token = _resolve_discord_token()
     gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not discord_token or not gemini_api_key:
-        raise RuntimeError("DISCORD_TOKEN and GEMINI_API_KEY are required")
+        raise RuntimeError("DISCORD_TOKEN (or DISCORD_BOT_TOKEN) and GEMINI_API_KEY are required")
 
     allowed_guild_ids = parse_allowed_guild_ids()
     max_message_len = int(os.getenv("MAX_DISCORD_MESSAGE_LEN", "1900"))
@@ -1346,6 +1558,7 @@ def main() -> None:
                 recent_limit = 40 if _is_recall_question(question) else 8
                 recent_context = await _build_recent_conversation_context(interaction.channel, limit=recent_limit)
             question_for_orchestrator = _inject_recent_conversation_hint(question_with_controls, recent_context)
+            question_for_orchestrator = _inject_followup_targets_hint(question_for_orchestrator, recent_context)
             answer = await orchestrator.answer(
                 question=question_for_orchestrator,
                 guild_id=interaction.guild_id,
@@ -1840,11 +2053,57 @@ def main() -> None:
         for part in os.getenv("DEBUG_OPERATOR_USER_IDS", os.getenv("CLI_APPROVER_USER_IDS", "")).split(",")
         if part.strip().isdigit()
     }
+    default_debug_probe_channel_id = int(os.getenv("DEBUG_PROBE_CHANNEL_ID", "1488500275294502942").strip() or "1488500275294502942")
+    debug_probe_timeout_sec = max(10, int(os.getenv("DEBUG_PROBE_TIMEOUT_SEC", "90").strip() or "90"))
+    debug_probe_audit_log_path = resolve_debug_probe_audit_log_path()
     command_allowlist = {
         part.strip()
-        for part in os.getenv("DISCORD_COMMAND_ALLOWLIST", "ask,deepdive,auth_status,debug_action").split(",")
+        for part in os.getenv(
+            "DISCORD_COMMAND_ALLOWLIST",
+            "ask,deepdive,auth_status,debug_action,debug_mention_probe,debug_probe_tail",
+        ).split(",")
         if part.strip()
     }
+    command_allowlist.update({"debug_mention_probe", "debug_probe_tail"})
+
+    async def _handle_mention_question(
+        *,
+        source_message: discord.Message,
+        question: str,
+        requester_user_id: int,
+    ) -> None:
+        mode, timeout_sec = _extract_research_controls(question)
+        question_with_controls = _inject_research_controls_hint_with_values(question, mode, timeout_sec)
+        recent_context = ""
+        if _should_attach_recent_context(question):
+            recent_limit = 40 if _is_recall_question(question) else 10
+            recent_context = await _build_recent_conversation_context(
+                source_message.channel,
+                limit=recent_limit,
+                before_message_id=source_message.id,
+            )
+        question_for_orchestrator = _inject_recent_conversation_hint(question_with_controls, recent_context)
+        question_for_orchestrator = _inject_followup_targets_hint(question_for_orchestrator, recent_context)
+        answer = await orchestrator.answer(
+            question=question_for_orchestrator,
+            guild_id=source_message.guild.id if source_message.guild else None,
+            channel_id=source_message.channel.id,
+            user_id=requester_user_id,
+            message_id=source_message.id,
+        )
+        await send_message_response(source_message, answer, max_message_len=max_message_len)
+        append_debug_probe_audit(
+            debug_probe_audit_log_path,
+            {
+                "event": "mention_answer_sent",
+                "guild_id": source_message.guild.id if source_message.guild else 0,
+                "channel_id": source_message.channel.id,
+                "request_message_id": source_message.id,
+                "requester_user_id": requester_user_id,
+                "question": question,
+                "answer_preview": answer[:600],
+            },
+        )
 
     @tree.command(name="auth_status", description="外部連携の認証設定状況を表示します")
     async def auth_status(interaction: discord.Interaction) -> None:
@@ -1940,6 +2199,129 @@ def main() -> None:
         except Exception:
             logger.exception("Failed to handle /debug_action")
             await interaction.followup.send("action の実行に失敗しました。", ephemeral=True)
+
+    @tree.command(name="debug_mention_probe", description="デバッグ用: Botが自律でメンション質問を投稿・応答します")
+    @app_commands.describe(
+        question="Botへ投げる質問本文",
+        channel_id="投稿先チャンネルID（省略時は既定値）",
+    )
+    async def debug_mention_probe(
+        interaction: discord.Interaction,
+        question: str,
+        channel_id: str = "",
+    ) -> None:
+        if interaction.guild_id is None or interaction.guild_id not in allowed_guild_ids:
+            await interaction.response.send_message(
+                "このサーバーではこのBotを利用できません。",
+                ephemeral=True,
+            )
+            return
+        if debug_operator_user_ids and interaction.user.id not in debug_operator_user_ids:
+            await interaction.response.send_message(
+                "このコマンドはデバッグ担当者のみ利用できます。",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if client.user is None or interaction.guild is None:
+            await interaction.followup.send("Bot情報を取得できませんでした。", ephemeral=True)
+            return
+
+        target_channel_id = default_debug_probe_channel_id
+        if channel_id.strip().isdigit():
+            target_channel_id = int(channel_id.strip())
+        target_channel = interaction.guild.get_channel(target_channel_id)
+        if target_channel is None:
+            await interaction.followup.send(
+                f"チャンネルを取得できませんでした: {target_channel_id}",
+                ephemeral=True,
+            )
+            return
+
+        mention_text = f"<@{client.user.id}> {question.strip()}"
+        try:
+            probe_message = await target_channel.send(f"[debug_mention_probe] {mention_text}")
+            append_debug_probe_audit(
+                debug_probe_audit_log_path,
+                {
+                    "event": "probe_posted",
+                    "guild_id": interaction.guild_id,
+                    "channel_id": int(target_channel_id),
+                    "request_message_id": int(probe_message.id),
+                    "requester_user_id": interaction.user.id,
+                    "question": question.strip(),
+                },
+            )
+        except Exception:
+            logger.exception("Failed to send debug mention probe")
+            await interaction.followup.send("テスト投稿に失敗しました。", ephemeral=True)
+            return
+
+        try:
+            await _handle_mention_question(
+                source_message=probe_message,
+                question=question.strip(),
+                requester_user_id=interaction.user.id,
+            )
+            await interaction.followup.send(
+                (
+                    "自律メンションテストを実行しました。\n"
+                    f"- channel_id: {target_channel_id}\n"
+                    f"- request_message_id: {probe_message.id}\n"
+                    f"- timeout_sec: {debug_probe_timeout_sec}\n"
+                    "出力本文はチャンネル投稿と debug_probe_audit に記録されています。"
+                ),
+                ephemeral=True,
+            )
+        except Exception:
+            logger.exception("Failed while handling debug mention probe")
+            append_debug_probe_audit(
+                debug_probe_audit_log_path,
+                {
+                    "event": "probe_failed",
+                    "guild_id": interaction.guild_id,
+                    "channel_id": int(target_channel_id),
+                    "request_message_id": int(probe_message.id),
+                    "requester_user_id": interaction.user.id,
+                    "question": question.strip(),
+                },
+            )
+            await interaction.followup.send("自律メンションの応答生成に失敗しました。", ephemeral=True)
+
+    @tree.command(name="debug_probe_tail", description="debug_mention_probe の監査ログを表示します")
+    @app_commands.describe(limit="表示件数(1-20)")
+    async def debug_probe_tail(interaction: discord.Interaction, limit: int = 5) -> None:
+        if interaction.guild_id is None or interaction.guild_id not in allowed_guild_ids:
+            await interaction.response.send_message(
+                "このサーバーではこのBotを利用できません。",
+                ephemeral=True,
+            )
+            return
+        if debug_operator_user_ids and interaction.user.id not in debug_operator_user_ids:
+            await interaction.response.send_message(
+                "このコマンドはデバッグ担当者のみ利用できます。",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        rows = read_debug_probe_audit_tail(debug_probe_audit_log_path, max(1, min(limit, 20)))
+        if not rows:
+            await interaction.followup.send("debug probe監査ログはまだありません。", ephemeral=True)
+            return
+
+        rendered: list[str] = []
+        for idx, row in enumerate(rows, start=1):
+            ts = str(row.get("ts", ""))
+            event = str(row.get("event", ""))
+            ch = str(row.get("channel_id", ""))
+            q = str(row.get("question", ""))[:120]
+            a = str(row.get("answer_preview", ""))[:160]
+            rendered.append(f"{idx}. [{ts}] event={event} ch={ch} q={q} a={a}")
+        body = "\n".join(rendered)
+        for chunk in chunk_text(body, 1800):
+            await interaction.followup.send(chunk, ephemeral=True)
 
     @client.event
     async def on_ready() -> None:
@@ -2156,25 +2538,11 @@ def main() -> None:
                     logger.exception("Failed to handle mention quick calendar action")
 
         try:
-            mode, timeout_sec = _extract_research_controls(question)
-            question_with_controls = _inject_research_controls_hint_with_values(question, mode, timeout_sec)
-            recent_context = ""
-            if _should_attach_recent_context(question):
-                recent_limit = 40 if _is_recall_question(question) else 10
-                recent_context = await _build_recent_conversation_context(
-                    message.channel,
-                    limit=recent_limit,
-                    before_message_id=message.id,
-                )
-            question_for_orchestrator = _inject_recent_conversation_hint(question_with_controls, recent_context)
-            answer = await orchestrator.answer(
-                question=question_for_orchestrator,
-                guild_id=message.guild.id,
-                channel_id=message.channel.id,
-                user_id=message.author.id,
-                message_id=message.id,
+            await _handle_mention_question(
+                source_message=message,
+                question=question,
+                requester_user_id=message.author.id,
             )
-            await send_message_response(message, answer, max_message_len=max_message_len)
         except Exception:
             logger.exception("Failed to handle mention ask: guild=%s channel=%s", message.guild.id, message.channel.id)
             try:
@@ -2198,4 +2566,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if "--debug-self-probe" in sys.argv[1:]:
+        _run_self_probe_cli(sys.argv[1:])
+    else:
+        main()

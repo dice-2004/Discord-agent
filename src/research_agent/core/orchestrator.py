@@ -199,7 +199,11 @@ class ResearchOrchestrator:
 
                 logger.info("Tool execution: %s (turn %d/%d)", tool_name, turn, self.max_tool_turns)
                 result = self.tool_registry.execute(tool_name, tool_args)
-                result_summary = result[:400] if result else "(空)"
+                if result:
+                    summary_limit = 2400 if tool_name == "source_deep_dive" else 400
+                    result_summary = result[:summary_limit]
+                else:
+                    result_summary = "(空)"
 
                 # Extract URLs from result for source attribution
                 urls = self._extract_urls_from_result(result)
@@ -328,6 +332,10 @@ class ResearchOrchestrator:
         now_jst: str,
         scratchpad: list[str],
     ) -> str:
+        deterministic = self._compose_github_probe_summary(question=question, scratchpad=scratchpad)
+        if deterministic:
+            return self._ensure_sources_in_text(deterministic, scratchpad)
+
         observation = "\n\n".join(scratchpad) if scratchpad else "(ツール結果なし)"
 
         # Extract all unique URLs from scratchpad for source attribution
@@ -388,6 +396,84 @@ class ResearchOrchestrator:
                 seen.add(clean)
                 unique_urls.append(clean)
         return unique_urls[:5]  # Return top 5 unique URLs
+
+    def _compose_github_probe_summary(self, question: str, scratchpad: list[str]) -> str:
+        probe = self._extract_latest_probe_fields(scratchpad)
+        if not probe:
+            return ""
+
+        repo = probe.get("repo", "(unknown)")
+        stars = probe.get("stars", "unknown")
+        open_issues = probe.get("open_issues", "unknown")
+        open_prs = probe.get("open_prs", "unknown")
+        about_desc = probe.get("about_description", "(none)")
+        about_kc = probe.get("about_contains_kc3hack", "unknown")
+        readme_state = probe.get("README", "unknown")
+        readme_kc = probe.get("README_contains_kc3hack", "unknown")
+        readme_head = probe.get("README_headline", "")
+        readme_excerpt = probe.get("README_excerpt", "")
+        latest_issue_title = probe.get("latest_issue_title", "")
+        latest_issue_updated = probe.get("latest_issue_updated_at", "")
+        latest_pr_title = probe.get("latest_pr_title", "")
+        latest_pr_updated = probe.get("latest_pr_updated_at", "")
+
+        lines: list[str] = [
+            f"`{repo}` のGitHub状況を確認しました。",
+            "",
+            "- リポジトリ基本情報",
+            f"  stars: {stars}",
+            f"  open issues: {open_issues}",
+            f"  open PRs: {open_prs}",
+            "",
+            "- READMEとAboutの区別",
+            f"  About(description): {about_desc}",
+            f"  AboutにKc3hack表記: {about_kc}",
+            f"  README状態: {readme_state}",
+            f"  READMEにKc3hack表記: {readme_kc}",
+        ]
+        if readme_head:
+            lines.append(f"  README見出し: {readme_head}")
+        if readme_excerpt:
+            lines.append(f"  README抜粋: {readme_excerpt}")
+
+        lines.extend(["", "- 最新の議論/更新（Issue・PR）"])
+        if latest_issue_title:
+            lines.append(f"  最新Issue: {latest_issue_title} (updated: {latest_issue_updated or 'unknown'})")
+        else:
+            lines.append("  最新Issue: 取得範囲内で確認できませんでした")
+        if latest_pr_title:
+            lines.append(f"  最新PR: {latest_pr_title} (updated: {latest_pr_updated or 'unknown'})")
+        else:
+            lines.append("  最新PR: 取得範囲内で確認できませんでした")
+
+        if readme_kc == "no" and about_kc == "yes":
+            lines.extend([
+                "",
+                "補足: Kc3hack表記はAbout欄由来であり、README本文由来ではありません。",
+            ])
+
+        return "\n".join(lines).strip()
+
+    @staticmethod
+    def _extract_latest_probe_fields(scratchpad: list[str]) -> dict[str, str]:
+        joined = "\n\n".join(scratchpad or [])
+        if "[GitHub Repo Probe]" not in joined:
+            return {}
+        blocks = joined.split("[GitHub Repo Probe]")
+        latest = blocks[-1]
+        fields: dict[str, str] = {}
+        for line in latest.splitlines():
+            raw = line.strip()
+            if not raw or raw.startswith("["):
+                continue
+            if ":" not in raw:
+                continue
+            key, value = raw.split(":", 1)
+            k = key.strip()
+            v = value.strip()
+            if k and v:
+                fields[k] = v
+        return fields
 
     @staticmethod
     def _normalize_extracted_url(url: str) -> str:
