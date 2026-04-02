@@ -265,6 +265,13 @@ KC3Hack を使いたい場合のみ追加で実施する。必須ではない。
 6. **任意シードテスト**：§3.5 の CT-031 から CT-032 を実施（必要時のみ）
 7. **@メンション同等テスト**：§4 の MT-001 から MT-034 を実施
    - コマンド系と同等以上の品質かを確認（手段指定せず）
+8. **エラーハンドリングテスト**：§7 の ERR-001 から ERR-010 を実施
+   - 異常系でBotが落ちないことを確認（仕様 §7.3 受け入れ条件）
+9. **質問ロジックパステスト**：§8 の QLP-001 から QLP-023 を実施
+   - Discord側からの質問送信で通過するすべてのコードパスを網羅的に確認
+10. **セキュリティテスト**：§9 の SEC-001 から SEC-006 を実施
+11. **設定バリデーションテスト**：§10 の CFG-001 から CFG-008 を実施
+12. **エッジケース・境界値テスト**：§11 の EDGE-001 から EDGE-012 を実施
 
 ### 5.2 テスト記録フォーマット
 
@@ -299,3 +306,135 @@ KC3Hack を使いたい場合のみ追加で実施する。必須ではない。
 - **GitHub README vs About**: UT-023 で README と About が正しく分離されているか確認してください
 - **Tool2/Tool3 の重点確認**: MT-025〜MT-034 で、Reader（本文抽出）と特殊ソース深掘りの判断・品質・失敗耐性を重点検証してください
 - **Tool3 の現行実装範囲**: GitHubは `source_deep_dive` 内でAPI probe（README/About/Issue/PR）を実施。Reddit/X/YouTubeは現時点では専用API連携ではなく `site:` 検索ベースであるため、テスト判定もこの実装差を前提にしてください
+
+## 7. エラーハンドリング・耐障害性テスト
+
+仕様 §7.3「以下でBotが落ちないこと」に対応する受け入れ条件テスト。
+
+| ID | 障害シナリオ | 手順 | 期待結果 | 確認方法 |
+|---|---|---|---|---|
+| ERR-001 | LLM API キー無効 | `GEMINI_API_KEY` を無効な値にして `/ask` 実行 | Botが落ちず「AI応答で問題が発生」エラーメッセージを返す | 応答テキスト + `docker logs` でスタックトレース確認 |
+| ERR-002 | LLM API タイムアウト | `GEMINI_TIMEOUT_SEC=1` など極端に短い値で `/ask` 実行 | リトライ後にエラーメッセージを返し、Bot継続 | ログに `Gemini invocation failed after retries` |
+| ERR-003 | Web検索ツール失敗 | 外部ネットワーク遮断状態で `/ask 最近のニュースは？` | 検索失敗をscratchpadに記録し、それでも回答を生成 | ログに `Failed` 記録、応答は返る |
+| ERR-004 | ChromaDB書き込み失敗 | ChromaDB パスを読み取り専用にしてメッセージ送信 | メッセージ保存失敗をログに記録し、Bot継続 | `docker logs` に例外出力、Botプロセス存続 |
+| ERR-005 | Discord送信権限不足 | Botに送信権限のないチャンネルで `/ask` 実行 | followup.send の例外をキャッチ、Bot継続 | ログに例外、Botプロセス存続 |
+| ERR-006 | 必須環境変数欠落 | `GEMINI_API_KEY` を空にして起動 | `RuntimeError` で安全に終了 | 起動ログに `GEMINI_API_KEY are required` |
+| ERR-007 | `initial_profile.md` 不在 | ファイルを削除して起動 | WARNINGログ出力、プロファイル空で継続 | ログに `initial_profile.md not found` |
+| ERR-008 | `initial_profile.md` 超過 | 12,000文字超のファイルを配置して起動 | 切り詰めてWARNING出力、Bot正常動作 | ログに `exceeds max chars` |
+| ERR-009 | Research Agent 接続失敗 | `RESEARCH_AGENT_URL` を無効にして `/deepdive` 実行 | エラーメッセージを返し、Bot継続 | 「deep diveの実行に失敗しました」が返る |
+| ERR-010 | ペルソナ記憶読み込み失敗 | ChromaDB のペルソナコレクションを破損させて `/ask` | ペルソナ取得失敗をログに記録、通常回答を返す | ログに `Failed to load persona profile`、応答は返る |
+
+## 8. Discord質問ロジックパス網羅テスト
+
+`/ask` および `@メンション` から質問が送信された際に通過するコード内の各ロジックパス（ルーティング分岐）を網羅的に確認するテスト。
+
+### 8.1 Research Controls 注入パス
+
+質問テキスト内の「Gemini CLI」「フォールバック」「〇〇秒」「〇〇分」の検出と、`[Research Controls]` ブロック注入（`_extract_research_controls` → `_inject_research_controls_hint_with_values`）を検証する。
+
+| ID | シナリオ | 送信メッセージ | 期待結果 | 確認方法 |
+|---|---|---|---|---|
+| QLP-001 | mode=gemini_cli の自動検出 | `@bot Gemini CLIでAIトレンドを調べて` | `dispatch_research_job` の `mode` が `gemini_cli` になる | ログに `mode=gemini_cli` |
+| QLP-002 | mode=fallback の自動検出 | `@bot フォールバックモードで最近のPython事情を調査して` | `dispatch_research_job` の `mode` が `fallback` になる | ログに `mode=fallback` |
+| QLP-003 | timeout_sec の秒指定 | `@bot 120秒でKubernetesの最新動向を調べて` | `timeout_sec=120` がそのまま使用される | ログに `timeout_sec: 120` |
+| QLP-004 | timeout_sec の分指定 | `@bot ２分間でRedditの反応を調べて` | 全角→半角変換 + 分→秒（120）変換 | ログに `timeout_sec: 120` |
+| QLP-005 | timeout_sec の境界値（上限） | `@bot 1800秒でじっくり調べて` | `timeout_sec=1800`（上限値） | ログに `timeout_sec: 1800` |
+| QLP-006 | mode + timeout の同時指定 | `@bot Gemini CLIで60秒でGitHubの議論を調べて` | `mode=gemini_cli` かつ `timeout_sec=60` | ログで両方確認 |
+
+### 8.2 Recent Conversation 文脈組立パス
+
+`_should_attach_recent_context` → `_build_recent_conversation_context` → `_inject_recent_conversation_hint` の一連の分岐を検証する。
+
+| ID | シナリオ | 送信メッセージ | 期待結果 | 確認方法 |
+|---|---|---|---|---|
+| QLP-007 | recall質問でRecent Context が40件取得 | 直前にチャンネルで複数会話 → `/ask さっき話した内容は？` | `recent_limit=40` で広い文脈を取得して回答に反映 | 回答が直近の会話内容を踏まえている |
+| QLP-008 | フォローアップ指示語でRecent Contextが8件取得 | Q1で質問 → `/ask それについてもう少し教えて` | `recent_limit=8` で直近文脈を取得 | Q1の内容を踏まえた回答 |
+| QLP-009 | recall/followup でない新規質問 | `/ask 今日の天気は？`（新規質問、指示語なし） | Recent Context を**付与しない** | 過去会話に引きずられない独立した回答 |
+
+### 8.3 フォローアップ解決・指示語注入パス
+
+`_is_list_followup_query` → `_inject_followup_targets_hint` で列挙系フォローアップの解決を検証する。
+
+| ID | シナリオ | 送信メッセージ | 期待結果 | 確認方法 |
+|---|---|---|---|---|
+| QLP-010 | 「その3つ」→ 列挙内容解決 | Q1: `/ask 推奨フレームワーク3つ` → Q2: `/ask その3つの違いは？` | `[Resolved Follow-up Context]` が注入され、Q1の3項目を参照 | Q2の回答がQ1の3項目を正確に参照 |
+| QLP-011 | 「それぞれ」→ 列挙内容解決 | Q1: 複数項目応答 → Q2: `/ask それぞれの長所は？` | 各項目が個別に説明される | 各項目別の回答 |
+| QLP-012 | 「深掘り」→ フォローアップ解決 | Q1: 概要回答 → Q2: `/ask 深掘りして` | Q1の内容を掘り下げた回答 | Q1の内容をベースにした詳細回答 |
+
+### 8.4 曖昧クエリの検出・拒否パス
+
+`_is_underspecified_external_research_query` のロジック分岐を検証する。曖昧な外部調査クエリでフォローアップマーカーがない場合に、調査対象が不明として拒否するパスを確認する。
+
+| ID | シナリオ | 送信メッセージ | 期待結果 | 確認方法 |
+|---|---|---|---|---|
+| QLP-013 | 曖昧クエリ（対象なし + followupなし） | `/ask Githubの最新議論を調べて`（具体的なリポジトリ指定なし、直前文脈なし） | 「調査対象が曖昧です。どの対象の最新議論を調べるか指定してください」と返る | 明確化を求めるメッセージ |
+| QLP-014 | 曖昧クエリ + フォローアップマーカー | Q1: `@bot oithxs/yorimichiについて` → Q2: `/ask その最新議論を調べて` | Q1のトピックを継承して調査実行 | Q2がQ1のリポジトリについて調査結果を返す |
+| QLP-015 | 具体的クエリ（URL指定あり） | `/ask github.com/owner/repoの最新議論を調べて` | 曖昧判定をスキップし調査実行 | 具体的な調査結果が返る |
+
+### 8.5 Research Job 強制ディスパッチパス
+
+`_should_force_research_job` の判定ロジックを検証する。ソース特化用語 + 調査用語の組み合わせで、LLMの判断を待たずに強制的に `dispatch_research_job` を実行するパス。
+
+| ID | シナリオ | 送信メッセージ | 期待結果 | 確認方法 |
+|---|---|---|---|---|
+| QLP-016 | ソース語 + 調査語 → 強制dispatch | `@bot Twitterの最新の反応を調べて` | `_should_force_research_job=true` → `dispatch_research_job` が実行される | ログに `force_dispatch_research_job` |
+| QLP-017 | エンティティ検索意図 → 強制dispatch | `@bot yorimichiについて教えて` | エンティティルックアップ意図で `dispatch_research_job` が実行される | ログに `guard_external_research_intent` |
+| QLP-018 | タスク/予定系は強制dispatchしない | `@bot 明日のyorimichiタスクを追加して` | 「タスク」キーワードで強制dispatch **無効**: `execute_internal_action` → `add_task` | タスクが正しく追加される |
+
+### 8.6 Self-Review（自己レビュー）パス
+
+`_self_review_response` で回答生成後にレビュー → `approve` / `rewrite` / `needs_tool` の分岐を検証する。
+
+| ID | シナリオ | 送信メッセージ | 期待結果 | 確認方法 |
+|---|---|---|---|---|
+| QLP-019 | 通常質問 → approve | `/ask 1+1は？` | self-review で `approve` され即回答 | ログに `self-review: turn=1 action=approve` |
+| QLP-020 | 根拠不足 → rewrite | `/ask 最新のGemini APIの変更点を厳密に教えて` | 根拠不足と判断されれば `rewrite` で書き直し | ログに `self-review: turn=N action=rewrite` |
+| QLP-021 | 追加ツール必要 → needs_tool | `/ask この記事の要約 https://example.com/article` （URL未読み込みの場合） | `needs_tool` で追加ツール実行後に再構成 | ログに `self-review: turn=N action=needs_tool` |
+
+### 8.7 重複ディスパッチ防止・メンション高速カレンダーパス
+
+| ID | シナリオ | 送信メッセージ | 期待結果 | 確認方法 |
+|---|---|---|---|---|
+| QLP-022 | メンション高速カレンダー | `@bot 明日14時から15時に会議` | `MENTION_QUICK_CALENDAR_ENABLED=true` 時に `add_calendar_event` が LLM 判断をスキップして直接実行される | ログに `mention_quick:add_calendar_event` |
+| QLP-023 | メンション高速タスク登録 | `@bot 明後日までにレポート提出タスク` | `build_quick_calendar_action` で `add_task` が検出され直接実行 | ログに `mention_quick:add_task` |
+
+## 9. セキュリティテスト
+
+| ID | テスト観点 | 手順 | 期待結果 | 確認方法 |
+|---|---|---|---|---|
+| SEC-001 | `/runcli` 承認トークン検証 | `CLI_APPROVAL_TOKEN` を不正にして承認ボタンを押す | コマンド実行が拒否される | 実行結果に認証エラー |
+| SEC-002 | ホワイトリスト外アクション拒否 | `INTERNAL_ALLOWED_ACTIONS` に未登録のアクションを `/debug_action` で実行 | `unsupported_action` エラー | JSON レスポンス確認 |
+| SEC-003 | Research Agent 共有トークン不一致 | `X-Research-Token` ヘッダーを不正にして `POST /v1/jobs` | `401` または `403` が返る | HTTP ステータスコード |
+| SEC-004 | プロファイル user_id 分離 | ユーザーAが `/profile_set` → ユーザーBが `/profile_show` | ユーザーBにはAのプロファイルが見えない | B の表示結果に A のデータがない |
+| SEC-005 | `backup_server_data` パストラバーサル | `target: "../../../etc/passwd"` で実行 | パストラバーサルを検出し拒否 | `forbidden_path` エラー |
+| SEC-006 | `/runcli` タイムアウト | 承認ボタンを90秒以内に押さない | ボタンが無効化（`on_timeout`） | ボタンがグレーアウト |
+
+## 10. 設定バリデーションテスト
+
+| ID | テスト観点 | 手順 | 期待結果 | 確認方法 |
+|---|---|---|---|---|
+| CFG-001 | `BOT_GUILD_ID` 未設定 | 環境変数を削除して起動 | `BOT_GUILD_ID is required` で起動失敗 | 起動ログ |
+| CFG-002 | `ALLOWED_GUILD_IDS` に不正値 | `ALLOWED_GUILD_IDS=abc,123` で起動 | `abc` は WARNING で無視、`123` のみ有効 | 起動ログに WARNING |
+| CFG-003 | `DISCORD_ENABLE_MESSAGE_CONTENT_INTENT=false` | Intent 無効で起動 | `on_message` でのバックフィル・ストリーム保存がスキップ | ログに取り込みなし |
+| CFG-004 | `MEMORY_RETRIEVAL_SCOPE=channel` | 環境変数設定後 `/ask` 実行 | メモリ検索がチャンネル限定 | ログに `scope=channel` |
+| CFG-005 | `PERSONA_MEMORY_ENABLED=false` | 無効にして `/profile_show` 実行 | 「ペルソナ記憶は無効です。」メッセージ | ephemeral メッセージ確認 |
+| CFG-006 | `MENTION_QUICK_CALENDAR_ENABLED=false` | 無効にしてメンション「明日14時に会議」 | 高速カレンダー不使用、LLM経由で処理 | ログに `mention_quick` がない |
+| CFG-007 | `LOGSEARCH_DEFAULT_SCOPE=channel` | 環境変数設定後 `/logsearch Python` | デフォルトスコープが `channel` | ログに `scope: channel` |
+| CFG-008 | `DISCORD_COMMAND_ALLOWLIST` 制限 | 許可リストから `logsearch` を除外して起動 | `/logsearch` がコマンド一覧に表示されない | コマンドツリー確認 |
+
+## 11. エッジケース・境界値テスト
+
+| ID | テスト観点 | 手順 | 期待結果 | 確認方法 |
+|---|---|---|---|---|
+| EDGE-001 | `/ask` 空文字列 | `/ask ""` | Bot が安全にエラーまたは空応答を返す | Bot が落ちない |
+| EDGE-002 | DM（ギルド外）で `/ask` | DM チャンネルで `/ask` 実行 | 「このサーバーでは利用できません」（`guild_id is None`） | ephemeral メッセージ |
+| EDGE-003 | 応答2000文字ぎりぎりの分割 | 1900文字前後の応答が出る質問 | `MAX_DISCORD_MESSAGE_LEN` で正しくチャンク分割 | 2メッセージに分割されるか確認 |
+| EDGE-004 | 15,000文字超のファイル添付フォールバック | 非常に長い回答が生成される質問 | `MAX_TOTAL_INLINE` 超過時にテキストファイル添付 | `ask_response.txt` が添付される |
+| EDGE-005 | 同一ドメイン重複除外 | 検索で同ドメインの複数結果が出る質問 | 重複URLが除外される | 参考URL欄の確認 |
+| EDGE-006 | `add_calendar_event` で `end_time < start_time` | `end_time` が `start_time` より前の値 | エラーまたは翌日跨ぎ補正 | 結果確認 |
+| EDGE-007 | `add_task` にタイトル空 | `/debug_action add_task payload_json: {"title":""}` | `missing_title` エラー | JSON レスポンス |
+| EDGE-008 | `/profile_set` key 48文字超 | 49文字のキーで `/profile_set` | 「key は48文字以内で指定してください」 | ephemeral メッセージ |
+| EDGE-009 | `/profile_set` value 500文字超 | 501文字の値で `/profile_set` | 「value は500文字以内で指定してください」 | ephemeral メッセージ |
+| EDGE-010 | `/logsearch` 空キーワード | `/logsearch ""`| 「キーワードが空です」 | ephemeral メッセージ |
+| EDGE-011 | `/runcli` 空コマンド | `/runcli ""` | 「コマンドが空です」 | ephemeral メッセージ |
+| EDGE-012 | メンション + 高速カレンダーで全角数字 | `@bot 明日１４時から１５時に打ち合わせ` | 全角→半角変換されてカレンダー登録成功 | カレンダーイベント確認 |
