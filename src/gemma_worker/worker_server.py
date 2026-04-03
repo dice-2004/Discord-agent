@@ -76,6 +76,42 @@ def _call_ollama(prompt: str, timeout_sec: int) -> tuple[str, str | None]:
         return "", "ollama_invalid_payload"
     text = str(parsed.get("response", "") or "").strip()
     if not text:
+        # Some ollama responses return done=true with empty text under load.
+        # Retry once with a compact prompt to recover a non-empty response.
+        compact_prompt = (
+            "次の指示に短く答えてください。出力は1行以上、空文字は禁止。\n\n"
+            f"{prompt[:1800]}"
+        )
+        retry_payload = {
+            "model": _ollama_model(),
+            "prompt": compact_prompt,
+            "stream": False,
+            "options": {
+                "num_predict": max(96, num_predict),
+                "temperature": min(temperature, 0.15),
+            },
+        }
+        retry_req = Request(
+            f"{_ollama_base_url()}/api/generate",
+            data=json.dumps(retry_payload, ensure_ascii=False).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "gemma-worker/1.0",
+            },
+        )
+        try:
+            with urlopen(retry_req, timeout=max(5, timeout_sec)) as retry_res:
+                retry_raw = retry_res.read().decode("utf-8", errors="replace")
+            retry_parsed = json.loads(retry_raw) if retry_raw else {}
+            if isinstance(retry_parsed, dict):
+                retry_text = str(retry_parsed.get("response", "") or "").strip()
+                if retry_text:
+                    logger.info("Gemma compact-retry succeeded model=%s response_chars=%s", _ollama_model(), len(retry_text))
+                    return retry_text, None
+        except Exception:
+            pass
         return "", "ollama_empty_response"
     logger.info("Gemma call done model=%s response_chars=%s", _ollama_model(), len(text))
     return text, None
@@ -230,7 +266,10 @@ class GemmaHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except BrokenPipeError:
+            logger.warning("Client disconnected before response write completed")
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/healthz":

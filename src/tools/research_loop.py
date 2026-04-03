@@ -126,7 +126,12 @@ def _build_thinking_prompt(
     registry: ToolRegistry,
     scratchpad: list[str],
 ) -> str:
-    observation = "\n\n".join(scratchpad) if scratchpad else "(ツール結果なし)"
+    if scratchpad:
+        recent = scratchpad[-4:]
+        trimmed_recent = [item[:1200] for item in recent]
+        observation = "\n\n".join(trimmed_recent)
+    else:
+        observation = "(ツール結果なし)"
     policy_lines = [
         "- 出力はJSONのみ",
         "- 形式1: {\"action\":\"tool\",\"tool\":\"...\",\"args\":{...},\"reason\":\"...\"}",

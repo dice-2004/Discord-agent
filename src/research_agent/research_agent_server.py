@@ -286,7 +286,9 @@ def _run_gemma_worker(topic: str, source: str, initial_report: str, timeout_sec:
         or "http://gemma-worker:8093/v1/research/analyze"
     )
     call_timeout = max(10, _safe_int("RESEARCH_AGENT_GEMMA_TIMEOUT_SEC", 180))
-    call_timeout = min(call_timeout, max(15, timeout_sec + 60))
+    # Keep transport timeout at least research budget + buffer.
+    # Using min() here causes premature abort for long jobs (e.g. 600s -> 180s).
+    call_timeout = max(call_timeout, max(15, timeout_sec + 60))
 
     payload = {
         "topic": topic,
