@@ -411,6 +411,7 @@ def _run_research(
 ) -> tuple[str, str | None, str, list[dict[str, Any]], str]:
     clean_mode = (mode or "auto").strip().lower() or "auto"
     decision_log: list[dict[str, Any]] = []
+    allow_gemma_fallback = os.getenv("RESEARCH_AGENT_GEMMA_FALLBACK_TO_GEMINI", "true").strip().lower() == "true"
     logger.info(
         "[research-agent][run] start topic=%s source=%s mode=%s time_specified=%s timeout_sec=%s",
         topic,
@@ -491,10 +492,32 @@ def _run_research(
 
     decision_log.extend(runner_log)
     if err:
+        if engine == "gemma4" and allow_gemma_fallback:
+            logger.warning("[research-agent][run] gemma failed; fallback to gemini-api err=%s", err)
+            decision_log.append({"stage": "fallback", "from": "gemma4", "to": "gemini_api", "reason": str(err)[:400]})
+            fb_timeout = max(60, min(timeout_sec, timeout_sec // 2 if timeout_sec > 120 else timeout_sec))
+            fb_report, fb_transcript, fb_log, fb_err = _coerce_runner_result(
+                _run_gemini_runner(topic=topic, source=source, timeout_sec=fb_timeout)
+            )
+            decision_log.extend(fb_log)
+            if not fb_err and _report_is_returnable(fb_report):
+                return fb_report[:12000], None, "gemma4->gemini_api", decision_log, fb_transcript
+            if fb_err:
+                decision_log.append({"stage": "fallback", "status": "failed", "detail": str(fb_err)[:400]})
         logger.warning("[research-agent][run] runner failed engine=%s err=%s", engine, err)
         return "", err, engine, decision_log, transcript
 
     if not _report_is_returnable(report):
+        if engine == "gemma4" and allow_gemma_fallback:
+            logger.warning("[research-agent][run] gemma weak report; fallback to gemini-api report_chars=%s", len(report))
+            decision_log.append({"stage": "fallback", "from": "gemma4", "to": "gemini_api", "reason": "weak_report"})
+            fb_timeout = max(60, min(timeout_sec, timeout_sec // 2 if timeout_sec > 120 else timeout_sec))
+            fb_report, fb_transcript, fb_log, fb_err = _coerce_runner_result(
+                _run_gemini_runner(topic=topic, source=source, timeout_sec=fb_timeout)
+            )
+            decision_log.extend(fb_log)
+            if not fb_err and _report_is_returnable(fb_report):
+                return fb_report[:12000], None, "gemma4->gemini_api", decision_log, fb_transcript
         logger.warning("[research-agent][run] report looks weak engine=%s report_chars=%s", engine, len(report))
         decision_log.append({"stage": "review", "status": "weak_report", "engine": engine, "report_chars": len(report)})
         if not report.strip():

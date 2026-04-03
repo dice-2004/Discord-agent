@@ -127,8 +127,8 @@ def _build_thinking_prompt(
     scratchpad: list[str],
 ) -> str:
     if scratchpad:
-        recent = scratchpad[-4:]
-        trimmed_recent = [item[:1200] for item in recent]
+        recent = scratchpad[-3:]
+        trimmed_recent = [item[:700] for item in recent]
         observation = "\n\n".join(trimmed_recent)
     else:
         observation = "(ツール結果なし)"
@@ -204,7 +204,7 @@ def _summarize_tool_result(result: str, tool_name: str) -> str:
     source_block = ""
     if urls:
         source_block = "\n[出典/参考URL]\n" + "\n".join(f"- {url}" for url in urls)
-    limit = 2400 if tool_name == "source_deep_dive" else 800
+    limit = 900 if tool_name == "source_deep_dive" else 500
     return f"[ツール結果: {tool_name}]\n{result[:limit]}{source_block}"
 
 

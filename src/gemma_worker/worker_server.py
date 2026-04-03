@@ -76,6 +76,47 @@ def _call_ollama(prompt: str, timeout_sec: int) -> tuple[str, str | None]:
         return "", "ollama_invalid_payload"
     text = str(parsed.get("response", "") or "").strip()
     if not text:
+        # Fallback path: some model/runtime combinations return empty text for /api/generate.
+        # Retry with /api/chat using the same content.
+        chat_payload = {
+            "model": _ollama_model(),
+            "stream": False,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt[:5000],
+                }
+            ],
+            "options": {
+                "num_predict": max(96, num_predict),
+                "temperature": temperature,
+            },
+        }
+        chat_req = Request(
+            f"{_ollama_base_url()}/api/chat",
+            data=json.dumps(chat_payload, ensure_ascii=False).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "gemma-worker/1.0",
+            },
+        )
+        try:
+            logger.info("[route] gemma-worker -> ollama path=/api/chat model=%s timeout_sec=%s", _ollama_model(), max(5, timeout_sec))
+            with urlopen(chat_req, timeout=max(5, timeout_sec)) as chat_res:
+                chat_raw = chat_res.read().decode("utf-8", errors="replace")
+            chat_parsed = json.loads(chat_raw) if chat_raw else {}
+            if isinstance(chat_parsed, dict):
+                msg = chat_parsed.get("message")
+                if isinstance(msg, dict):
+                    chat_text = str(msg.get("content", "") or "").strip()
+                    if chat_text:
+                        logger.info("Gemma chat-fallback succeeded model=%s response_chars=%s", _ollama_model(), len(chat_text))
+                        return chat_text, None
+        except Exception:
+            pass
+
         # Some ollama responses return done=true with empty text under load.
         # Retry once with a compact prompt to recover a non-empty response.
         compact_prompt = (
@@ -248,7 +289,7 @@ def _analyze_research(topic: str, source: str, initial_report: str, timeout_sec:
         model_name=_ollama_model(),
         model_call=_call,
         loop_label="gemma4-research",
-        max_turns=max(4, min(16, timeout_sec // 75 + 4)),
+        max_turns=max(4, min(10, timeout_sec // 90 + 3)),
     )
     logger.info(
         "Gemma research loop done report_chars=%s transcript_chars=%s decision_log_len=%s",
