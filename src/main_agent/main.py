@@ -139,6 +139,64 @@ def _inject_research_controls_hint_with_values(
     return (question or "").rstrip() + "\n" + "\n".join(lines)
 
 
+def _extract_urls_from_text(text: str) -> list[str]:
+    if not text:
+        return []
+    urls = re.findall(r"https?://[^\s\]\)\">]+", text)
+    seen: set[str] = set()
+    out: list[str] = []
+    for url in urls:
+        clean = url.strip().rstrip(".,;!?)］】」』")
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        out.append(clean)
+    return out
+
+
+def _has_url_comparison_intent(text: str) -> bool:
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return False
+    if len(_extract_urls_from_text(lowered)) >= 2:
+        return True
+    compare_terms = (
+        "比較",
+        "違い",
+        "どう違う",
+        "差",
+        "対比",
+        "比べ",
+        "比較して",
+        "見比べ",
+        "主張の違い",
+    )
+    return any(term in lowered for term in compare_terms) and bool(_extract_urls_from_text(lowered))
+
+async def _run_reader_compare(
+    *,
+    orchestrator: DiscordOrchestrator,
+    question: str,
+    task_label_prefix: str,
+) -> str | None:
+    if not _has_url_comparison_intent(question):
+        return None
+
+    urls = _extract_urls_from_text(question)
+    if not urls:
+        return None
+
+    parts: list[str] = []
+    for index, url in enumerate(urls, start=1):
+        result = await orchestrator.execute_tool_job(
+            tool_name="read_url_markdown",
+            args={"url": url},
+            task_label=f"{task_label_prefix}:{index}",
+        )
+        parts.append(f"[URL {index}] {url}\n{result}")
+    return "\n\n".join(parts)
+
+
 async def _build_recent_conversation_context(
     channel: object,
     *,
@@ -199,6 +257,7 @@ def _has_followup_marker(question: str) -> bool:
     text = (question or "").strip().lower()
     if not text:
         return False
+    text = re.sub(r"「[^」]*」|『[^』]*』|\"[^\"]*\"", "", text)
     markers = (
         "それ",
         "その",
@@ -252,8 +311,10 @@ def _extract_latest_assistant_snippet(recent_context: str) -> str:
             assistant_lines.append(content)
     if not assistant_lines:
         return ""
-    snippet = assistant_lines[-1]
-    return snippet[:500]
+    if len(assistant_lines) == 1:
+        return assistant_lines[-1][:1500]
+    snippet = "\n\n[Previous Assistant Context]\n".join(assistant_lines[-2:])
+    return snippet[:2400]
 
 
 def _inject_followup_targets_hint(question: str, recent_context: str) -> str:
@@ -354,11 +415,11 @@ async def send_response(
             io.BytesIO(response_text.encode("utf-8")),
             filename=ATTACHMENT_NAME,
         )
-        await interaction.followup.send(summary, file=file_obj)
+        await interaction.followup.send(summary, file=file_obj, suppress_embeds=True)
         return
 
     for chunk in chunk_text(response_text, max_message_len):
-        await interaction.followup.send(chunk)
+        await interaction.followup.send(chunk, suppress_embeds=True)
 
 
 async def send_message_response(
@@ -372,15 +433,15 @@ async def send_message_response(
             io.BytesIO(response_text.encode("utf-8")),
             filename=ATTACHMENT_NAME,
         )
-        await message.reply(summary, file=file_obj, mention_author=False)
+        await message.reply(summary, file=file_obj, mention_author=False, suppress_embeds=True)
         return
 
     chunks = chunk_text(response_text, max_message_len)
     if not chunks:
         return
-    await message.reply(chunks[0], mention_author=False)
+    await message.reply(chunks[0], mention_author=False, suppress_embeds=True)
     for chunk in chunks[1:]:
-        await message.channel.send(chunk)
+        await message.channel.send(chunk, suppress_embeds=True)
 
 
 def ensure_runtime_dirs(paths: Iterable[str]) -> None:
@@ -596,6 +657,92 @@ def _safe_float_env(name: str, default: float) -> float:
         return float(raw)
     except ValueError:
         return default
+
+
+def _safe_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _gemma_rerank_logsearch_records(
+    *,
+    keyword: str,
+    records: list[object],
+    endpoint: str,
+    timeout_sec: int,
+) -> list[object]:
+    if not keyword or not endpoint or len(records) <= 1:
+        return records
+
+    candidates: list[dict[str, object]] = []
+    for idx, record in enumerate(records):
+        content = str(getattr(record, "content", "") or "")
+        if not content:
+            continue
+        metadata = getattr(record, "metadata", None) or {}
+        candidates.append(
+            {
+                "index": idx,
+                "content": content,
+                "timestamp": str(getattr(record, "timestamp", "") or ""),
+                "channel_id": str(metadata.get("channel_id", "")),
+                "channel_name": str(metadata.get("channel_name", "")),
+                "role": str(getattr(record, "role", "") or ""),
+            }
+        )
+
+    if len(candidates) <= 1:
+        return records
+
+    payload = json.dumps({"query": keyword, "candidates": candidates}, ensure_ascii=False).encode("utf-8")
+    request = Request(
+        endpoint,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urlopen(request, timeout=max(1, int(timeout_sec))) as response:
+            raw = response.read().decode("utf-8", errors="ignore")
+        parsed = json.loads(raw)
+    except (HTTPError, OSError, TimeoutError, json.JSONDecodeError):
+        logging.getLogger(__name__).warning("Gemma logsearch rerank failed; fallback to local ranking", exc_info=True)
+        return records
+
+    ranking_raw = []
+    if isinstance(parsed, dict):
+        ranking_raw = parsed.get("ranking") or parsed.get("results") or []
+    if not isinstance(ranking_raw, list):
+        return records
+
+    ordered_indexes: list[int] = []
+    seen: set[int] = set()
+    for item in ranking_raw:
+        if isinstance(item, dict):
+            idx_raw = item.get("index")
+        else:
+            idx_raw = item
+        try:
+            idx = int(idx_raw)
+        except (TypeError, ValueError):
+            continue
+        if idx < 0 or idx >= len(records) or idx in seen:
+            continue
+        seen.add(idx)
+        ordered_indexes.append(idx)
+
+    if not ordered_indexes:
+        return records
+
+    reranked = [records[i] for i in ordered_indexes]
+    for idx, record in enumerate(records):
+        if idx not in seen:
+            reranked.append(record)
+    return reranked
 
 
 def _extract_time_range(text: str) -> tuple[int, int, int, int] | None:
@@ -913,7 +1060,10 @@ async def _run_self_probe_once(guild_id: int, channel_id: int, question: str) ->
     probe_message = _discord_rest_request(
         "POST",
         f"/channels/{channel_id}/messages",
-        {"content": probe_text},
+        {
+            "content": probe_text,
+            "flags": 4,
+        },
     )
     probe_message_id = int(probe_message.get("id", 0) or 0)
     if probe_message_id <= 0:
@@ -938,6 +1088,7 @@ async def _run_self_probe_once(guild_id: int, channel_id: int, question: str) ->
         f"/channels/{channel_id}/messages",
         {
             "content": "[debug_self_probe answer]\n" + answer,
+            "flags": 4,
             "message_reference": {
                 "message_id": str(probe_message_id),
                 "fail_if_not_exists": False,
@@ -1114,7 +1265,7 @@ def main() -> None:
     )
     bootstrap_archived_limit_per_parent = int(os.getenv("MEMORY_BOOTSTRAP_ARCHIVED_LIMIT_PER_PARENT", "0"))
     mention_ask_enabled = os.getenv("MENTION_ASK_ENABLED", "true").strip().lower() == "true"
-    mention_require_prefix = os.getenv("MENTION_REQUIRE_PREFIX", "true").strip().lower() == "true"
+    mention_require_prefix = os.getenv("MENTION_REQUIRE_PREFIX", "false").strip().lower() == "true"
     mention_quick_calendar_enabled = os.getenv("MENTION_QUICK_CALENDAR_ENABLED", "true").strip().lower() == "true"
     deepdive_use_research_agent = os.getenv("DEEPDIVE_USE_RESEARCH_AGENT", "true").strip().lower() == "true"
     research_notify_on_complete = os.getenv("RESEARCH_NOTIFY_ON_COMPLETE", "true").strip().lower() == "true"
@@ -1137,6 +1288,12 @@ def main() -> None:
     logsearch_include_score = os.getenv("LOGSEARCH_INCLUDE_SCORE", "true").strip().lower() == "true"
     score_overlap_weight = _safe_float_env("LOGSEARCH_SCORE_OVERLAP_WEIGHT", 0.7)
     score_recency_weight = _safe_float_env("LOGSEARCH_SCORE_RECENCY_WEIGHT", 0.3)
+    logsearch_gemma_enabled = os.getenv("LOGSEARCH_GEMMA_ENABLED", "false").strip().lower() == "true"
+    logsearch_gemma_endpoint = os.getenv("LOGSEARCH_GEMMA_ENDPOINT", "http://gemma-worker:8093/v1/logsearch/rerank").strip()
+    logsearch_gemma_timeout_sec = _safe_int_env("LOGSEARCH_GEMMA_TIMEOUT_SEC", 8)
+    logsearch_gemma_candidate_multiplier = _safe_int_env("LOGSEARCH_GEMMA_CANDIDATE_MULTIPLIER", 3)
+    logsearch_gemma_timeout_sec = max(2, min(logsearch_gemma_timeout_sec, 30))
+    logsearch_gemma_candidate_multiplier = max(1, min(logsearch_gemma_candidate_multiplier, 6))
     if score_overlap_weight < 0:
         score_overlap_weight = 0.0
     if score_recency_weight < 0:
@@ -1149,7 +1306,7 @@ def main() -> None:
         score_recency_weight /= weight_sum
     persona_memory_enabled = os.getenv("PERSONA_MEMORY_ENABLED", "true").strip().lower() == "true"
     directional_memory_enabled = os.getenv("DIRECTIONAL_MEMORY_ENABLED", "false").strip().lower() == "true"
-    personal_guild_id = int(os.getenv("PERSONAL_GUILD_ID", "0") or 0)
+    personal_guild_id = _safe_int_env("PERSONAL_GUILD_ID", 0)
     family_guild_ids = _parse_int_set_env("FAMILY_GUILD_IDS")
     cli_approver_user_ids = {
         int(part.strip())
@@ -1284,6 +1441,7 @@ def main() -> None:
                     raw_report = str(status_payload.get("report", "")).strip()
                     report = _strip_engine_header(raw_report) or "(レポート本文なし)"
                     engine = _extract_research_engine(status_payload, raw_report)
+                    artifact_path = str(status_payload.get("artifact_path", "")).strip()
                     logger.info(
                         "[main-agent][research-notify] done job_id=%s engine=%s report_chars=%s",
                         job_id,
@@ -1298,8 +1456,14 @@ def main() -> None:
                             "[要約]",
                             _build_research_digest(report),
                         ])
-                        should_attach = "[DeepDive Query" in report or len(report) > 1200
-                        if should_attach:
+                        artifact_file_path = Path(artifact_path) if artifact_path else None
+                        if artifact_file_path is not None and artifact_file_path.exists():
+                            file_obj = discord.File(
+                                io.BytesIO(artifact_file_path.read_bytes()),
+                                filename=artifact_file_path.name or RESEARCH_ATTACHMENT_NAME,
+                            )
+                            await channel.send(summary + "\n\n(原文は添付ファイルを参照してください)", file=file_obj)
+                        elif "[DeepDive Query" in report or len(report) > 1200:
                             file_obj = discord.File(
                                 io.BytesIO(report.encode("utf-8")),
                                 filename=RESEARCH_ATTACHMENT_NAME,
@@ -2008,14 +2172,27 @@ def main() -> None:
         try:
             selected_scope = scope.value if scope is not None else "default"
             query_scope = logsearch_default_scope if selected_scope == "default" else selected_scope
+            requested_limit = int(limit)
+            candidate_limit = min(24, max(requested_limit, requested_limit * logsearch_gemma_candidate_multiplier))
 
             records = await orchestrator.memory.fetch_relevant_messages(
                 guild_id=interaction.guild_id,
                 channel_id=interaction.channel_id,
                 query_text=clean_keyword,
-                limit=int(limit),
+                limit=candidate_limit,
                 scope=query_scope,
             )
+
+            if logsearch_gemma_enabled and len(records) > requested_limit:
+                records = await asyncio.to_thread(
+                    _gemma_rerank_logsearch_records,
+                    keyword=clean_keyword,
+                    records=records,
+                    endpoint=logsearch_gemma_endpoint,
+                    timeout_sec=logsearch_gemma_timeout_sec,
+                )
+
+            records = records[:requested_limit]
 
             if not records:
                 await interaction.followup.send("該当する過去ログは見つかりませんでした。", ephemeral=True)
@@ -2072,6 +2249,40 @@ def main() -> None:
         question: str,
         requester_user_id: int,
     ) -> None:
+        try:
+            combined = await _run_reader_compare(
+                orchestrator=orchestrator,
+                question=question,
+                task_label_prefix="mention_url_compare",
+            )
+            if combined is not None:
+                await send_message_response(source_message, combined, max_message_len=max_message_len)
+                append_debug_probe_audit(
+                    debug_probe_audit_log_path,
+                    {
+                        "event": "mention_answer_sent",
+                        "guild_id": source_message.guild.id if source_message.guild else 0,
+                        "channel_id": source_message.channel.id,
+                        "request_message_id": source_message.id,
+                        "requester_user_id": requester_user_id,
+                        "question": question,
+                        "answer_preview": combined[:600],
+                        "route": "reader_direct_compare",
+                    },
+                )
+                return
+        except Exception:
+            logger.exception("Failed to handle direct reader URL comparison")
+
+            combined = await _run_reader_compare(
+                orchestrator=orchestrator,
+                question=question,
+                task_label_prefix="ask_url_compare",
+            )
+            if combined is not None:
+                await send_response(interaction, combined, max_message_len=max_message_len)
+                return
+
         mode, timeout_sec = _extract_research_controls(question)
         question_with_controls = _inject_research_controls_hint_with_values(question, mode, timeout_sec)
         recent_context = ""

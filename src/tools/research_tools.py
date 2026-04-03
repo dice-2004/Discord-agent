@@ -132,7 +132,8 @@ def dispatch_research_job(
     # Research time (actual research budget, not polling timeout)
     # Default is intentionally short for normal (non time-specified) requests.
     research_time_sec = max(10, _safe_int("RESEARCH_AGENT_DEFAULT_TIMEOUT_SEC", 45))
-    if str(timeout_sec or "").strip():
+    time_specified = bool(str(timeout_sec or "").strip())
+    if time_specified:
         try:
             research_time_sec = int(str(timeout_sec).strip())
         except (ValueError, TypeError):
@@ -150,6 +151,7 @@ def dispatch_research_job(
             "source": clean_source,
             "mode": clean_mode,
             "timeout_sec": str(research_time_sec),  # Send actual research time to Agent
+            "time_specified": time_specified,
         },
     )
     if err is not None:
@@ -183,7 +185,8 @@ def dispatch_research_job(
                 "action": "dispatch_research_job",
                 "job_id": job_id,
                 "mode": clean_mode,
-                "timeout_sec": wait_timeout,
+                "timeout_sec": research_time_sec,
+                "poll_timeout_sec": wait_timeout,
                 "detail": "Research Agent にジョブを投入しました。",
             },
             ensure_ascii=False,

@@ -6,9 +6,82 @@
 
 ## 2026-04-02
 
+## 2026-04-03
+
+## 2026-04-04
+
+### 仕様更新
+
+- Research Agent の責務を「Gemini/Gemma の選択・校閲・返却可否判定・原文アーティファクト保存」に縮小し、深掘りの tool loop は Gemini API / Gemma 4 側へ移した
+- Gemini CLI 依存をやめ、Research Agent は Python native の Gemini API 呼び出しを標準経路にした
+
+### 実装
+
+- `src/tools/research_loop.py` を追加し、Gemini と Gemma が同じ JSON tool loop 契約で `web_search` / `read_url_markdown` / `source_deep_dive` を回せる共通実行器を導入した
+- `src/research_agent/core/orchestrator.py` を共通 loop 接続へ切り替え、Gemini 側の生トランスクリプトを保持できるようにした
+- `src/gemma_worker/worker_server.py` を tool loop 実行モードへ変更し、Gemma の推論結果に raw transcript と decision log を含めた
+- `src/research_agent/research_agent_server.py` を裁定/検査中心に簡素化し、ジョブ完了時に原文アーティファクトを保存して `artifact_path` として返せるようにした
+- `src/main_agent/main.py` の研究完了通知で、保存済みの原文アーティファクトがあれば優先的に添付するようにした
+
+### 仕様更新
+
+- 現在実装準拠の責務/経路図として `docs/ROUTE_DIAGRAM_CURRENT.md` を追加し、Main/Research/管理オーケストレータ/Gemini CLI/Gemma Worker の分岐とログ追跡ポイントを明文化した
+
+### 実装
+
+- Ollamaモデルを `gemma3:4b` から `gemma4:e2b` へ切り替え、`gemma3:4b` / `gemma4:e4b` を削除してN100メモリ制約下で安定動作する構成へ調整した
+- Heretic派生へ切り替えやすいように、`OLLAMA_MODEL` の差し替え候補を `.env` と `.env.example` にコメントで残した
+- Gemma 4 E4B運用向けに `GEMMA_WORKER_HTTP_TIMEOUT_SEC=240` と `GEMMA_WORKER_NUM_PREDICT=128` を既定化し、長時間推論のタイムアウトを緩和した
+- `gemma-worker` の `/v1/research/analyze` に短縮リトライ経路を追加し、一次推論失敗時でもGemma要約を返しやすくした
+- `docker-compose.yml` に `ollama` サービスを追加し、`data/ollama` ボリューム永続化・healthcheck・profile(`gemma`)付きで管理できるようにした
+- `gemma-worker` を profile(`gemma`)配下へ移し、`ollama` のヘルス完了後に起動する `depends_on` 条件を追加した
+- `OLLAMA_BASE_URL` の既定を `http://ollama:11434` へ更新し、compose内サービス参照を標準化した
+- `gemma-worker` の research analyze で深掘り再取得を既定OFF（`GEMMA_WORKER_RESEARCH_USE_DEEP_DIVE=false`）にし、Ollamaタイムアウト時のフォールバック頻度を低減した
+- `GEMMA_WORKER_NUM_PREDICT` / `GEMMA_WORKER_TEMPERATURE` を追加し、N100向けにGemma生成長を抑えて応答安定性を改善した
+- `src/gemma_worker/worker_server.py` を追加し、`/v1/logsearch/rerank` と `/v1/research/analyze` を提供するGemma Workerを実装した
+- `docker/Dockerfile.gemma` を追加し、Gemma Workerを独立コンテナとして起動できるようにした
+- `docker-compose.yml` に `gemma-worker` サービスを追加し、`main-agent` / `research-agent` から参照できる構成へ更新した
+- Research Agentに4段目（Gemma 4）委譲の実装を追加し、時間指定の明示 + 深掘り意図語 + しきい値（既定10分）を満たす場合のみGemmaステージを発火するようにした
+- `dispatch_research_job` から `time_specified` フラグをResearch Agentへ渡し、時間指定有無に基づいた発火判定ができるようにした
+- Gemma呼び出し失敗時は既存ルート（Gemini CLI / Orchestrator / DeepDive）へフォールバックするようにし、ジョブ失敗率を上げない実装にした
+- `/logsearch` に Gemma補助リランキング（任意有効）を追加し、上位候補の再並び替えをローカル推論APIへ委譲できるようにした（失敗時は既存スコアへフォールバック）
+- `.env.example` に `LOGSEARCH_GEMMA_*` 設定（有効化、エンドポイント、タイムアウト、候補倍率）を追加した
+- `.env.example` に `RESEARCH_AGENT_GEMMA_*` 設定（有効化、エンドポイント、タイムアウト、発火しきい値、例外起動可否）を追加した
+- `.env.example` に `GEMMA_WORKER_*` と `OLLAMA_*` 設定を追加し、別コンテナ運用時の接続先を明示した
+
+- `/ask` に URL比較時の Reader直行ルートを追加し、比較質問で Research Agent へ過剰委譲される経路を抑制した
+- メンション判定の既定を「先頭一致必須」から「文中メンション許容」へ変更し、`今日は @bot ...` 形式でも反応するようにした（`MENTION_REQUIRE_PREFIX` で従来挙動に戻し可能）
+- 一般知識クエリ判定を追加し、フォローアップでない質問では履歴注入を抑制して無関係メモリ混入を低減した
+- 方向付きメモリ境界の設定読み込みを堅牢化し、`PERSONAL_GUILD_ID` の不正値で起動失敗しにくいようにした
+
+### 仕様更新
+
+- `docs/DESIGN.md` に N100導入時の標準分離（`main-agent` / `research-agent` / `gemma-worker`）を追記した
+- `docs/DESIGN.md` の Discord過去ログ検索を「将来拡張」から「拡張実装対象」へ更新し、Gemma rerank を初期実装方針として明文化した
+- 提案方針として「提案1/提案2を採用、提案3（全メッセージ常時ゲート）は既定不採用」を仕様へ反映した
+- `docs/DESIGN.md` に多段委譲ポリシーを追記し、最終回答品質責任をResearch管理エージェント（Gemini API）に置く方針を明文化した
+- 4段目（Gemma 4）の起動基準を追加し、「時間指定のじっくり調査」を主条件、深掘り語・時間しきい値（推奨10分）・高精度タスク例外を仕様化した
+- 4段目出力フォーマット（根拠URL、要点、反証・異説、不確実点）を標準化し、Gemmaは網羅収集/抽出、Geminiは最終統合を担う責務分離を追記した
+
+- `docs/DESIGN.md` のロードマップを現行実装に合わせて更新し、以下を明文化した
+	- Discord過去ログ検索（`/logsearch`）は実装済み
+	- Eternal Explorer とカスタムドキュメントRAGは当面非対象
+	- runcli関連強化は後回し
+	- システム権限管理は方向付きメモリ境界で最小実装済み（個人→身内参照可、逆方向/身内間不可）
+- `docs/DESIGN.md` の `.env` サンプルに `add_task/update_task/delete_task` と一括削除/一括更新アクションを反映した
+
 ### テスト項目書更新
 
 - `docs/TEST_PLAN.md` にエラーハンドリング・耐障害性テスト（§7: ERR-001〜ERR-010）を追加した
+
+### 再テスト・不具合管理更新
+
+- `docs/TEST_RESULTS.md` で FAIL 再検証の 1st batch を反映（UT-061, CT-010, CT-026, MT-014/016/026/033, QLP-005 を更新）
+- `src/tools/action_tools.py` の `get_calendar_events` ローカル分岐で発生していた `NameError(storage_path)` を修正
+- `docs/MANUAL_TEST_ITEMS.md` に BUG-004 / BUG-010 の実機検証ランブックとクローズ条件を追加
+- `docs/BUG_TRACKER.md` に BUG-004 / BUG-010 の実機クローズ条件を追記
+- 実機ログ反映: CT-004 は `PASS（実機）` へ更新、CT-020 は `PASS（実機）` として BUG-010 を Fixed 化
+- CT-006 は polling 表示確認手順が未確定のため後回しとして継続管理
 - Discord質問ロジックパス網羅テスト（§8: QLP-001〜QLP-023）を追加した。Research Controls 注入、Recent Conversation 文脈組立、フォローアップ解決・指示語注入、曖昧クエリ検出・拒否、強制ディスパッチ、Self-Review、メンション高速カレンダー/タスクの全パスをカバー
 - セキュリティテスト（§9: SEC-001〜SEC-006）、設定バリデーションテスト（§10: CFG-001〜CFG-008）、エッジケース・境界値テスト（§11: EDGE-001〜EDGE-012）を追加した
 - テスト実施手順（§5.1）に新セクション（§7〜§11）の実施順序を追記した

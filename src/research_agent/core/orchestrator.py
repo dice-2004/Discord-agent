@@ -15,6 +15,7 @@ from typing import Any
 import google.generativeai as genai
 
 from tools import ToolRegistry, build_default_tool_registry
+from tools.research_loop import run_model_research_loop
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ class ResearchOrchestrator:
         self.tool_registry = build_default_tool_registry()
         self.model = genai.GenerativeModel(model_name=self.config.gemini_model)
         self.max_tool_turns = 2
+        self.last_transcript = ""
 
     async def answer(
         self,
@@ -38,223 +40,42 @@ class ResearchOrchestrator:
         source: str = "auto",
         timeout_sec: int = 60,
     ) -> tuple[str, list[dict[str, Any]]]:
-        """
-        Research answer with tool-calling support.
-        Continues research for at least timeout_sec seconds.
-        Returns: (answer_text, decision_log)
-        """
+        """Run the Gemini-based research loop and keep its raw transcript for later attachment."""
         await asyncio.sleep(0)
 
-        # 60秒以上は「時間指定あり」の深掘りモードとして扱う。
-        explicit_timed_research = timeout_sec >= 60
-        if explicit_timed_research:
-            # Timed research: allow enough turns to actually consume the requested budget.
-            # Approximate one useful turn at ~6-10 seconds including tool/network latency.
-            self.max_tool_turns = max(8, min(24, timeout_sec // 6))
+        if timeout_sec >= 60:
+            self.max_tool_turns = max(6, min(18, timeout_sec // 8))
         else:
-            # Default behavior: return quickly when answer quality is sufficient.
             self.max_tool_turns = 2
 
-        start_time = time.time()
-        turn = 0
-        scratchpad: list[str] = []
-        decision_log: list[dict[str, Any]] = []
-        tool_history: list[str] = []
         question = f"topic: {topic}\nsource: {source}"
-        now_jst = (datetime.now(timezone.utc) + timedelta(hours=9)).strftime("%Y-%m-%d %H:%M:%S")
 
-        final_candidate_response = ""
-
-        for turn in range(1, self.max_tool_turns + 1):
-            elapsed = time.time() - start_time
-            if explicit_timed_research and elapsed >= timeout_sec and turn > 1:
-                logger.info(
-                    "Timed research budget reached at turn=%d elapsed=%.1f/%d",
-                    turn,
-                    elapsed,
-                    timeout_sec,
-                )
-                break
-
-            now_jst = (datetime.now(timezone.utc) + timedelta(hours=9)).strftime("%Y-%m-%d %H:%M:%S")
-            question = f"topic: {topic}\nsource: {source}"
-
-            prompt = self._build_thinking_prompt(
-                question=question,
-                turn=turn,
-                scratchpad=scratchpad,
-                now_jst=now_jst,
+        def _call_model(prompt: str) -> str:
+            response = self.model.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.2,
+                    top_p=0.95,
+                    top_k=40,
+                    max_output_tokens=256,
+                    response_mime_type="application/json",
+                ),
             )
+            return response.text if hasattr(response, "text") and response.text else str(response)
 
-            decision = await self._make_decision(prompt)
-            decision_log.append(
-                {
-                    "turn": turn,
-                    "action": decision.get("action"),
-                    "tool": decision.get("tool"),
-                    "reason": decision.get("reason"),
-                }
-            )
-            logger.info(
-                "[AI_THOUGHT] agent=research turn=%s action=%s tool=%s reason=%s",
-                turn,
-                str(decision.get("action", "")),
-                str(decision.get("tool", "")),
-                str(decision.get("reason", ""))[:180],
-            )
-
-            # Early respond: only if at max turns, ignore early completion otherwise
-            if decision.get("action") == "respond":
-                response_text = str(decision.get("response", "")).strip()
-                final_candidate_response = response_text
-                # Timed research must keep gathering evidence until budget is consumed.
-                if explicit_timed_research and (elapsed < timeout_sec) and turn < self.max_tool_turns:
-                    logger.info(
-                        "Early completion at turn=%d/%d elapsed=%.1f/%d: forcing deeper research",
-                        turn,
-                        self.max_tool_turns,
-                        elapsed,
-                        timeout_sec,
-                    )
-                    logger.info(
-                        "[AI_THOUGHT] agent=research stage=early_respond_override turn=%s elapsed=%.1f timeout_sec=%s",
-                        turn,
-                        elapsed,
-                        timeout_sec,
-                    )
-                    forced_tool, forced_args = self._select_forced_tool(topic=topic, turn=turn, scratchpad=scratchpad)
-                    logger.info(
-                        "Forced tool execution: %s (turn %d/%d)",
-                        forced_tool,
-                        turn,
-                        self.max_tool_turns,
-                    )
-                    forced_result = self.tool_registry.execute(forced_tool, forced_args)
-                    forced_summary = forced_result[:400] if forced_result else "(空)"
-                    forced_urls = self._extract_urls_from_result(forced_result)
-                    forced_sources = ""
-                    if forced_urls:
-                        forced_sources = "\n\n[出典/参考URL]\n" + "\n".join(f"- {url}" for url in forced_urls)
-
-                    scratchpad.append(
-                        f"[❌ respond は拒否されました - ターン {turn}]\n"
-                        f"理由: まだ {self.max_tool_turns - turn} ターン残っており、より詳細な調査が必須です。\n"
-                        f"あなたが提案した回答:\n{response_text[:250]}...\n\n"
-                        f"[⚠️ 重要: 時間指定リサーチ中のため調査を継続します]\n"
-                        f"[自動実行ツール: {forced_tool}]\n"
-                        f"{forced_summary}{forced_sources}\n"
-                        f"(ターン進捗: {turn}/{self.max_tool_turns}, 経過時間: {elapsed:.0f}秒/{timeout_sec}秒)"
-                    )
-                    await asyncio.sleep(0.8)
-                    continue
-                else:
-                    # Quick mode or final turn.
-                    if self._looks_like_placeholder_response(response_text):
-                        composed = await self._compose_final_response(
-                            question=question,
-                            now_jst=now_jst,
-                            scratchpad=scratchpad,
-                        )
-                        if self._looks_like_placeholder_response(composed):
-                            fallback = self._build_fallback_report(
-                                question=question,
-                                scratchpad=scratchpad,
-                                candidate=final_candidate_response,
-                            )
-                            return fallback, decision_log
-                        return self._ensure_sources_in_text(composed, scratchpad), decision_log
-
-                    return self._ensure_sources_in_text(response_text, scratchpad), decision_log
-
-            if decision.get("action") == "tool":
-                tool_name = str(decision.get("tool", "")).strip()
-                tool_args = decision.get("args", {})
-                if not isinstance(tool_args, dict):
-                    tool_args = {}
-
-                # Prevent recursive dispatch inside research agent.
-                if tool_name == "dispatch_research_job":
-                    tool_name = "source_deep_dive"
-                    tool_args = {"topic": topic, "source": source}
-
-                # Avoid getting stuck on the same tool over and over.
-                if len(tool_history) >= 2 and tool_history[-1] == tool_history[-2] == tool_name:
-                    alt_tool, alt_args = self._select_forced_tool(topic=topic, turn=turn, scratchpad=scratchpad)
-                    if alt_tool != tool_name:
-                        logger.info(
-                            "Tool repetition guard: %s -> %s (turn %d/%d)",
-                            tool_name,
-                            alt_tool,
-                            turn,
-                            self.max_tool_turns,
-                        )
-                        logger.info(
-                            "[AI_THOUGHT] agent=research stage=tool_repetition_guard turn=%s from=%s to=%s",
-                            turn,
-                            tool_name,
-                            alt_tool,
-                        )
-                        tool_name = alt_tool
-                        tool_args = alt_args
-
-                logger.info("Tool execution: %s (turn %d/%d)", tool_name, turn, self.max_tool_turns)
-                result = self.tool_registry.execute(tool_name, tool_args)
-                if result:
-                    summary_limit = 2400 if tool_name == "source_deep_dive" else 400
-                    result_summary = result[:summary_limit]
-                else:
-                    result_summary = "(空)"
-
-                # Extract URLs from result for source attribution
-                urls = self._extract_urls_from_result(result)
-                source_attribution = ""
-                if urls:
-                    source_attribution = "\n\n[出典/参考URL]\n" + "\n".join(f"- {url}" for url in urls)
-
-                scratchpad.append(f"[ツール結果: {tool_name}]\n{result_summary}{source_attribution}")
-                tool_history.append(tool_name)
-                if len(tool_history) > 8:
-                    tool_history = tool_history[-8:]
-                await asyncio.sleep(0.5)
-
-        if explicit_timed_research:
-            extra_round = 0
-            # Keep continuing until budget is consumed; cap is high enough for long jobs.
-            max_extra_rounds = max(12, min(240, timeout_sec * 2))
-            while (time.time() - start_time) < timeout_sec and extra_round < max_extra_rounds:
-                extra_round += 1
-                elapsed = time.time() - start_time
-                forced_tool, forced_args = self._select_forced_tool(topic=topic, turn=self.max_tool_turns + extra_round, scratchpad=scratchpad)
-                logger.info(
-                    "Timed continuation tool: %s (extra_round=%d/%d elapsed=%.1f/%d)",
-                    forced_tool,
-                    extra_round,
-                    max_extra_rounds,
-                    elapsed,
-                    timeout_sec,
-                )
-                forced_result = self.tool_registry.execute(forced_tool, forced_args)
-                forced_summary = forced_result[:400] if forced_result else "(空)"
-                forced_urls = self._extract_urls_from_result(forced_result)
-                forced_sources = ""
-                if forced_urls:
-                    forced_sources = "\n\n[出典/参考URL]\n" + "\n".join(f"- {url}" for url in forced_urls)
-                scratchpad.append(
-                    f"[継続調査: {forced_tool}]\n"
-                    f"{forced_summary}{forced_sources}\n"
-                    f"(継続ラウンド: {extra_round}, 経過時間: {elapsed:.0f}秒/{timeout_sec}秒)"
-                )
-                await asyncio.sleep(1.0)
-
-        final_response = await self._compose_final_response(
-            question=question,
-            now_jst=now_jst,
-            scratchpad=scratchpad,
+        loop_result = await asyncio.to_thread(
+            run_model_research_loop,
+            topic=question,
+            source=source,
+            timeout_sec=timeout_sec,
+            model_name=self.config.gemini_model,
+            model_call=_call_model,
+            loop_label="gemini-api-research",
+            tool_registry=self.tool_registry,
+            max_turns=self.max_tool_turns if self.max_tool_turns > 0 else None,
         )
-        if self._looks_like_placeholder_response(final_response):
-            fallback = self._build_fallback_report(question=question, scratchpad=scratchpad, candidate=final_candidate_response)
-            return fallback, decision_log
-        return self._ensure_sources_in_text(final_response, scratchpad), decision_log
+        self.last_transcript = loop_result.transcript
+        return loop_result.report, loop_result.decision_log
 
     def _build_thinking_prompt(
         self,

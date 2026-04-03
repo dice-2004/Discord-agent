@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shlex
 import sqlite3
 import subprocess
@@ -14,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from tools.deep_dive_tools import source_deep_dive
 from research_agent.core.orchestrator import build_research_orchestrator
@@ -40,6 +42,7 @@ class ResearchJobStore:
                     status TEXT NOT NULL,
                     engine TEXT NOT NULL,
                     report TEXT NOT NULL,
+                    artifact_path TEXT NOT NULL,
                     decision_log TEXT NOT NULL,
                     error TEXT NOT NULL,
                     created_at TEXT NOT NULL,
@@ -54,6 +57,8 @@ class ResearchJobStore:
             }
             if "engine" not in cols:
                 conn.execute("ALTER TABLE research_jobs ADD COLUMN engine TEXT NOT NULL DEFAULT ''")
+            if "artifact_path" not in cols:
+                conn.execute("ALTER TABLE research_jobs ADD COLUMN artifact_path TEXT NOT NULL DEFAULT ''")
             if "decision_log" not in cols:
                 conn.execute("ALTER TABLE research_jobs ADD COLUMN decision_log TEXT NOT NULL DEFAULT '[]'")
 
@@ -63,8 +68,8 @@ class ResearchJobStore:
             with sqlite3.connect(self._db_path, timeout=5.0) as conn:
                 conn.execute(
                     """
-                    INSERT INTO research_jobs(job_id, topic, source, mode, status, engine, report, decision_log, error, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, 'queued', '', '', '[]', '', ?, ?)
+                    INSERT INTO research_jobs(job_id, topic, source, mode, status, engine, report, artifact_path, decision_log, error, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, 'queued', '', '', '', '[]', '', ?, ?)
                     """,
                     (job_id, topic, source, mode, now, now),
                 )
@@ -75,6 +80,7 @@ class ResearchJobStore:
         *,
         status: str,
         report: str = "",
+        artifact_path: str = "",
         error: str = "",
         engine: str | None = None,
         decision_log: list[dict[str, Any]] | None = None,
@@ -87,19 +93,19 @@ class ResearchJobStore:
                     conn.execute(
                         """
                         UPDATE research_jobs
-                        SET status = ?, report = ?, error = ?, decision_log = ?, updated_at = ?
+                        SET status = ?, report = ?, artifact_path = ?, error = ?, decision_log = ?, updated_at = ?
                         WHERE job_id = ?
                         """,
-                        (status, report, error, log_json, now, job_id),
+                        (status, report, artifact_path, error, log_json, now, job_id),
                     )
                 else:
                     conn.execute(
                         """
                         UPDATE research_jobs
-                        SET status = ?, engine = ?, report = ?, error = ?, decision_log = ?, updated_at = ?
+                        SET status = ?, engine = ?, report = ?, artifact_path = ?, error = ?, decision_log = ?, updated_at = ?
                         WHERE job_id = ?
                         """,
-                        (status, engine, report, error, log_json, now, job_id),
+                        (status, engine, report, artifact_path, error, log_json, now, job_id),
                     )
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
@@ -107,7 +113,7 @@ class ResearchJobStore:
             with sqlite3.connect(self._db_path, timeout=5.0) as conn:
                 row = conn.execute(
                     """
-                    SELECT job_id, topic, source, mode, status, engine, report, decision_log, error, created_at, updated_at
+                    SELECT job_id, topic, source, mode, status, engine, report, artifact_path, decision_log, error, created_at, updated_at
                     FROM research_jobs
                     WHERE job_id = ?
                     """,
@@ -116,7 +122,7 @@ class ResearchJobStore:
         if row is None:
             return None
         try:
-            decision_log = json.loads(str(row[7]) if row[7] else "[]")
+            decision_log = json.loads(str(row[8]) if row[8] else "[]")
         except Exception:
             decision_log = []
         return {
@@ -127,10 +133,11 @@ class ResearchJobStore:
             "status": str(row[4]),
             "engine": str(row[5]),
             "report": str(row[6]),
+            "artifact_path": str(row[7]),
             "decision_log": decision_log,
-            "error": str(row[8]),
-            "created_at": str(row[9]),
-            "updated_at": str(row[10]),
+            "error": str(row[9]),
+            "created_at": str(row[10]),
+            "updated_at": str(row[11]),
         }
 
 
@@ -170,6 +177,7 @@ def _run_gemini_cli(topic: str, source: str) -> tuple[str, str | None]:
         topic,
         source,
     )
+    logger.info("[route] research-agent -> gemini-cli command=%s model=%s", argv[0], model or "(default)")
 
     try:
         completed = subprocess.run(
@@ -194,97 +202,303 @@ def _run_gemini_cli(topic: str, source: str) -> tuple[str, str | None]:
     return out, None
 
 
-def _run_research(topic: str, source: str, mode: str, timeout_sec: int = 60) -> tuple[str, str | None, str, list[dict[str, Any]]]:
+def _safe_bool(value: object, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if not text:
+        return default
+    return text in {"1", "true", "yes", "on"}
+
+
+def _contains_deep_intent(text: str) -> bool:
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return False
+    markers = (
+        "網羅",
+        "徹底",
+        "全部",
+        "比較表",
+        "じっくり",
+        "deep",
+        "thorough",
+        "comprehensive",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _is_high_precision_exception_task(text: str) -> bool:
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return False
+    patterns = (
+        r"規約|利用規約|terms|policy",
+        r"学術|論文|paper|survey",
+        r"矛盾|contradiction|conflict",
+    )
+    return any(re.search(pattern, lowered) for pattern in patterns)
+
+
+def _should_trigger_gemma_stage(topic: str, timeout_sec: int, time_specified: bool) -> bool:
+    gemma_enabled = os.getenv("RESEARCH_AGENT_GEMMA_ENABLED", "false").strip().lower() == "true"
+    if not gemma_enabled:
+        return False
+
+    min_minutes = max(1, _safe_int("RESEARCH_AGENT_GEMMA_TRIGGER_MIN_MINUTES", 10))
+    min_seconds = min_minutes * 60
+    allow_exception = os.getenv("RESEARCH_AGENT_GEMMA_ALLOW_EXCEPTION_TRIGGER", "false").strip().lower() == "true"
+    has_deep_intent = _contains_deep_intent(topic)
+
+    if time_specified and timeout_sec >= min_seconds:
+        return True
+    if time_specified and has_deep_intent:
+        return True
+    if allow_exception and _is_high_precision_exception_task(topic):
+        return True
+    return False
+
+
+def _run_gemini_runner(topic: str, source: str, timeout_sec: int) -> tuple[str, str, list[dict[str, Any]], str | None]:
+    try:
+        orchestrator = asyncio.run(build_research_orchestrator())
+        report, decision_log = asyncio.run(orchestrator.answer(topic=topic, source=source, timeout_sec=timeout_sec))
+        transcript = getattr(orchestrator, "last_transcript", "") or report
+        logger.info(
+            "[route] research-agent -> gemini-api topic=%s source=%s timeout_sec=%s report_chars=%s transcript_chars=%s",
+            topic[:160],
+            source,
+            timeout_sec,
+            len(report),
+            len(transcript),
+        )
+        return report, transcript, decision_log, None
+    except Exception as exc:
+        logger.exception("Gemini runner failed: %s", exc)
+        return "", "", [], f"gemini_runner_failed:{exc}"
+
+
+def _run_gemma_worker(topic: str, source: str, initial_report: str, timeout_sec: int) -> tuple[str, str, list[dict[str, Any]], str | None]:
+    endpoint = (
+        os.getenv("RESEARCH_AGENT_GEMMA_ENDPOINT", "http://gemma-worker:8093/v1/research/analyze").strip()
+        or "http://gemma-worker:8093/v1/research/analyze"
+    )
+    call_timeout = max(10, _safe_int("RESEARCH_AGENT_GEMMA_TIMEOUT_SEC", 180))
+    call_timeout = min(call_timeout, max(15, timeout_sec + 60))
+
+    payload = {
+        "topic": topic,
+        "source": source,
+        "initial_report": initial_report,
+        "timeout_sec": timeout_sec,
+        "output_format": "evidence_summary",
+    }
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = Request(
+        endpoint,
+        data=data,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "discord-ai-agent-research/1.0",
+        },
+    )
+    try:
+        logger.info(
+            "[route] research-agent -> gemma-worker endpoint=%s topic=%s source=%s timeout_sec=%s",
+            endpoint,
+            topic[:160],
+            source,
+            call_timeout,
+        )
+        with urlopen(req, timeout=call_timeout) as res:
+            raw = res.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        return "", "", [], f"gemma_worker_http_error:{exc}"
+
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except Exception:
+        parsed = {"report": raw}
+
+    report = ""
+    if isinstance(parsed, dict):
+        for key in ("report", "result", "output", "text"):
+            value = parsed.get(key)
+            if isinstance(value, str) and value.strip():
+                report = value.strip()
+                break
+        status = str(parsed.get("status", "ok")).strip().lower()
+        if status in {"error", "failed"} and not report:
+            detail = str(parsed.get("detail") or parsed.get("error") or "gemma_worker_failed")
+            return "", "", [], f"gemma_worker_failed:{detail[:800]}"
+    elif isinstance(parsed, str):
+        report = parsed.strip()
+
+    if not report:
+        return "", "", [], "gemma_worker_empty_output"
+    transcript = ""
+    decision_log: list[dict[str, Any]] = []
+    if isinstance(parsed, dict):
+        transcript = str(parsed.get("transcript", "") or "").strip()
+        candidate_log = parsed.get("decision_log", [])
+        if isinstance(candidate_log, list):
+            decision_log = [item for item in candidate_log if isinstance(item, dict)]
+    return report[:12000], transcript[:24000] or report[:12000], decision_log, None
+
+
+def _build_research_artifact(job_id: str, engine: str, report: str, transcript: str, decision_log: list[dict[str, Any]]) -> str:
+    artifact_dir = Path(os.getenv("RESEARCH_AGENT_ARTIFACT_DIR", "./data/runtime/research_artifacts").strip() or "./data/runtime/research_artifacts")
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    safe_engine = re.sub(r"[^a-zA-Z0-9_.-]+", "_", engine or "unknown")
+    artifact_path = artifact_dir / f"{job_id}-{safe_engine}.txt"
+    body = [
+        f"job_id: {job_id}",
+        f"engine: {engine}",
+        "",
+        "[summary]",
+        report.strip() or "(empty)",
+        "",
+        "[decision_log]",
+        json.dumps(decision_log or [], ensure_ascii=False, indent=2),
+        "",
+        "[raw_transcript]",
+        transcript.strip() or "(empty)",
+    ]
+    artifact_path.write_text("\n".join(body), encoding="utf-8")
+    return str(artifact_path)
+
+
+def _report_is_returnable(report: str) -> bool:
+    body = (report or "").strip()
+    if not body:
+        return False
+    placeholders = {
+        "(タイムアウト)",
+        "(解析エラー)",
+        "(レスポンス生成失敗)",
+        "(調査結果の生成に失敗しました)",
+    }
+    return body not in placeholders and len(body) >= 40
+
+
+def _coerce_runner_result(raw: Any) -> tuple[str, str, list[dict[str, Any]], str | None]:
+    if isinstance(raw, tuple):
+        if len(raw) == 4:
+            report, transcript, runner_log, err = raw
+            report_text = str(report or "")
+            transcript_text = str(transcript or "")
+            safe_log = runner_log if isinstance(runner_log, list) else []
+            safe_err = None if err is None else str(err)
+            return report_text, transcript_text, safe_log, safe_err
+        if len(raw) == 2:
+            report, err = raw
+            return str(report or ""), "", [], None if err is None else str(err)
+    return "", "", [], "invalid_runner_result"
+
+
+def _run_research(
+    topic: str,
+    source: str,
+    mode: str,
+    timeout_sec: int = 60,
+    time_specified: bool = False,
+) -> tuple[str, str | None, str, list[dict[str, Any]], str]:
     clean_mode = (mode or "auto").strip().lower() or "auto"
-    gemini_enabled = os.getenv("RESEARCH_AGENT_USE_GEMINI_CLI", "false").strip().lower() == "true"
-    orchestrator_enabled = bool(os.getenv("RESEARCH_GEMINI_API_KEY", "").strip())
-    auto_prefer_orchestrator = os.getenv("RESEARCH_AGENT_AUTO_PREFER_ORCHESTRATOR", "true").strip().lower() == "true"
-    orchestrator_attempted = False
-    initial_report = ""
+    decision_log: list[dict[str, Any]] = []
     logger.info(
-        "[research-agent][run] start topic=%s source=%s mode=%s gemini_cli=%s orchestrator=%s",
+        "[research-agent][run] start topic=%s source=%s mode=%s time_specified=%s timeout_sec=%s",
         topic,
         source,
         clean_mode,
-        gemini_enabled,
-        orchestrator_enabled,
+        time_specified,
+        timeout_sec,
     )
 
+    gemma_enabled = os.getenv("RESEARCH_AGENT_GEMMA_ENABLED", "false").strip().lower() == "true"
+    min_minutes = max(1, _safe_int("RESEARCH_AGENT_GEMMA_TRIGGER_MIN_MINUTES", 10))
+    allow_exception = os.getenv("RESEARCH_AGENT_GEMMA_ALLOW_EXCEPTION_TRIGGER", "false").strip().lower() == "true"
+    has_deep_intent = _contains_deep_intent(topic)
+    is_exception_task = _is_high_precision_exception_task(topic)
+    gemma_triggered = _should_trigger_gemma_stage(topic=topic, timeout_sec=timeout_sec, time_specified=time_specified)
+    logger.info(
+        "[research-agent][gemma] decision enabled=%s triggered=%s time_specified=%s timeout_sec=%s min_minutes=%s deep_intent=%s exception_task=%s allow_exception=%s auto_prefer_orchestrator=%s",
+        gemma_enabled,
+        gemma_triggered,
+        time_specified,
+        timeout_sec,
+        min_minutes,
+        has_deep_intent,
+        is_exception_task,
+        allow_exception,
+        "n/a",
+    )
+    decision_log.append(
+        {
+            "stage": "gemma_trigger_decision",
+            "triggered": gemma_triggered,
+            "time_specified": time_specified,
+            "timeout_sec": timeout_sec,
+            "gemma_enabled": gemma_enabled,
+            "min_minutes": min_minutes,
+            "has_deep_intent": has_deep_intent,
+            "is_exception_task": is_exception_task,
+            "allow_exception": allow_exception,
+            "auto_prefer_orchestrator": False,
+        }
+    )
+
+    transcript = ""
     if clean_mode == "gemini_cli":
-        if not gemini_enabled:
-            return "", "gemini_cli_disabled", "gemini_cli", []
-
-        report, err = _run_gemini_cli(topic, source)
-        if err:
-            logger.warning("[research-agent][run] gemini_cli mode failed err=%s", err)
-            return "", err, "gemini_cli", []
-
-        if orchestrator_enabled and _check_need_orchestrator(report):
-            try:
-                orch_report, orch_decision_log = asyncio.run(_run_orchestrator_deepdive(topic, source, report, timeout_sec))
-                if orch_report:
-                    logger.info("[research-agent][run] route=gemini_cli+orchestrator")
-                    combined = f"[Gemini CLI Initial]\n{report}\n\n[Management AI Deepdive]\n{orch_report}"
-                    return combined[:12000], None, "gemini_cli+orchestrator", orch_decision_log
-            except Exception as exc:
-                logger.exception("Orchestrator failed in gemini_cli mode: %s", exc)
-        return report, None, "gemini_cli", []
-
-    if clean_mode == "auto" and auto_prefer_orchestrator and orchestrator_enabled:
-        try:
-            orchestrator_attempted = True
-            orch_report, orch_decision_log = asyncio.run(
-                _run_orchestrator_deepdive(topic, source, initial_report, timeout_sec)
+        logger.info("[route] research-agent mode=gemini_cli path=gemini-api")
+        report, transcript, runner_log, err = _coerce_runner_result(
+            _run_gemini_runner(topic=topic, source=source, timeout_sec=timeout_sec)
+        )
+        engine = "gemini_api"
+    elif clean_mode == "fallback":
+        logger.info("[route] research-agent mode=fallback path=gemma-worker")
+        report, transcript, runner_log, err = _coerce_runner_result(
+            _run_gemma_worker(
+                topic=topic,
+                source=source,
+                initial_report="",
+                timeout_sec=timeout_sec,
             )
-            if orch_report:
-                logger.info("[research-agent][run] route=orchestrator(auto_preferred)")
-                return orch_report[:12000], None, "orchestrator", orch_decision_log
-            logger.warning("Orchestrator returned empty report in auto-preferred mode; fallback to other routes")
-        except Exception as exc:
-            logger.exception("Orchestrator auto-preferred path failed: %s", exc)
-
-    if clean_mode == "auto" and gemini_enabled:
-        report, err = _run_gemini_cli(topic, source)
-        if not err and report:
-            initial_report = report
-            try:
-                if orchestrator_enabled and _check_need_orchestrator(report):
-                    orch_report, orch_decision_log = asyncio.run(_run_orchestrator_deepdive(topic, source, report, timeout_sec))
-                    if orch_report:
-                        logger.info("[research-agent][run] route=gemini_cli+orchestrator")
-                        combined = f"[Gemini CLI Initial]\n{report}\n\n[Management AI Deepdive]\n{orch_report}"
-                        return combined[:12000], None, "gemini_cli+orchestrator", orch_decision_log
-                logger.info("[research-agent][run] route=gemini_cli")
-                return report, None, "gemini_cli", []
-            except Exception as exc:
-                logger.exception("Orchestrator failed: %s", exc)
-                return report, None, "gemini_cli", []
-
-        logger.warning("Gemini CLI failed; fallback to deep dive. err=%s", err)
-        if clean_mode == "gemini_cli":
-            return "", err, "gemini_cli", []
-
-    if clean_mode in {"auto", "fallback"} and orchestrator_enabled and not orchestrator_attempted:
-        try:
-            orch_report, orch_decision_log = asyncio.run(
-                _run_orchestrator_deepdive(topic, source, initial_report, timeout_sec)
+        )
+        engine = "gemma4"
+    elif gemma_triggered:
+        logger.info("[route] research-agent mode=auto path=gemma-worker gemma_triggered=%s", gemma_triggered)
+        report, transcript, runner_log, err = _coerce_runner_result(
+            _run_gemma_worker(
+                topic=topic,
+                source=source,
+                initial_report="",
+                timeout_sec=timeout_sec,
             )
-            if orch_report:
-                if initial_report:
-                    logger.info("[research-agent][run] route=gemini_cli+orchestrator")
-                    combined = f"[Gemini CLI Initial]\n{initial_report}\n\n[Management AI Deepdive]\n{orch_report}"
-                    return combined[:12000], None, "gemini_cli+orchestrator", orch_decision_log
-                logger.info("[research-agent][run] route=orchestrator")
-                return orch_report[:12000], None, "orchestrator", orch_decision_log
-            logger.warning("Orchestrator returned empty report; fallback to deep dive")
-        except Exception as exc:
-            logger.exception("Orchestrator fallback failed: %s", exc)
+        )
+        engine = "gemma4"
+    else:
+        logger.info("[route] research-agent mode=auto path=gemini-api gemma_triggered=%s", gemma_triggered)
+        report, transcript, runner_log, err = _coerce_runner_result(
+            _run_gemini_runner(topic=topic, source=source, timeout_sec=timeout_sec)
+        )
+        engine = "gemini_api"
 
-    try:
-        logger.info("[research-agent][run] route=deep_dive")
-        return source_deep_dive(topic=topic, source=source), None, "deep_dive", []
-    except Exception as exc:
-        return "", str(exc), "deep_dive", []
+    decision_log.extend(runner_log)
+    if err:
+        logger.warning("[research-agent][run] runner failed engine=%s err=%s", engine, err)
+        return "", err, engine, decision_log, transcript
+
+    if not _report_is_returnable(report):
+        logger.warning("[research-agent][run] report looks weak engine=%s report_chars=%s", engine, len(report))
+        decision_log.append({"stage": "review", "status": "weak_report", "engine": engine, "report_chars": len(report)})
+        if not report.strip():
+            return "", "empty_report", engine, decision_log, transcript
+
+    return report[:12000], None, engine, decision_log, transcript
 
 
 def _check_need_orchestrator(report: str) -> bool:
@@ -355,6 +569,7 @@ class ResearchHandler(BaseHTTPRequestHandler):
                 self._send_json(500, {"status": "error", "code": "store_unavailable"})
                 return
             job_id = parsed.path.split("/v1/jobs/", 1)[1].strip()
+            logger.info("[route] research-agent -> job_status_lookup job_id=%s", job_id)
             if not job_id:
                 self._send_json(400, {"status": "error", "code": "invalid_job_id"})
                 return
@@ -389,6 +604,7 @@ class ResearchHandler(BaseHTTPRequestHandler):
         source = str(payload.get("source", "auto")).strip().lower() or "auto"
         mode = str(payload.get("mode", "auto")).strip().lower() or "auto"
         timeout_sec = max(10, _safe_int("_request_timeout_sec", _safe_int("RESEARCH_AGENT_JOB_TIMEOUT_SEC", 60)))
+        time_specified = _safe_bool(payload.get("time_specified"), default=False)
         try:
             raw_timeout = str(payload.get("timeout_sec", "")).strip()
             if raw_timeout:
@@ -405,6 +621,14 @@ class ResearchHandler(BaseHTTPRequestHandler):
 
         job_id = _build_job_id()
         self.store.create_job(job_id=job_id, topic=topic, source=source, mode=mode)
+        logger.info(
+            "[route] main-agent -> research-agent accepted job_id=%s mode=%s source=%s timeout_sec=%s time_specified=%s",
+            job_id,
+            mode,
+            source,
+            timeout_sec,
+            time_specified,
+        )
 
         def _worker() -> None:
             assert self.store is not None
@@ -412,9 +636,16 @@ class ResearchHandler(BaseHTTPRequestHandler):
             start_time = time.time()
 
             logger.info("[research-agent][job] start job_id=%s topic=%s source=%s mode=%s timeout_sec=%s", job_id, topic, source, mode, timeout_sec)
+            logger.info("[route] research-agent job_started job_id=%s mode=%s source=%s timeout_sec=%s", job_id, mode, source, timeout_sec)
             self.store.update_job(job_id, status="running", engine="")
             try:
-                report, err, engine, decision_log = _run_research(topic=topic, source=source, mode=mode, timeout_sec=timeout_sec)
+                report, err, engine, decision_log, transcript = _run_research(
+                    topic=topic,
+                    source=source,
+                    mode=mode,
+                    timeout_sec=timeout_sec,
+                    time_specified=time_specified,
+                )
                 elapsed = time.time() - start_time
                 if elapsed > job_timeout:
                     self.store.update_job(
@@ -441,14 +672,27 @@ class ResearchHandler(BaseHTTPRequestHandler):
                         decision_log=decision_log,
                     )
                     return
-                decorated_report = f"[Research Engine] {engine}\n{report}" if report else f"[Research Engine] {engine}"
+                artifact_path = _build_research_artifact(
+                    job_id=job_id,
+                    engine=engine,
+                    report=report,
+                    transcript=transcript,
+                    decision_log=decision_log,
+                )
+                decorated_report = (
+                    f"[Research Engine] {engine}\n{report}\n\n[原文アーティファクト]\n{artifact_path}"
+                    if report
+                    else f"[Research Engine] {engine}\n[原文アーティファクト]\n{artifact_path}"
+                )
                 self.store.update_job(
                     job_id,
                     status="done",
                     report=decorated_report[:12000],
+                    artifact_path=artifact_path,
                     engine=engine,
                     decision_log=decision_log,
                 )
+                logger.info("[route] research-agent job_completed job_id=%s engine=%s decision_log_len=%s", job_id, engine, len(decision_log))
                 logger.info(
                     "[research-agent][job] done job_id=%s engine=%s elapsed_sec=%.1f report_chars=%s decision_log_len=%s",
                     job_id,

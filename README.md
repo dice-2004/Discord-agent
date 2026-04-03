@@ -289,6 +289,7 @@ RESEARCH_GEMINI_TIMEOUT_SEC=60
 - `@agent-bot 今日の予定を教えて` のようにメンション先頭で送ると、`/ask` 相当として処理されます
 - `MENTION_REQUIRE_PREFIX=true` の場合、文中メンションでは発火せず先頭メンションのみ反応します
 - `MENTION_QUICK_CALENDAR_ENABLED=true` の場合、カレンダー系の定型依頼はLLMを経由せず直接 action 実行します（高速・安定化）
+- Gemma 4 の運用確認には、`いまの返答は Gemma 4 経由ですか？使っているならモデル名、使っていないなら通っていない経路を一行で教えてください。` がそのまま使えます
 
 ## 運用メモ
 

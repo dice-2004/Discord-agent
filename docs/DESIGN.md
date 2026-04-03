@@ -93,12 +93,12 @@
 * **LLMエンジン:** `Gemini 3.1 Flash Lite` API (軽量・高速・1日500リクエストの無料枠を使用)。
 * **役割:** 数秒〜20秒で完結するタスク（簡単な検索、URL要約、ローカル状態確認）を実行し即答する。重いタスクを検知した場合は、後述のResearch Agent等に処理を丸投げする。
 
-### 2.2. Research Agent (非同期・深掘り調査担当 / 段階実装)
+### 2.2. Research Agent (非同期・裁定/検査担当)
 
 * **インターフェース:** Main Agentからサブプロセス（バックグラウンドジョブ）として起動される。
-* **LLMエンジン:** Google公式 `gemini CLI` ツール。
-* **認証基盤:** "Sign in with Google" (OAuth) 済みのトークンを使用（巨大な無料枠で上位モデルを利用）。
-* **役割:** 1分〜1時間程度かかるタスク（複数サイトの横断、Reddit/GitHubの深掘り）を実行。完了後、Discordに長文レポートを非同期で通知して終了する。
+* **LLMエンジン:** Google公式 Gemini API を使う Python native 実装。Gemma 4 側は `gemma-worker` 経由で呼び出す。
+* **認証基盤:** Gemini 側は Research Agent 専用の API キー、Gemma 側はローカル Ollama を使用する。
+* **役割:** どちらの経路へ投げるかを判断し、返ってきた結果を校閲・要約・返却可否判定する。深掘りの tool loop 自体は Gemini / Gemma の各ランナーが担当する。
 
 #### 2.2.2. 現行の最小実装（2026-04-02追記）
 
@@ -106,15 +106,33 @@
 * Main Agentは `dispatch_research_job` ツールで `POST /v1/jobs` にジョブ投入し、`GET /v1/jobs/{job_id}` で状態取得する。
 * 通信は `X-Research-Token` ヘッダで共有トークン認証する。
 * 研究ジョブ状態は `RESEARCH_AGENT_DB_PATH`（SQLite）に `queued/running/done/failed` で保存する。
-* `mode=auto` では、`RESEARCH_AGENT_USE_GEMINI_CLI=true` のとき Gemini CLI を先行し、必要時のみ管理AI（Gemini API Orchestrator）を追加実行する。
-* `mode=fallback` では Gemini CLI を使わず、管理AI（Gemini API Orchestrator）を優先実行する。
-* 管理AIが利用不可（APIキー未設定）または失敗時のみ `source_deep_dive` へフォールバックする。
+* `mode=auto` では、`time_specified` と Gemma 4 発火条件を満たす場合は `gemma-worker` を優先し、それ以外は Gemini API ランナーを優先する。
+* `mode=fallback` では Gemini ルートを使わず、`gemma-worker` を優先実行する。
+* Research Agent は実行結果の要約・校閲・原文アーティファクト保存のみを行い、深掘りの tool loop は担当しない。
 
-#### 2.2.3. Gemini CLI配置方針（2026-04-01追記）
+#### 2.2.4. 多段委譲ポリシー（2026-04-03追記）
 
-* 既定推奨: **Research Agentコンテナ内にGemini CLIを同梱**して実行環境を固定する。
-* 代替案: ホスト側Gemini CLIを使う場合は、Research Agentへバインドマウント等で実行可能パスを渡す。
-* 互換のため `RESEARCH_AGENT_GEMINI_COMMAND` で実行コマンドを上書き可能にする（例: `gemini`, `/usr/local/bin/gemini`）。
+品質・コスト・遅延の両立のため、研究系ワークフローは以下の役割分担を標準とする。
+
+* Main Agent（Gemini 3.1 Flash Lite）: 受付・即時応答・委譲判断
+* Research管理エージェント（Gemini API）: 調査計画、統合、最終品質チェック、返却可否判定
+* Research調査エージェント（Gemini API native）: ツール実行、探索、一次要約
+* 網羅調査エージェント（Gemma 4 + tools）: 長文網羅読解、候補抽出、再ランク
+
+運用ルール:
+
+* 常時4段委譲は行わず、通常は上位段で完結させる。
+* 4段目（Gemma 4）の発火は「時間指定でじっくり調べる」意図を含む依頼を主条件とする。
+* 誤発火抑制のため、時間指定に加えて深掘り意図語（例: 網羅的に、徹底的に、全部、比較表）を補助条件として扱う。
+* 最低時間しきい値を設け、短時間指定では4段目を起動しない（既定10分以上を推奨）。
+* ただし、規約比較・学術調査・複数ソース矛盾解消など高精度必須タスクは時間指定なしでも例外起動を許容する。
+* 最終ユーザー回答の品質責任はResearch管理エージェント（Gemini API）に置き、Gemma出力は原文アーティファクト付きの根拠素材として扱う。
+
+#### 2.2.3. Gemini配置方針（2026-04-04更新）
+
+* 既定推奨: **Research Agent は Gemini API を Python native で直接呼び出す**。
+* CLI 互換経路は残してもよいが、標準ルートは `google-generativeai` ベースの API 呼び出しとする。
+* 認証情報は Research Agent 専用の API キーとして `.env` から読む。
 
 #### 2.2.1. 配置方針（2026-04-01追記）
 
@@ -141,6 +159,20 @@
 ※ ただし **ダミー実装・未使用コードの大量追加は不要**です。
 「あとから追加しやすい構造」に留めてください。
 
+### 2.5. N100導入時のコンテナ分離（2026-04-04更新）
+
+N100導入時は、Main Agentの即応性を守るために以下の分離を標準とする。
+
+* `main-agent`: Discord I/O、Orchestrator、軽量ツール呼び出し、承認UI、監査ログ記録
+* `research-agent`: 非同期深掘りジョブの裁定/検査/原文保存、ジョブ状態管理
+* `gemma-worker`: ローカルGemma推論の補助API（ログ検索再ランク、長文要約、候補抽出、tool loop）
+
+運用原則:
+
+* Main AgentからGemma処理を**同期で直列ブロックしない**（必要時のみ短時間呼び出し）
+* 重いGemma処理は `gemma-worker` で tool loop を回し、`research-agent` は原文保存と裁定だけ行う
+* 先行提案のうち、全メッセージ常時ゲート（提案3）は既定採用しない
+
 ---
 
 ## 3. Tool（道具箱）の6本柱設計
@@ -161,9 +193,12 @@
 
    * **概要:** `docker ps` などのホストシステム情報取得。
    * **【絶対遵守のセキュリティ（HitL）】:** コマンドの「実行」を伴う操作は、必ずDiscordのInteractive Button（承認/拒否）を生成し、管理者ユーザーが承認した場合のみ実行される設計（Human-in-the-Loop）とすること。
-5. **Discord過去ログ検索ツール [将来実装]**
+5. **Discord過去ログ検索ツール [実装済み + 拡張実装対象]**
 
    * **概要:** RAGによる受動的な記憶引き出しとは別に、AIが自発的に特定のキーワードやユーザー名で過去のDiscordログを検索しに行くツール。
+   * **現行:** `/logsearch` によりキーワード検索は実装済み。
+   * **拡張方針:** ローカルPC（N100）上のGemma系モデルを補助的に利用する検索強化を実装対象に含める。
+   * **初期実装方針:** 候補抽出は既存メモリ検索で実施し、Gemmaは再ランク（rerank）専用で呼び出す。失敗時は既存スコアへ即時フォールバックする。
 6. **外部自動化・アクションツール [コード内実行]**
 
    * **概要:** 「外部サービスへ行動を起こす」担当。Webhook中継を使わず、Botコード内で action ハンドラを直接実行し、必要なAPI（GitHub/SMTP等）へ接続する。
@@ -258,9 +293,11 @@
 3. **カスタムドキュメントのRAG (大学資料など / 将来拡張)**
 
    * **概要:** Discordの会話だけでなく、特定のディレクトリに配置されたPDFやテキストファイル（大学のシラバス、研究室のマニュアル等）を読み込み、専用コレクションとしてChromaDBにベクトル保存する拡張枠を想定する。
-4. **システム・権限管理DB (SQLite / 将来実装)**
+4. **システム・権限管理DB (SQLite / 現在は最小実装 + 拡張可能)**
 
-   * **概要:** 現時点では必須ではないが、将来的な「チャンネルごとのアクセス権限マップ」や「HitLの承認待ちステータス」を永続化するためのRelational DBとしてSQLiteを採用可能にする。設計上、組み込める余白を残すこと。
+   * **概要:** 現行はメモリ参照権限を `DIRECTIONAL_MEMORY_ENABLED` / `PERSONAL_GUILD_ID` / `FAMILY_GUILD_IDS` で制御する。
+   * **現行ポリシー:** 個人サーバーからは身内サーバー参照を許可、逆方向（身内→個人）と身内間の相互参照は禁止。
+   * **将来拡張:** チャンネルごとの詳細ACLやHitL承認待ち状態の永続管理は、必要に応じてSQLiteテーブルを追加して拡張する。
 5. **ユーザー・ペルソナ長期記憶 (第二の自分化 / 継続拡張)**
 
    * **概要:** ユーザーの性格・価値観・好み・長期目標・運用ルールを、会話RAGとは別に長期記憶として保持し、回答の一貫性を高める。
@@ -340,10 +377,15 @@
    * Gemini 3.1 Flash Lite APIをGoogle公式SDKで利用し、Orchestrator主導でツール連携するエージェントを構築。
    * Gemini Skills（静的Markdown読み込み）とChromaDB（会話履歴保存）の統合。
    * 一般Web検索ツールのモジュール化実装。
-* **次段の拡張候補:** Research Agent (`gemini CLI` サブプロセス)、Reader / Agent-Reach、Discord過去ログ検索ツール。
-* **運用拡張候補:** ローカルCLIツールのHitL強化、SQLiteによる承認待ち・権限情報管理。
-* **秘書化拡張候補:** ペルソナ抽出器、プロファイル確認フロー、タスク管理（締切/優先度）、行動提案の定期サマリ。
-* **将来構想:** Agent P2Pプロトコル連携、および **Eternal Explorer Agent（無限ループ自律研究）** の構築。
+* **現在の実装済み:** Research Agent連携、Reader、Agent-Reach系深掘り、Discord過去ログ検索（`/logsearch`）、方向付きメモリ境界。
+* **直近期で実装する内容（2026-04-03確定）:**
+
+   * N100上の `gemma-worker` を使った `/logsearch` の再ランク補助
+   * Main/Research/Gemma の3コンテナ分離運用
+   * 提案1（N100非同期研究補助）と提案2（安全ローカル実行ゲート）の仕様投入
+* **当面の保留（後回し）:** runcli関連の追加強化・再設計。
+* **当面の非対象:** **Eternal Explorer Agent**、カスタムドキュメントRAG。
+* **次段の拡張候補:** ペルソナ抽出専用エージェント、SQLite ACLの詳細化、Gemma補助の品質評価（A/B比較）。
 
 ### 5.1. 完成定義（追記）
 
@@ -746,6 +788,19 @@ SEARCH_COOLDOWN_SEC=45
 READER_TIMEOUT_SEC=12
 READER_MAX_CHARS=5000
 DEEP_DIVE_MAX_QUERIES=3
+RESEARCH_AGENT_GEMMA_ENABLED=false
+RESEARCH_AGENT_GEMMA_ENDPOINT=http://gemma-worker:8093/v1/research/analyze
+RESEARCH_AGENT_GEMMA_TIMEOUT_SEC=180
+RESEARCH_AGENT_GEMMA_TRIGGER_MIN_MINUTES=10
+RESEARCH_AGENT_GEMMA_ALLOW_EXCEPTION_TRIGGER=false
+GEMMA_WORKER_HOST=0.0.0.0
+GEMMA_WORKER_PORT=8093
+GEMMA_WORKER_HTTP_TIMEOUT_SEC=240
+GEMMA_WORKER_RESEARCH_USE_DEEP_DIVE=false
+GEMMA_WORKER_NUM_PREDICT=128
+GEMMA_WORKER_TEMPERATURE=0.2
+OLLAMA_BASE_URL=http://ollama:11434
+OLLAMA_MODEL=gemma4:e2b
 GEMINI_TIMEOUT_SEC=30
 MAX_DISCORD_MESSAGE_LEN=1900
 MENTION_ASK_ENABLED=true
@@ -764,8 +819,12 @@ RUNCLI_AUDIT_EVENT_FILTER_DEFAULT=all
 LOGSEARCH_INCLUDE_SCORE=true
 LOGSEARCH_SCORE_OVERLAP_WEIGHT=0.7
 LOGSEARCH_SCORE_RECENCY_WEIGHT=0.3
-INTERNAL_ALLOWED_ACTIONS=add_calendar_event,get_calendar_events,add_notion_memo,append_sheet_row,create_github_issue,send_email,backup_server_data
-INTERNAL_ACTION_REQUIRED_FIELDS=add_calendar_event:title;get_calendar_events:time_min,time_max;add_notion_memo:title,content,category;append_sheet_row:sheet_name,column_data;create_github_issue:repository,title,body;send_email:to_address,subject,body;backup_server_data:target
+LOGSEARCH_GEMMA_ENABLED=false
+LOGSEARCH_GEMMA_ENDPOINT=http://gemma-worker:8093/v1/logsearch/rerank
+LOGSEARCH_GEMMA_TIMEOUT_SEC=8
+LOGSEARCH_GEMMA_CANDIDATE_MULTIPLIER=3
+INTERNAL_ALLOWED_ACTIONS=add_calendar_event,get_calendar_events,add_task,update_task,delete_task,bulk_update_task_due_date,bulk_delete_by_dates,add_notion_memo,append_sheet_row,create_github_issue,send_email,backup_server_data
+INTERNAL_ACTION_REQUIRED_FIELDS=add_calendar_event:title;get_calendar_events:time_min,time_max;add_task:title;update_task:title,due_date;delete_task:task_id,title;bulk_update_task_due_date:from_dates,to_date;bulk_delete_by_dates:dates;add_notion_memo:title,content,category;append_sheet_row:sheet_name,column_data;create_github_issue:repository,title,body;send_email:to_address,subject,body;backup_server_data:target
 INTERNAL_ACTION_TIMEOUT_SEC=15
 GITHUB_AUTH_URL=https://github.com/settings/tokens
 GITHUB_TOKEN=
@@ -807,10 +866,48 @@ Google AI Studio/Geminiの「検索・地図グラウンディング」は、将
 
 * 実装・検証・実運用は **Dockerコンテナ内で実行**する
 * 現行では、以下を最小要件とする
-   * `docker/Dockerfile.main` / `docker/Dockerfile.research` を用意し、`python:3.11-slim` 系を利用
+   * `docker/Dockerfile.main` / `docker/Dockerfile.research` / `docker/Dockerfile.gemma` を用意し、`python:3.11-slim` 系を利用
    * ルートディレクトリの `.env` を渡して起動可能であること
    * ルートの `data/chromadb` をボリューム永続化できる構成であること
+   * Gemma系は `ollama` と `gemma-worker` を compose profile `gemma` で起動し、`OLLAMA_BASE_URL=http://ollama:11434` を既定とする
 * 追加の管理基盤（Kubernetes等）は現時点の対象外
+
+### 12.13. N100向けディレクトリ分離方針（2026-04-03追記）
+
+Gemma補助を実装する際は、責務分離を維持するため以下の配置を標準とする。
+
+* `src/main_agent/`: Discord受信、即時応答、軽量オーケストレーション
+* `src/research_agent/`: 長時間調査ジョブ、状態管理、非同期通知
+* `src/gemma_worker/`: ローカル推論補助API（rerank/summarize/extract）
+* `src/tools/`: Main/Research/Gemmaから共有される純粋ツール群
+* `data/runtime/`: 監査ログ・チェックポイント・ジョブDB
+* `data/chromadb/`: 会話メモリ永続化
+
+この分離により、Gemma処理を停止してもMain Agentの基本機能（/ask, /deepdive, /logsearch基本検索）を維持できる。
+
+### 12.14. 網羅調査（4段目）起動基準（2026-04-03追記）
+
+4段目の網羅調査エージェント（Gemma 4）の起動基準は以下を既定とする。
+
+* 主条件: ユーザーが時間指定を伴って「じっくり調べる」意図を示した場合
+* 補助条件: 深掘り語（網羅/徹底/全部/比較表など）を含む場合は起動優先度を上げる
+* しきい値: 既定で10分以上の指定を4段目候補とする
+* 例外起動: 高精度が必須な規約比較・学術調査・矛盾解消は時間指定なしでも許可
+* 非対象: 短いQA、即時回答、単純確認、雑談は4段目対象外
+* 切替運用: Heretic派生へ差し替える場合も `.env` の `OLLAMA_MODEL` だけを変えればよいようにし、既定値は N100 安定版のまま維持する
+* 運用確認用の @メンション例: 「いまの返答は Gemma 4 経由ですか？使っているならモデル名、使っていないなら通っていない経路を一行で教えてください。」
+
+4段目出力の標準フォーマット:
+
+* 根拠URL一覧（採用/不採用理由を含む）
+* 要点箇条書き
+* 反証・異説
+* 不確実点（追加調査候補）
+
+品質統制:
+
+* 最終回答文の生成と整合チェックはGemini側で実施する
+* Gemma側は「網羅収集・抽出」中心とし、最終判断責任を持たせない
 
 ### 12.11. 自律ツール判断方針（2026-03-31反映）
 

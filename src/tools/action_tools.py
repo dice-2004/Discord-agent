@@ -9,7 +9,7 @@ import smtplib
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from uuid import uuid4
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -57,6 +57,8 @@ def _normalize_action_name(action: str) -> str:
         "calendar_get_events": "get_calendar_events",
         "create_calendar_event": "add_calendar_event",
         "list_calendar_events": "get_calendar_events",
+        "task_update": "update_task",
+        "task_delete": "delete_task",
     }
     return aliases.get(key, key)
 
@@ -168,6 +170,88 @@ def _parse_date_only(value: object) -> str | None:
     return None
 
 
+def _normalize_mmdd_to_date(token: str, default_year: int) -> str | None:
+    text = (token or "").strip()
+    if not text:
+        return None
+    parts = text.split("/")
+    if len(parts) != 2:
+        return None
+    try:
+        month = int(parts[0])
+        day = int(parts[1])
+        parsed = datetime(default_year, month, day)
+        return parsed.strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+
+def _extract_date_tokens(raw_value: object) -> list[str]:
+    if raw_value is None:
+        return []
+    if isinstance(raw_value, list):
+        tokens: list[str] = []
+        for item in raw_value:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            tokens.extend([part.strip() for part in re.split(r"[,\s]+", text) if part.strip()])
+        return tokens
+
+    text = str(raw_value).strip()
+    if not text:
+        return []
+    return [part.strip() for part in re.split(r"[,\s]+", text) if part.strip()]
+
+
+def _resolve_target_dates(payload: dict[str, object], *, key: str = "dates") -> tuple[list[str], str | None]:
+    default_year = datetime.now().year
+    year_raw = str(payload.get("year", "")).strip()
+    if year_raw:
+        try:
+            default_year = int(year_raw)
+        except Exception:
+            return [], "year は4桁の数値で指定してください。"
+
+    raw = payload.get(key)
+    if raw is None:
+        raw = payload.get("date_list")
+    if raw is None:
+        raw = payload.get("target_dates")
+
+    tokens = _extract_date_tokens(raw)
+    if not tokens:
+        return [], "dates が空です。"
+
+    resolved: list[str] = []
+    seen: set[str] = set()
+    month_context: int | None = None
+    for token in tokens:
+        iso_date = _parse_date_only(token)
+        if not iso_date:
+            iso_date = _normalize_mmdd_to_date(token, default_year)
+            if iso_date:
+                try:
+                    month_context = int(token.split("/")[0])
+                except Exception:
+                    month_context = None
+        # 例: "4/3,4,5,7" のように月が省略された day-only トークンを許可する。
+        if not iso_date and month_context is not None and re.fullmatch(r"\d{1,2}", token):
+            try:
+                day = int(token)
+                parsed = datetime(default_year, month_context, day)
+                iso_date = parsed.strftime("%Y-%m-%d")
+            except Exception:
+                iso_date = None
+        if not iso_date:
+            return [], f"日付形式が不正です: {token}"
+        if iso_date in seen:
+            continue
+        seen.add(iso_date)
+        resolved.append(iso_date)
+    return resolved, None
+
+
 def _calendar_provider() -> str:
     return (os.getenv("CALENDAR_PROVIDER", "google").strip().lower() or "google")
 
@@ -184,6 +268,55 @@ def _google_tasks_auth_url() -> str:
         "GOOGLE_TASKS_AUTH_URL",
         "https://console.cloud.google.com/apis/credentials",
     ).strip()
+
+def _append_local_calendar_event_record(event: dict[str, object]) -> None:
+    storage_path = _calendar_storage_path()
+    storage_path.parent.mkdir(parents=True, exist_ok=True)
+    with storage_path.open("a", encoding="utf-8") as wf:
+        wf.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+def _load_local_calendar_events(min_dt: datetime, max_dt: datetime) -> tuple[list[dict[str, object]], str | None]:
+    storage_path = _calendar_storage_path()
+    if not storage_path.exists():
+        return [], None
+
+    events: list[dict[str, object]] = []
+    try:
+        with storage_path.open("r", encoding="utf-8") as rf:
+            for line in rf:
+                text = line.strip()
+                if not text:
+                    continue
+                try:
+                    event = json.loads(text)
+                except Exception:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+
+                start_dt = _parse_iso8601(event.get("start_time"))
+                end_dt = _parse_iso8601(event.get("end_time"))
+                if start_dt is None and event.get("start_date"):
+                    start_dt = _parse_iso8601(f"{_parse_date_only(event.get('start_date')) or str(event.get('start_date')).strip()}T00:00:00")
+                if end_dt is None and event.get("end_date_exclusive"):
+                    end_dt = _parse_iso8601(f"{_parse_date_only(event.get('end_date_exclusive')) or str(event.get('end_date_exclusive')).strip()}T00:00:00")
+
+                if start_dt is None or end_dt is None:
+                    continue
+                if end_dt > min_dt and start_dt < max_dt:
+                    events.append(
+                        {
+                            "id": str(event.get("id", "")),
+                            "title": str(event.get("title", "")),
+                            "start_time": start_dt.isoformat(),
+                            "end_time": end_dt.isoformat(),
+                            "description": str(event.get("description", "")),
+                        }
+                    )
+    except Exception as exc:
+        return [], _truncate_text(str(exc))
+
+    return events, None
 
 
 def _google_calendar_creds() -> dict[str, str]:
@@ -304,6 +437,23 @@ def _google_calendar_insert_event(
                     "detail": _truncate_text(str(payload)),
                 }
             )
+        try:
+            mirror_event = {
+                "id": str(payload.get("id", "")) or f"cal-{uuid4().hex[:12]}",
+                "title": title,
+                "description": description,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if all_day_start_date and all_day_end_date_exclusive:
+                mirror_event["all_day"] = True
+                mirror_event["start_date"] = all_day_start_date
+                mirror_event["end_date_exclusive"] = all_day_end_date_exclusive
+            else:
+                mirror_event["start_time"] = start_dt.isoformat() if start_dt is not None else ""
+                mirror_event["end_time"] = end_dt.isoformat() if end_dt is not None else ""
+            _append_local_calendar_event_record(mirror_event)
+        except Exception:
+            pass
         return _as_json_line(
             {
                 "status": "ok",
@@ -435,9 +585,250 @@ def _google_tasks_insert_task(title: str, due_date: str | None = None, notes: st
         )
 
 
+def _google_tasks_list_all_tasks() -> tuple[list[dict[str, object]], str | None, int | None]:
+    token, err = _google_access_token()
+    if not token:
+        return [], err or "auth_required", None
+
+    tasks: list[dict[str, object]] = []
+    page_token: str | None = None
+    timeout_sec = _safe_int("INTERNAL_ACTION_TIMEOUT_SEC", 15)
+
+    try:
+        while True:
+            query_params: dict[str, str] = {
+                "showCompleted": "true",
+                "showHidden": "true",
+                "maxResults": "100",
+            }
+            if page_token:
+                query_params["pageToken"] = page_token
+
+            req = Request(
+                f"https://www.googleapis.com/tasks/v1/lists/@default/tasks?{urlencode(query_params)}",
+                method="GET",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json",
+                    "User-Agent": "discord-ai-agent/1.0",
+                },
+            )
+
+            with urlopen(req, timeout=timeout_sec) as res:
+                status = int(getattr(res, "status", 200))
+                raw = res.read().decode("utf-8", errors="replace")
+
+            payload = json.loads(raw) if raw else {}
+            if status != 200:
+                return [], _truncate_text(str(payload)), status
+
+            items = payload.get("items", []) if isinstance(payload, dict) else []
+            for item in items if isinstance(items, list) else []:
+                if isinstance(item, dict):
+                    tasks.append(item)
+
+            page_token = str(payload.get("nextPageToken", "")).strip() if isinstance(payload, dict) else ""
+            if not page_token:
+                break
+
+        return tasks, None, 200
+    except HTTPError as exc:
+        try:
+            raw = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            raw = str(exc)
+        return [], _truncate_text(raw), int(getattr(exc, "code", 500))
+    except Exception as exc:
+        return [], _truncate_text(str(exc)), None
+
+
+def _google_tasks_update_task(
+    task_id: str,
+    *,
+    title: str | None = None,
+    due_date: str | None = None,
+    notes: str | None = None,
+    completed: bool | None = None,
+) -> str:
+    token, err = _google_access_token()
+    if not token:
+        return _as_json_line(
+            {
+                "status": "error",
+                "code": "auth_required",
+                "action": "update_task",
+                "detail": f"Google Tasks認証が未設定または無効です: {err or 'unknown'}",
+            }
+        )
+
+    body: dict[str, object] = {}
+    if title is not None:
+        body["title"] = title
+    if due_date:
+        body["due"] = f"{due_date}T00:00:00.000Z"
+    if notes is not None:
+        body["notes"] = notes
+    if completed is not None:
+        body["status"] = "completed" if completed else "needsAction"
+
+    if not body:
+        return _as_json_line(
+            {
+                "status": "error",
+                "code": "missing_required_fields",
+                "action": "update_task",
+                "detail": "更新内容が空です。",
+            }
+        )
+
+    req = Request(
+        f"https://www.googleapis.com/tasks/v1/lists/@default/tasks/{quote(task_id, safe='')}",
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        method="PATCH",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "discord-ai-agent/1.0",
+        },
+    )
+
+    timeout_sec = _safe_int("INTERNAL_ACTION_TIMEOUT_SEC", 15)
+    try:
+        with urlopen(req, timeout=timeout_sec) as res:
+            status = int(getattr(res, "status", 200))
+            raw = res.read().decode("utf-8", errors="replace")
+        payload = json.loads(raw) if raw else {}
+        if status != 200:
+            return _as_json_line(
+                {
+                    "status": "error",
+                    "code": "update_task_failed",
+                    "action": "update_task",
+                    "status_code": status,
+                    "detail": _truncate_text(str(payload)),
+                }
+            )
+        return _as_json_line(
+            {
+                "status": "ok",
+                "action": "update_task",
+                "task_id": payload.get("id", task_id),
+                "title": payload.get("title", title),
+                "due_date": str(payload.get("due", due_date or ""))[:10] if payload.get("due") or due_date else None,
+                "web_link": payload.get("selfLink") or "https://tasks.google.com",
+            }
+        )
+    except HTTPError as exc:
+        try:
+            raw = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            raw = str(exc)
+        return _as_json_line(
+            {
+                "status": "error",
+                "code": "update_task_failed",
+                "action": "update_task",
+                "status_code": int(getattr(exc, "code", 500)),
+                "detail": _truncate_text(raw),
+            }
+        )
+    except Exception as exc:
+        return _as_json_line(
+            {
+                "status": "error",
+                "code": "update_task_failed",
+                "action": "update_task",
+                "detail": _truncate_text(str(exc)),
+            }
+        )
+
+
+def _google_tasks_delete_task(task_id: str) -> str:
+    token, err = _google_access_token()
+    if not token:
+        return _as_json_line(
+            {
+                "status": "error",
+                "code": "auth_required",
+                "action": "delete_task",
+                "detail": f"Google Tasks認証が未設定または無効です: {err or 'unknown'}",
+            }
+        )
+
+    req = Request(
+        f"https://www.googleapis.com/tasks/v1/lists/@default/tasks/{quote(task_id, safe='')}",
+        method="DELETE",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "discord-ai-agent/1.0",
+        },
+    )
+
+    timeout_sec = _safe_int("INTERNAL_ACTION_TIMEOUT_SEC", 15)
+    try:
+        with urlopen(req, timeout=timeout_sec) as res:
+            status = int(getattr(res, "status", 200))
+            raw = res.read().decode("utf-8", errors="replace") if hasattr(res, "read") else ""
+        if status not in (200, 204):
+            return _as_json_line(
+                {
+                    "status": "error",
+                    "code": "delete_task_failed",
+                    "action": "delete_task",
+                    "status_code": status,
+                    "detail": _truncate_text(raw),
+                }
+            )
+        return _as_json_line(
+            {
+                "status": "ok",
+                "action": "delete_task",
+                "task_id": task_id,
+                "web_link": "https://tasks.google.com",
+            }
+        )
+    except HTTPError as exc:
+        try:
+            raw = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            raw = str(exc)
+        return _as_json_line(
+            {
+                "status": "error",
+                "code": "delete_task_failed",
+                "action": "delete_task",
+                "status_code": int(getattr(exc, "code", 500)),
+                "detail": _truncate_text(raw),
+            }
+        )
+    except Exception as exc:
+        return _as_json_line(
+            {
+                "status": "error",
+                "code": "delete_task_failed",
+                "action": "delete_task",
+                "detail": _truncate_text(str(exc)),
+            }
+        )
+
+
 def _google_calendar_list_events(min_dt: datetime, max_dt: datetime, calendar_id_override: str | None = None) -> str:
     token, err = _google_access_token()
     if not token:
+        local_events, local_err = _load_local_calendar_events(min_dt, max_dt)
+        if local_err is None:
+            return _as_json_line(
+                {
+                    "status": "ok",
+                    "action": "get_calendar_events",
+                    "calendar_id": (calendar_id_override or "").strip() or _google_calendar_creds()["calendar_id"],
+                    "events": local_events,
+                    "count": len(local_events),
+                    "source": "local_cache",
+                }
+            )
         return _as_json_line(
             {
                 "status": "error",
@@ -535,6 +926,19 @@ def _google_calendar_list_events(min_dt: datetime, max_dt: datetime, calendar_id
             raw = exc.read().decode("utf-8", errors="replace")
         except Exception:
             raw = str(exc)
+        local_events, local_err = _load_local_calendar_events(min_dt, max_dt)
+        if local_err is None:
+            return _as_json_line(
+                {
+                    "status": "ok",
+                    "action": "get_calendar_events",
+                    "calendar_id": calendar_id,
+                    "events": local_events,
+                    "count": len(local_events),
+                    "source": "local_cache",
+                    "fallback_detail": _truncate_text(raw),
+                }
+            )
         return _as_json_line(
             {
                 "status": "error",
@@ -545,6 +949,19 @@ def _google_calendar_list_events(min_dt: datetime, max_dt: datetime, calendar_id
             }
         )
     except Exception as exc:
+        local_events, local_err = _load_local_calendar_events(min_dt, max_dt)
+        if local_err is None:
+            return _as_json_line(
+                {
+                    "status": "ok",
+                    "action": "get_calendar_events",
+                    "calendar_id": calendar_id,
+                    "events": local_events,
+                    "count": len(local_events),
+                    "source": "local_cache",
+                    "fallback_detail": _truncate_text(str(exc)),
+                }
+            )
         return _as_json_line(
             {
                 "status": "error",
@@ -553,6 +970,99 @@ def _google_calendar_list_events(min_dt: datetime, max_dt: datetime, calendar_id
                 "detail": _truncate_text(str(exc)),
             }
         )
+
+
+def _google_calendar_delete_event(event_id: str, calendar_id_override: str | None = None) -> str:
+    token, err = _google_access_token()
+    if not token:
+        return _as_json_line(
+            {
+                "status": "error",
+                "code": "auth_required",
+                "action": "delete_calendar_event",
+                "detail": f"Google Calendar認証が未設定または無効です: {err or 'unknown'}",
+                "auth_url": _google_calendar_auth_url(),
+            }
+        )
+
+    creds = _google_calendar_creds()
+    calendar_id = (calendar_id_override or "").strip() or creds["calendar_id"]
+    req = Request(
+        f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events/{quote(event_id, safe='')}",
+        method="DELETE",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "discord-ai-agent/1.0",
+        },
+    )
+
+    timeout_sec = _safe_int("INTERNAL_ACTION_TIMEOUT_SEC", 15)
+    try:
+        with urlopen(req, timeout=timeout_sec) as res:
+            status = int(getattr(res, "status", 200))
+            raw = res.read().decode("utf-8", errors="replace") if hasattr(res, "read") else ""
+        if status not in (200, 204):
+            return _as_json_line(
+                {
+                    "status": "error",
+                    "code": "delete_calendar_event_failed",
+                    "action": "delete_calendar_event",
+                    "event_id": event_id,
+                    "status_code": status,
+                    "detail": _truncate_text(raw),
+                }
+            )
+        return _as_json_line(
+            {
+                "status": "ok",
+                "action": "delete_calendar_event",
+                "event_id": event_id,
+                "calendar_id": calendar_id,
+            }
+        )
+    except HTTPError as exc:
+        try:
+            raw = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            raw = str(exc)
+        return _as_json_line(
+            {
+                "status": "error",
+                "code": "delete_calendar_event_failed",
+                "action": "delete_calendar_event",
+                "event_id": event_id,
+                "status_code": int(getattr(exc, "code", 500)),
+                "detail": _truncate_text(raw),
+            }
+        )
+    except Exception as exc:
+        return _as_json_line(
+            {
+                "status": "error",
+                "code": "delete_calendar_event_failed",
+                "action": "delete_calendar_event",
+                "event_id": event_id,
+                "detail": _truncate_text(str(exc)),
+            }
+        )
+
+
+def _iso_day_of(value: object) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+
+    if len(text) >= 10:
+        direct = _parse_date_only(text[:10])
+        if direct:
+            return direct
+
+    parsed = _parse_iso8601(text)
+    if parsed is not None:
+        return parsed.date().strftime("%Y-%m-%d")
+
+    return _parse_date_only(text)
 
 
 def _parse_allowed_roots() -> list[Path]:
@@ -709,7 +1219,6 @@ def _handle_add_calendar_event(payload: dict[str, object]) -> str:
 
         if _calendar_provider() == "local":
             storage_path = _calendar_storage_path()
-            storage_path.parent.mkdir(parents=True, exist_ok=True)
             event = {
                 "id": f"cal-{uuid4().hex[:12]}",
                 "title": title,
@@ -720,8 +1229,7 @@ def _handle_add_calendar_event(payload: dict[str, object]) -> str:
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
             try:
-                with storage_path.open("a", encoding="utf-8") as wf:
-                    wf.write(json.dumps(event, ensure_ascii=False) + "\n")
+                    _append_local_calendar_event_record(event)
             except Exception as exc:
                 return _as_json_line(
                     {
@@ -777,7 +1285,6 @@ def _handle_add_calendar_event(payload: dict[str, object]) -> str:
 
     if _calendar_provider() == "local":
         storage_path = _calendar_storage_path()
-        storage_path.parent.mkdir(parents=True, exist_ok=True)
         event = {
             "id": f"cal-{uuid4().hex[:12]}",
             "title": title,
@@ -787,8 +1294,7 @@ def _handle_add_calendar_event(payload: dict[str, object]) -> str:
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         try:
-            with storage_path.open("a", encoding="utf-8") as wf:
-                wf.write(json.dumps(event, ensure_ascii=False) + "\n")
+            _append_local_calendar_event_record(event)
         except Exception as exc:
             return _as_json_line(
                 {
@@ -852,6 +1358,321 @@ def _handle_add_task(payload: dict[str, object]) -> str:
     return _google_tasks_insert_task(title=title, due_date=due_date, notes=notes)
 
 
+def _handle_update_task(payload: dict[str, object]) -> str:
+    search_title = str(
+        payload.get("title", "")
+        or payload.get("task_title", "")
+        or payload.get("old_title", "")
+        or payload.get("query", "")
+    ).strip()
+    task_id = str(payload.get("task_id", "")).strip()
+    new_title = str(payload.get("new_title", "")).strip() or None
+    due_date_text = str(payload.get("due_date", "")).strip() or str(payload.get("date", "")).strip()
+    notes = str(payload.get("notes", "")).strip() or str(payload.get("description", "")).strip() or None
+    completed = payload.get("completed")
+
+    due_date = None
+    if due_date_text:
+        due_date = _parse_date_only(due_date_text)
+        if not due_date:
+            return _as_json_line(
+                {
+                    "status": "error",
+                    "code": "invalid_date_format",
+                    "action": "update_task",
+                    "detail": f"期限の日付形式が不正です: {due_date_text}",
+                }
+            )
+
+    if not task_id:
+        if not search_title:
+            return _as_json_line(
+                {
+                    "status": "error",
+                    "code": "missing_required_fields",
+                    "action": "update_task",
+                    "required": ["title or task_id", "due_date"],
+                }
+            )
+        tasks, err, status_code = _google_tasks_list_all_tasks()
+        if err is not None:
+            return _as_json_line(
+                {
+                    "status": "error",
+                    "code": "update_task_failed",
+                    "action": "update_task",
+                    "status_code": status_code,
+                    "detail": err,
+                }
+            )
+
+        matches = [task for task in tasks if str(task.get("title", "")).strip() == search_title]
+        if not matches:
+            matches = [task for task in tasks if search_title and search_title in str(task.get("title", ""))]
+        if not matches:
+            return _as_json_line(
+                {
+                    "status": "error",
+                    "code": "task_not_found",
+                    "action": "update_task",
+                    "title": search_title,
+                }
+            )
+        task_id = str(matches[0].get("id", "")).strip()
+
+    if not due_date and new_title is None and notes is None and completed is None:
+        return _as_json_line(
+            {
+                "status": "error",
+                "code": "missing_required_fields",
+                "action": "update_task",
+                "required": ["due_date"],
+            }
+        )
+
+    return _google_tasks_update_task(
+        task_id=task_id,
+        title=new_title,
+        due_date=due_date,
+        notes=notes,
+        completed=completed if isinstance(completed, bool) else None,
+    )
+
+
+def _handle_delete_task(payload: dict[str, object]) -> str:
+    task_id = str(payload.get("task_id", "")).strip()
+    title_hint = str(
+        payload.get("title", "")
+        or payload.get("task_title", "")
+        or payload.get("query", "")
+    ).strip()
+
+    if not task_id:
+        if not title_hint:
+            return _as_json_line(
+                {
+                    "status": "error",
+                    "code": "missing_required_fields",
+                    "action": "delete_task",
+                    "required": ["task_id or title"],
+                }
+            )
+        tasks, err, status_code = _google_tasks_list_all_tasks()
+        if err is not None:
+            return _as_json_line(
+                {
+                    "status": "error",
+                    "code": "delete_task_failed",
+                    "action": "delete_task",
+                    "status_code": status_code,
+                    "detail": err,
+                }
+            )
+
+        matches = [task for task in tasks if str(task.get("title", "")).strip() == title_hint]
+        if not matches:
+            matches = [task for task in tasks if title_hint and title_hint in str(task.get("title", ""))]
+        if not matches:
+            return _as_json_line(
+                {
+                    "status": "error",
+                    "code": "task_not_found",
+                    "action": "delete_task",
+                    "title": title_hint,
+                }
+            )
+        task_id = str(matches[0].get("id", "")).strip()
+
+    return _google_tasks_delete_task(task_id)
+
+
+def _handle_bulk_update_task_due_date(payload: dict[str, object]) -> str:
+    from_dates, date_err = _resolve_target_dates(payload, key="from_dates")
+    if date_err is not None:
+        return _as_json_line(
+            {
+                "status": "error",
+                "code": "invalid_date_format",
+                "action": "bulk_update_task_due_date",
+                "detail": date_err,
+            }
+        )
+
+    to_date_text = str(payload.get("to_date", "")).strip()
+    to_date = _parse_date_only(to_date_text)
+    if not to_date:
+        return _as_json_line(
+            {
+                "status": "error",
+                "code": "invalid_date_format",
+                "action": "bulk_update_task_due_date",
+                "detail": "to_date は YYYY-MM-DD 形式で指定してください。",
+            }
+        )
+
+    tasks, err, status_code = _google_tasks_list_all_tasks()
+    if err is not None:
+        return _as_json_line(
+            {
+                "status": "error",
+                "code": "bulk_update_task_due_date_failed",
+                "action": "bulk_update_task_due_date",
+                "status_code": status_code,
+                "detail": err,
+            }
+        )
+
+    targets: list[dict[str, object]] = []
+    from_set = set(from_dates)
+    for task in tasks:
+        due_day = _iso_day_of(task.get("due"))
+        if due_day and due_day in from_set:
+            targets.append(task)
+
+    updated: list[dict[str, object]] = []
+    failed: list[dict[str, object]] = []
+    for task in targets:
+        task_id = str(task.get("id", "")).strip()
+        if not task_id:
+            failed.append({"task_id": "", "title": str(task.get("title", "")), "detail": "missing_task_id"})
+            continue
+
+        result = json.loads(_google_tasks_update_task(task_id=task_id, due_date=to_date))
+        if result.get("status") == "ok":
+            updated.append({"task_id": task_id, "title": str(task.get("title", "")), "to_date": to_date})
+        else:
+            failed.append(
+                {
+                    "task_id": task_id,
+                    "title": str(task.get("title", "")),
+                    "detail": str(result.get("detail", result.get("code", "unknown_error"))),
+                }
+            )
+
+    return _as_json_line(
+        {
+            "status": "ok" if not failed else "partial",
+            "action": "bulk_update_task_due_date",
+            "from_dates": from_dates,
+            "to_date": to_date,
+            "matched_count": len(targets),
+            "updated_count": len(updated),
+            "failed_count": len(failed),
+            "updated": updated,
+            "failed": failed,
+        }
+    )
+
+
+def _handle_bulk_delete_by_dates(payload: dict[str, object]) -> str:
+    dates, date_err = _resolve_target_dates(payload, key="dates")
+    if date_err is not None:
+        return _as_json_line(
+            {
+                "status": "error",
+                "code": "invalid_date_format",
+                "action": "bulk_delete_by_dates",
+                "detail": date_err,
+            }
+        )
+
+    delete_tasks = _as_bool(payload.get("delete_tasks", True))
+    delete_calendar = _as_bool(payload.get("delete_calendar", True))
+    date_set = set(dates)
+
+    task_deleted: list[dict[str, object]] = []
+    task_failed: list[dict[str, object]] = []
+    if delete_tasks:
+        tasks, err, status_code = _google_tasks_list_all_tasks()
+        if err is not None:
+            task_failed.append(
+                {
+                    "scope": "tasks",
+                    "detail": err,
+                    "status_code": status_code,
+                }
+            )
+        else:
+            for task in tasks:
+                due_day = _iso_day_of(task.get("due"))
+                if not due_day or due_day not in date_set:
+                    continue
+                task_id = str(task.get("id", "")).strip()
+                if not task_id:
+                    task_failed.append({"scope": "tasks", "title": str(task.get("title", "")), "detail": "missing_task_id"})
+                    continue
+                result = json.loads(_google_tasks_delete_task(task_id))
+                if result.get("status") == "ok":
+                    task_deleted.append({"task_id": task_id, "title": str(task.get("title", "")), "due_date": due_day})
+                else:
+                    task_failed.append(
+                        {
+                            "scope": "tasks",
+                            "task_id": task_id,
+                            "title": str(task.get("title", "")),
+                            "detail": str(result.get("detail", result.get("code", "unknown_error"))),
+                        }
+                    )
+
+    event_deleted: list[dict[str, object]] = []
+    event_failed: list[dict[str, object]] = []
+    if delete_calendar:
+        min_date = min(dates)
+        max_date = max(dates)
+        min_dt = _parse_iso8601(f"{min_date}T00:00:00+09:00")
+        max_dt = _parse_iso8601(f"{max_date}T23:59:59+09:00")
+        if min_dt is None or max_dt is None:
+            event_failed.append({"scope": "calendar", "detail": "failed_to_build_time_range"})
+        else:
+            list_res = json.loads(_google_calendar_list_events(min_dt=min_dt, max_dt=max_dt + timedelta(seconds=1)))
+            if list_res.get("status") != "ok":
+                event_failed.append(
+                    {
+                        "scope": "calendar",
+                        "detail": str(list_res.get("detail", list_res.get("code", "list_failed"))),
+                    }
+                )
+            else:
+                events = list_res.get("events", [])
+                for event in events if isinstance(events, list) else []:
+                    if not isinstance(event, dict):
+                        continue
+                    start_day = _iso_day_of(event.get("start_time"))
+                    if not start_day or start_day not in date_set:
+                        continue
+                    event_id = str(event.get("id", "")).strip()
+                    if not event_id:
+                        event_failed.append({"scope": "calendar", "title": str(event.get("title", "")), "detail": "missing_event_id"})
+                        continue
+                    result = json.loads(_google_calendar_delete_event(event_id))
+                    if result.get("status") == "ok":
+                        event_deleted.append({"event_id": event_id, "title": str(event.get("title", "")), "date": start_day})
+                    else:
+                        event_failed.append(
+                            {
+                                "scope": "calendar",
+                                "event_id": event_id,
+                                "title": str(event.get("title", "")),
+                                "detail": str(result.get("detail", result.get("code", "unknown_error"))),
+                            }
+                        )
+
+    failed_count = len(task_failed) + len(event_failed)
+    return _as_json_line(
+        {
+            "status": "ok" if failed_count == 0 else "partial",
+            "action": "bulk_delete_by_dates",
+            "dates": dates,
+            "task_deleted_count": len(task_deleted),
+            "event_deleted_count": len(event_deleted),
+            "failed_count": failed_count,
+            "task_deleted": task_deleted,
+            "event_deleted": event_deleted,
+            "failed": task_failed + event_failed,
+        }
+    )
+
+
 def _handle_get_calendar_events(payload: dict[str, object]) -> str:
     time_min_text = str(payload.get("time_min", "")).strip()
     time_max_text = str(payload.get("time_max", "")).strip()
@@ -880,51 +1701,14 @@ def _handle_get_calendar_events(payload: dict[str, object]) -> str:
 
     if _calendar_provider() == "local":
         storage_path = _calendar_storage_path()
-        if not storage_path.exists():
-            return _as_json_line(
-                {
-                    "status": "ok",
-                    "action": "get_calendar_events",
-                    "events": [],
-                    "count": 0,
-                    "storage_path": str(storage_path),
-                }
-            )
-
-        events: list[dict[str, object]] = []
-        try:
-            with storage_path.open("r", encoding="utf-8") as rf:
-                for line in rf:
-                    text = line.strip()
-                    if not text:
-                        continue
-                    try:
-                        event = json.loads(text)
-                    except Exception:
-                        continue
-                    if not isinstance(event, dict):
-                        continue
-                    start_dt = _parse_iso8601(event.get("start_time"))
-                    end_dt = _parse_iso8601(event.get("end_time"))
-                    if start_dt is None or end_dt is None:
-                        continue
-                    if end_dt > min_dt and start_dt < max_dt:
-                        events.append(
-                            {
-                                "id": str(event.get("id", "")),
-                                "title": str(event.get("title", "")),
-                                "start_time": start_dt.isoformat(),
-                                "end_time": end_dt.isoformat(),
-                                "description": str(event.get("description", "")),
-                            }
-                        )
-        except Exception as exc:
+        events, err = _load_local_calendar_events(min_dt, max_dt)
+        if err is not None:
             return _as_json_line(
                 {
                     "status": "error",
                     "code": "get_calendar_events_failed",
                     "action": "get_calendar_events",
-                    "detail": _truncate_text(str(exc)),
+                    "detail": err,
                 }
             )
 
@@ -970,17 +1754,38 @@ def _handle_append_sheet_row(payload: dict[str, object]) -> str:
                 "detail": "sheet_name は英数字・_・- を含む名前で指定してください。",
             }
         )
-    if not isinstance(raw_columns, dict) or not raw_columns:
+    if isinstance(raw_columns, dict):
+        if not raw_columns:
+            return _as_json_line(
+                {
+                    "status": "error",
+                    "code": "invalid_column_data",
+                    "action": "append_sheet_row",
+                    "detail": "column_data は空でないJSONオブジェクトで指定してください。",
+                }
+            )
+        column_data = {str(k): str(v) for k, v in raw_columns.items()}
+    elif isinstance(raw_columns, list):
+        if not raw_columns:
+            return _as_json_line(
+                {
+                    "status": "error",
+                    "code": "invalid_column_data",
+                    "action": "append_sheet_row",
+                    "detail": "column_data は空でないJSON配列で指定してください。",
+                }
+            )
+        column_data = {f"col{i + 1}": str(v) for i, v in enumerate(raw_columns)}
+    else:
         return _as_json_line(
             {
                 "status": "error",
                 "code": "invalid_column_data",
                 "action": "append_sheet_row",
-                "detail": "column_data は空でないJSONオブジェクトで指定してください。",
+                "detail": "column_data はJSONオブジェクトまたはJSON配列で指定してください。",
             }
         )
 
-    column_data = {str(k): str(v) for k, v in raw_columns.items()}
     header = sorted(column_data.keys())
 
     storage_dir = Path(os.getenv("SHEET_STORAGE_DIR", "./data/runtime/sheets")).expanduser().resolve()
@@ -1280,6 +2085,65 @@ def execute_internal_action(action: str, payload_json: str = "{}") -> str:
                     "detail": "add_calendar_event は timed(start_time,end_time) か all_day(date) のどちらかが必要です。",
                 }
             )
+    elif clean_action == "update_task":
+        # update_task は task_id 指定、または title 指定で対象解決できればよい。
+        # 汎用 required_fields では OR 条件を表現できないため個別検証する。
+        has_task_id = bool(str(payload.get("task_id", "")).strip())
+        has_title = bool(str(payload.get("title", "")).strip())
+        if not has_task_id and not has_title:
+            return _as_json_line(
+                {
+                    "status": "error",
+                    "code": "missing_required_fields",
+                    "action": clean_action,
+                    "required": ["task_id or title"],
+                }
+            )
+    elif clean_action == "delete_task":
+        # delete_task は task_id か title のどちらかがあれば実行できる。
+        has_task_id = bool(str(payload.get("task_id", "")).strip())
+        has_title = bool(str(payload.get("title", "") or payload.get("task_title", "") or payload.get("query", "")).strip())
+        if not has_task_id and not has_title:
+            return _as_json_line(
+                {
+                    "status": "error",
+                    "code": "missing_required_fields",
+                    "action": clean_action,
+                    "required": ["task_id or title"],
+                }
+            )
+    elif clean_action == "bulk_update_task_due_date":
+        from_dates, from_err = _resolve_target_dates(payload, key="from_dates")
+        if from_err is not None or not from_dates:
+            return _as_json_line(
+                {
+                    "status": "error",
+                    "code": "missing_required_fields",
+                    "action": clean_action,
+                    "required": ["from_dates", "to_date"],
+                }
+            )
+        to_date = _parse_date_only(payload.get("to_date"))
+        if not to_date:
+            return _as_json_line(
+                {
+                    "status": "error",
+                    "code": "invalid_date_format",
+                    "action": clean_action,
+                    "detail": "to_date は YYYY-MM-DD 形式で指定してください。",
+                }
+            )
+    elif clean_action == "bulk_delete_by_dates":
+        dates, dates_err = _resolve_target_dates(payload, key="dates")
+        if dates_err is not None or not dates:
+            return _as_json_line(
+                {
+                    "status": "error",
+                    "code": "missing_required_fields",
+                    "action": clean_action,
+                    "required": ["dates"],
+                }
+            )
     else:
         required_fields = _required_fields_map().get(clean_action, [])
         missing = [name for name in required_fields if name not in payload]
@@ -1305,6 +2169,18 @@ def execute_internal_action(action: str, payload_json: str = "{}") -> str:
 
     if clean_action == "add_task":
         return _handle_add_task(payload)
+
+    if clean_action == "update_task":
+        return _handle_update_task(payload)
+
+    if clean_action == "delete_task":
+        return _handle_delete_task(payload)
+
+    if clean_action == "bulk_update_task_due_date":
+        return _handle_bulk_update_task_due_date(payload)
+
+    if clean_action == "bulk_delete_by_dates":
+        return _handle_bulk_delete_by_dates(payload)
 
     if clean_action == "send_email":
         return _handle_send_email(payload)

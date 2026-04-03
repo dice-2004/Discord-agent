@@ -10,6 +10,8 @@ services:
       - ./data/chromadb:/app/data/chromadb
       - ./data/profiles:/app/data/profiles
       - ./data/runtime:/app/data/runtime
+    depends_on:
+      - research-agent
     restart: unless-stopped
 
   research-agent:
@@ -19,6 +21,41 @@ services:
     container_name: research-agent
     env_file:
       - ./.env
+    volumes:
+      - ./data/runtime:/app/data/runtime
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    profiles:
+      - gemma
+    env_file:
+      - ./.env
+    volumes:
+      - ./data/ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    restart: unless-stopped
+
+  gemma-worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.gemma
+    container_name: gemma-worker
+    env_file:
+      - ./.env
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
+    profiles:
+      - gemma
+    depends_on:
+      ollama:
+        condition: service_healthy
     volumes:
       - ./data/runtime:/app/data/runtime
     restart: unless-stopped

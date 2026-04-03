@@ -239,6 +239,19 @@ class DiscordOrchestrator:
                 reason="explicit_global_source_query_without_followup",
                 question=retrieval_question,
             )
+        elif (
+            not has_followup_marker
+            and not recall_intent
+            and self._is_general_knowledge_query(retrieval_question)
+        ):
+            use_history_context = False
+            retrieval_scope = "disabled(general_knowledge_query)"
+            self._log_ai_thought(
+                stage="memory_context_policy",
+                action="skip_history_context",
+                reason="general_knowledge_query",
+                question=retrieval_question,
+            )
 
         if use_history_context:
             retrieval_guild_ids = self._resolve_retrieval_guild_ids(guild_id)
@@ -578,6 +591,14 @@ class DiscordOrchestrator:
                         requested_timeout or "(none)",
                         str(args.get("timeout_sec", "")).strip() or "(default)",
                     )
+                    logger.info(
+                        "[route] main-agent -> research-agent tool=%s topic=%s source=%s mode=%s timeout_sec=%s",
+                        tool_name,
+                        str(args.get("topic", ""))[:160],
+                        str(args.get("source", "")),
+                        str(args.get("mode", "")),
+                        str(args.get("timeout_sec", "")).strip() or "(default)",
+                    )
                     signature = self._research_dispatch_signature(args)
                     if signature in executed_research_signatures and scratchpad:
                         self._log_ai_thought(
@@ -602,6 +623,12 @@ class DiscordOrchestrator:
                     executed_research_signatures.add(signature)
 
                 logger.info("Tool execution: %s (%s/%s)", tool_name, turn, self.max_tool_turns)
+                logger.info(
+                    "[route] main-agent -> tool tool=%s turn=%s args=%s",
+                    tool_name,
+                    turn,
+                    json.dumps(args, ensure_ascii=False)[:500],
+                )
                 tool_output = await asyncio.to_thread(self.tool_registry.execute, tool_name, args)
                 preview = (tool_output or "").replace("\n", " ")[:180]
                 logger.info(
@@ -621,6 +648,7 @@ class DiscordOrchestrator:
 
             response = str(decision.get("response", "")).strip()
             if response:
+                logger.info("[route] main-agent -> respond turn=%s", turn)
                 if self._is_nonfinal_response(response):
                     had_tool_context = bool(scratchpad)
                     scratchpad.append(f"[Agent] 非最終応答を検知: {response[:120]}")
@@ -894,6 +922,7 @@ class DiscordOrchestrator:
             return True
         patterns = [
             "回答を組み立て中に形式エラーが発生しました",
+            "回答の内部整形で一時的な問題が発生しました",
             "質問を短くして再試行してください",
             "回答を生成できませんでした",
             "現在AI応答で問題が発生しています",
@@ -907,6 +936,10 @@ class DiscordOrchestrator:
             return body
         body = body.replace(
             "回答を組み立て中に形式エラーが発生しました。質問を短くして再試行してください。",
+            "回答の内部整形で一時的な問題が発生しました。しばらく待って再試行してください。",
+        )
+        body = body.replace(
+            "回答の内部整形で一時的な問題が発生しました。再構成して続行します。",
             "回答の内部整形で一時的な問題が発生しました。しばらく待って再試行してください。",
         )
         body = body.replace(
@@ -1012,6 +1045,16 @@ class DiscordOrchestrator:
         source_terms = (
             "agent-reach",
             "agent reach",
+            "api",
+            "gemini",
+            "kubernetes",
+            "docker",
+            "python",
+            "discord",
+            "google",
+            "calendar",
+            "tasks",
+            "notion",
             "x.com",
             "twitter",
             "ツイッター",
@@ -1044,6 +1087,17 @@ class DiscordOrchestrator:
             "口コミ",
             "出典",
             "ソース",
+            "対策",
+            "解決",
+            "実例",
+            "事例",
+            "失敗",
+            "失敗例",
+            "運用",
+            "方法",
+            "手順",
+            "導入",
+            "違い",
         )
 
         has_source_term = any(term in text for term in source_terms)
@@ -1104,6 +1158,7 @@ class DiscordOrchestrator:
         text = (question or "").strip().lower()
         if not text:
             return False
+        text = re.sub(r"「[^」]*」|『[^』]*』|\"[^\"]*\"", "", text)
         markers = (
             "それ",
             "その",
@@ -1199,6 +1254,40 @@ class DiscordOrchestrator:
         return has_source and (has_global_scope or has_source_latest_phrase)
 
     @staticmethod
+    def _is_general_knowledge_query(text: str) -> bool:
+        lowered = (text or "").strip().lower()
+        if not lowered:
+            return False
+
+        # 明示的な過去参照や自己参照は履歴利用対象。
+        if DiscordOrchestrator._has_followup_marker(lowered) or DiscordOrchestrator._is_history_recall_query(lowered):
+            return False
+        if re.search(r"(私|ぼく|僕|俺|わたし|自分|このサーバー|このチャンネル|さっき|前回)", lowered):
+            return False
+
+        # URLやリポジトリ指定がある場合は一般知識とはみなさない。
+        if re.search(r"https?://", lowered) or re.search(r"[a-z0-9_.-]+/[a-z0-9_.-]+", lowered):
+            return False
+
+        generic_markers = (
+            "とは",
+            "意味",
+            "使い方",
+            "標準ライブラリ",
+            "メリット",
+            "デメリット",
+            "違い",
+            "比較",
+            "なに",
+            "何",
+            "教えて",
+            "解説",
+            "仕組み",
+            "方法",
+        )
+        return any(marker in lowered for marker in generic_markers)
+
+    @staticmethod
     def _extract_followup_topic_from_recent_context(question: str) -> str:
         text = question or ""
         marker = "[Recent Conversation]"
@@ -1219,6 +1308,17 @@ class DiscordOrchestrator:
             content = re.sub(r"<@!?\d+>", "", content).strip()
             if content:
                 user_lines.append(content)
+
+        for content in reversed(user_lines):
+            lowered = content.lower()
+            if DiscordOrchestrator._has_followup_marker(lowered):
+                continue
+            if re.search(r"(深掘り|掘り下げ|もっと詳しく|もう少し|詳しく|続けて|追加で|その点|この点)", lowered):
+                continue
+            if re.fullmatch(r"[\s\W_]*", content):
+                continue
+            return content
+
         return user_lines[-1] if user_lines else ""
 
     @staticmethod
@@ -1247,6 +1347,15 @@ class DiscordOrchestrator:
         time_pattern = re.compile(r"\d+\s*(?:分|秒)(?:間)?")
         focus_tokens = DiscordOrchestrator._extract_focus_tokens_for_recall(normalized_question)
         question_has_time = bool(time_pattern.search(normalized_question))
+        recall_question = any(cue in normalized_question for cue in recall_cues)
+        recency_threshold = None
+        if recall_question:
+            timestamps = sorted(
+                (DiscordOrchestrator._timestamp_sort_key(record.timestamp) for record in records),
+                reverse=True,
+            )
+            if timestamps:
+                recency_threshold = timestamps[min(3, len(timestamps) - 1)]
 
         ranked: list[tuple[int, float, int, MemoryRecord]] = []
         for idx, record in enumerate(records):
@@ -1275,6 +1384,8 @@ class DiscordOrchestrator:
                 score -= 6
             if normalized_question and normalized_question in lowered:
                 score -= 3
+            if recency_threshold is not None and DiscordOrchestrator._timestamp_sort_key(record.timestamp) >= recency_threshold:
+                score += 8
 
             ts_value = DiscordOrchestrator._timestamp_sort_key(record.timestamp)
             ranked.append((score, ts_value, -idx, record))

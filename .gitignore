@@ -4,6 +4,7 @@ __pycache__/
 
 .env
 data/chromadb/
+data/ollama/
 data/profiles/*.local.md
 data/runtime/
 data/audit/
