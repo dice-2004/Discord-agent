@@ -411,7 +411,6 @@ def _run_research(
 ) -> tuple[str, str | None, str, list[dict[str, Any]], str]:
     clean_mode = (mode or "auto").strip().lower() or "auto"
     decision_log: list[dict[str, Any]] = []
-    allow_gemma_fallback = os.getenv("RESEARCH_AGENT_GEMMA_FALLBACK_TO_GEMINI", "true").strip().lower() == "true"
     logger.info(
         "[research-agent][run] start topic=%s source=%s mode=%s time_specified=%s timeout_sec=%s",
         topic,
@@ -421,103 +420,21 @@ def _run_research(
         timeout_sec,
     )
 
-    gemma_enabled = os.getenv("RESEARCH_AGENT_GEMMA_ENABLED", "false").strip().lower() == "true"
-    min_minutes = max(1, _safe_int("RESEARCH_AGENT_GEMMA_TRIGGER_MIN_MINUTES", 10))
-    allow_exception = os.getenv("RESEARCH_AGENT_GEMMA_ALLOW_EXCEPTION_TRIGGER", "false").strip().lower() == "true"
-    has_deep_intent = _contains_deep_intent(topic)
-    is_exception_task = _is_high_precision_exception_task(topic)
-    gemma_triggered = _should_trigger_gemma_stage(topic=topic, timeout_sec=timeout_sec, time_specified=time_specified)
-    logger.info(
-        "[research-agent][gemma] decision enabled=%s triggered=%s time_specified=%s timeout_sec=%s min_minutes=%s deep_intent=%s exception_task=%s allow_exception=%s auto_prefer_orchestrator=%s",
-        gemma_enabled,
-        gemma_triggered,
-        time_specified,
-        timeout_sec,
-        min_minutes,
-        has_deep_intent,
-        is_exception_task,
-        allow_exception,
-        "n/a",
-    )
-    decision_log.append(
-        {
-            "stage": "gemma_trigger_decision",
-            "triggered": gemma_triggered,
-            "time_specified": time_specified,
-            "timeout_sec": timeout_sec,
-            "gemma_enabled": gemma_enabled,
-            "min_minutes": min_minutes,
-            "has_deep_intent": has_deep_intent,
-            "is_exception_task": is_exception_task,
-            "allow_exception": allow_exception,
-            "auto_prefer_orchestrator": False,
-        }
-    )
-
     transcript = ""
-    if clean_mode == "gemini_cli":
-        logger.info("[route] research-agent mode=gemini_cli path=gemini-api")
-        report, transcript, runner_log, err = _coerce_runner_result(
-            _run_gemini_runner(topic=topic, source=source, timeout_sec=timeout_sec)
-        )
-        engine = "gemini_api"
-    elif clean_mode == "fallback":
-        logger.info("[route] research-agent mode=fallback path=gemma-worker")
-        report, transcript, runner_log, err = _coerce_runner_result(
-            _run_gemma_worker(
-                topic=topic,
-                source=source,
-                initial_report="",
-                timeout_sec=timeout_sec,
-            )
-        )
-        engine = "gemma4"
-    elif gemma_triggered:
-        logger.info("[route] research-agent mode=auto path=gemma-worker gemma_triggered=%s", gemma_triggered)
-        report, transcript, runner_log, err = _coerce_runner_result(
-            _run_gemma_worker(
-                topic=topic,
-                source=source,
-                initial_report="",
-                timeout_sec=timeout_sec,
-            )
-        )
-        engine = "gemma4"
-    else:
-        logger.info("[route] research-agent mode=auto path=gemini-api gemma_triggered=%s", gemma_triggered)
-        report, transcript, runner_log, err = _coerce_runner_result(
-            _run_gemini_runner(topic=topic, source=source, timeout_sec=timeout_sec)
-        )
-        engine = "gemini_api"
+    if clean_mode not in {"auto", "gemini_cli", "fallback"}:
+        logger.warning("[research-agent][run] unknown mode=%s; defaulting to gemini-api", clean_mode)
+    logger.info("[route] research-agent mode=%s path=gemini-api", clean_mode)
+    report, transcript, runner_log, err = _coerce_runner_result(
+        _run_gemini_runner(topic=topic, source=source, timeout_sec=timeout_sec)
+    )
+    engine = "gemini_api"
 
     decision_log.extend(runner_log)
     if err:
-        if engine == "gemma4" and allow_gemma_fallback:
-            logger.warning("[research-agent][run] gemma failed; fallback to gemini-api err=%s", err)
-            decision_log.append({"stage": "fallback", "from": "gemma4", "to": "gemini_api", "reason": str(err)[:400]})
-            fb_timeout = max(60, min(timeout_sec, timeout_sec // 2 if timeout_sec > 120 else timeout_sec))
-            fb_report, fb_transcript, fb_log, fb_err = _coerce_runner_result(
-                _run_gemini_runner(topic=topic, source=source, timeout_sec=fb_timeout)
-            )
-            decision_log.extend(fb_log)
-            if not fb_err and _report_is_returnable(fb_report):
-                return fb_report[:12000], None, "gemma4->gemini_api", decision_log, fb_transcript
-            if fb_err:
-                decision_log.append({"stage": "fallback", "status": "failed", "detail": str(fb_err)[:400]})
         logger.warning("[research-agent][run] runner failed engine=%s err=%s", engine, err)
         return "", err, engine, decision_log, transcript
 
     if not _report_is_returnable(report):
-        if engine == "gemma4" and allow_gemma_fallback:
-            logger.warning("[research-agent][run] gemma weak report; fallback to gemini-api report_chars=%s", len(report))
-            decision_log.append({"stage": "fallback", "from": "gemma4", "to": "gemini_api", "reason": "weak_report"})
-            fb_timeout = max(60, min(timeout_sec, timeout_sec // 2 if timeout_sec > 120 else timeout_sec))
-            fb_report, fb_transcript, fb_log, fb_err = _coerce_runner_result(
-                _run_gemini_runner(topic=topic, source=source, timeout_sec=fb_timeout)
-            )
-            decision_log.extend(fb_log)
-            if not fb_err and _report_is_returnable(fb_report):
-                return fb_report[:12000], None, "gemma4->gemini_api", decision_log, fb_transcript
         logger.warning("[research-agent][run] report looks weak engine=%s report_chars=%s", engine, len(report))
         decision_log.append({"stage": "review", "status": "weak_report", "engine": engine, "report_chars": len(report)})
         if not report.strip():
