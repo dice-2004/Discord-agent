@@ -79,6 +79,7 @@ def run_model_research_loop(
 
         if action == "tool":
             tool_name, tool_args = _normalize_tool_call(topic=topic, source=source, tool_name=tool_name, decision=decision, turn=turn, scratchpad=scratchpad)
+            logger.info("[route] %s -> tool:%s turn=%s", loop_label, tool_name, turn)
             tool_result = registry.execute(tool_name, tool_args)
             tool_summary = _summarize_tool_result(tool_result, tool_name)
             scratchpad.append(tool_summary)
@@ -92,6 +93,7 @@ def run_model_research_loop(
         final_candidate = str(decision.get("response", "") or response_text).strip()
         if turn < target_turns and elapsed < timeout_sec:
             forced_tool, forced_args = _select_forced_tool(topic=topic, turn=turn, scratchpad=scratchpad)
+            logger.info("[route] %s -> forced_tool:%s turn=%s", loop_label, forced_tool, turn)
             forced_result = registry.execute(forced_tool, forced_args)
             forced_summary = _summarize_tool_result(forced_result, forced_tool)
             scratchpad.append(forced_summary)

@@ -6,13 +6,13 @@ import asyncio
 import json
 import logging
 import os
+import shlex
 import re
+import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
-
-import google.generativeai as genai
 
 from tools import ToolRegistry, build_default_tool_registry
 from tools.research_loop import run_model_research_loop
@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class OrchestratorConfig:
+    use_gemini_cli: bool = True
+    gemini_command: str = "gemini"
     gemini_model: str = "gemini-3.1-flash-lite-preview"
     gemini_timeout_sec: int = 60
 
@@ -30,52 +32,101 @@ class ResearchOrchestrator:
     def __init__(self, config: OrchestratorConfig | None = None) -> None:
         self.config = config or OrchestratorConfig()
         self.tool_registry = build_default_tool_registry()
-        self.model = genai.GenerativeModel(model_name=self.config.gemini_model)
         self.max_tool_turns = 2
         self.last_transcript = ""
+        self._deadline_monotonic: float | None = None
 
     async def answer(
         self,
         topic: str,
         source: str = "auto",
         timeout_sec: int = 60,
+        time_specified: bool = False,
     ) -> tuple[str, list[dict[str, Any]]]:
-        """Run the Gemini-based research loop and keep its raw transcript for later attachment."""
+        """Run the Gemini CLI-based research loop and keep its raw transcript for later attachment."""
         await asyncio.sleep(0)
-
-        if timeout_sec >= 60:
-            self.max_tool_turns = max(6, min(18, timeout_sec // 8))
+        if time_specified:
+            self._deadline_monotonic = time.monotonic() + max(10, int(timeout_sec))
+            if timeout_sec >= 60:
+                self.max_tool_turns = max(6, min(18, timeout_sec // 8))
+            else:
+                self.max_tool_turns = 2
         else:
-            self.max_tool_turns = 2
+            self._deadline_monotonic = None
+            self.max_tool_turns = 4
 
         question = f"topic: {topic}\nsource: {source}"
 
         def _call_model(prompt: str) -> str:
-            response = self.model.generate_content(
-                prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.2,
-                    top_p=0.95,
-                    top_k=40,
-                    max_output_tokens=256,
-                    response_mime_type="application/json",
-                ),
-            )
-            return response.text if hasattr(response, "text") and response.text else str(response)
+            if not self.config.use_gemini_cli:
+                logger.warning("Gemini CLI is disabled in config; using CLI path anyway")
+            return self._call_gemini_cli(prompt)
 
-        loop_result = await asyncio.to_thread(
-            run_model_research_loop,
-            topic=question,
-            source=source,
-            timeout_sec=timeout_sec,
-            model_name=self.config.gemini_model,
-            model_call=_call_model,
-            loop_label="gemini-api-research",
-            tool_registry=self.tool_registry,
-            max_turns=self.max_tool_turns if self.max_tool_turns > 0 else None,
+        try:
+            loop_result = await asyncio.to_thread(
+                run_model_research_loop,
+                topic=question,
+                source=source,
+                timeout_sec=timeout_sec,
+                model_name=self.config.gemini_model,
+                model_call=_call_model,
+                loop_label="gemini-cli-research",
+                tool_registry=self.tool_registry,
+                max_turns=self.max_tool_turns if self.max_tool_turns > 0 else None,
+            )
+            self.last_transcript = loop_result.transcript
+            return loop_result.report, loop_result.decision_log
+        finally:
+            self._deadline_monotonic = None
+
+    def _call_gemini_cli(self, prompt: str) -> str:
+        command = (self.config.gemini_command or "gemini").strip() or "gemini"
+        argv = shlex.split(command)
+        if not argv:
+            raise RuntimeError("gemini_cli_command_empty")
+
+        if self.config.gemini_model:
+            argv.extend(["--model", self.config.gemini_model])
+        argv.extend(["--prompt", prompt])
+
+        cli_timeout = int(self.config.gemini_timeout_sec)
+        if self._deadline_monotonic is not None:
+            remaining = int(self._deadline_monotonic - time.monotonic())
+            if remaining <= 1:
+                raise RuntimeError("research_timeout_reached_before_gemini_call")
+            cli_timeout = max(5, min(cli_timeout, remaining))
+
+        logger.info(
+            "[route] research-agent -> gemini-cli command=%s model=%s timeout_sec=%s prompt_chars=%s",
+            argv[0],
+            self.config.gemini_model,
+            cli_timeout,
+            len(prompt),
         )
-        self.last_transcript = loop_result.transcript
-        return loop_result.report, loop_result.decision_log
+
+        try:
+            completed = subprocess.run(
+                argv,
+                text=True,
+                capture_output=True,
+                timeout=cli_timeout,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"gemini_cli_not_found:{exc}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"gemini_cli_timeout:{int(cli_timeout)}s") from exc
+        except Exception as exc:
+            raise RuntimeError(f"gemini_cli_exec_failed:{exc}") from exc
+
+        if completed.returncode != 0:
+            err = (completed.stderr or completed.stdout or "gemini_cli_non_zero_exit").strip()
+            raise RuntimeError(err[:1200])
+
+        output = (completed.stdout or "").strip()
+        if not output:
+            raise RuntimeError("gemini_cli_empty_output")
+        return output
 
     def _build_thinking_prompt(
         self,
@@ -121,25 +172,15 @@ class ResearchOrchestrator:
     async def _make_decision(self, prompt: str) -> dict[str, Any]:
         try:
             response = await asyncio.wait_for(
-                asyncio.to_thread(
-                    self.model.generate_content,
-                    prompt,
-                    generation_config=genai.types.GenerationConfig(
-                        temperature=0.2,
-                        top_p=0.95,
-                        top_k=40,
-                        max_output_tokens=256,
-                        response_mime_type="application/json",
-                    ),
-                ),
+                asyncio.to_thread(self._call_gemini_cli, prompt),
                 timeout=self.config.gemini_timeout_sec,
             )
-            text = response.text if hasattr(response, "text") else str(response)
+            text = response
         except asyncio.TimeoutError:
-            logger.warning("Gemini API timeout")
+            logger.warning("Gemini CLI timeout")
             return {"action": "respond", "response": "(タイムアウト)"}
         except Exception as exc:
-            logger.exception("Gemini API error: %s", exc)
+            logger.exception("Gemini CLI error: %s", exc)
             return {"action": "respond", "response": f"(APIエラー: {exc})"}
 
         parsed = self._extract_json_object(text)
@@ -186,10 +227,10 @@ class ResearchOrchestrator:
         )
         try:
             response = await asyncio.wait_for(
-                asyncio.to_thread(self.model.generate_content, prompt),
+                asyncio.to_thread(self._call_gemini_cli, prompt),
                 timeout=self.config.gemini_timeout_sec,
             )
-            text = response.text if hasattr(response, "text") else str(response)
+            text = response
             return self._ensure_sources_in_text(text, scratchpad)
         except Exception as exc:
             logger.exception("Final response error: %s", exc)
@@ -423,10 +464,24 @@ class ResearchOrchestrator:
 
 def load_research_orchestrator_config() -> OrchestratorConfig:
     """Load Research orchestrator config from environment."""
-    genai.configure(api_key=os.getenv("RESEARCH_GEMINI_API_KEY", ""))
+    cli_model = (
+        os.getenv("RESEARCH_AGENT_GEMINI_MODEL", "").strip()
+        or os.getenv("RESEARCH_GEMINI_MODEL", "gemini-3.1-flash-lite-preview").strip()
+    )
+    cli_timeout_raw = (
+        os.getenv("RESEARCH_AGENT_GEMINI_TIMEOUT_SEC", "").strip()
+        or os.getenv("RESEARCH_GEMINI_TIMEOUT_SEC", "60").strip()
+    )
+    try:
+        cli_timeout = int(cli_timeout_raw)
+    except ValueError:
+        cli_timeout = 60
+
     return OrchestratorConfig(
-        gemini_model=os.getenv("RESEARCH_GEMINI_MODEL", "gemini-3.1-flash-lite-preview").strip(),
-        gemini_timeout_sec=int(os.getenv("RESEARCH_GEMINI_TIMEOUT_SEC", "60")),
+        use_gemini_cli=os.getenv("RESEARCH_AGENT_USE_GEMINI_CLI", "true").strip().lower() == "true",
+        gemini_command=os.getenv("RESEARCH_AGENT_GEMINI_COMMAND", "gemini").strip() or "gemini",
+        gemini_model=cli_model,
+        gemini_timeout_sec=max(30, cli_timeout),
     )
 
 

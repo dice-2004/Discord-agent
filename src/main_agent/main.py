@@ -8,16 +8,25 @@ import logging
 import os
 import re
 import sys
+import threading
+import wave
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import discord
 from discord import app_commands
 from discord.ui import Button, View
 from dotenv import load_dotenv
+
+try:
+    from discord.ext import voice_recv  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover - optional dependency
+    voice_recv = None  # type: ignore[assignment]
+
+AudioSinkBase = voice_recv.AudioSink if voice_recv is not None else object
 
 from main_agent.core.orchestrator import DiscordOrchestrator, load_orchestrator_config_from_env
 
@@ -28,6 +37,158 @@ CURSOR_FILE_NAME = "memory_ingest_cursor.json"
 RUNCLI_AUDIT_LOG_DEFAULT = "./data/audit/runcli_audit.jsonl"
 RESEARCH_AUDIT_LOG_DEFAULT = "./data/audit/research_audit.jsonl"
 DEBUG_PROBE_AUDIT_LOG_DEFAULT = "./data/audit/debug_probe_audit.jsonl"
+
+
+class VoiceChunkForwarder:
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+        self._queue: asyncio.Queue[tuple[dict[str, int | str], bytes]] = asyncio.Queue(
+            maxsize=max(10, int(os.getenv("VOICE_STT_CHUNK_QUEUE_MAX", "128").strip() or "128"))
+        )
+        self._worker_task: asyncio.Task[None] | None = None
+        base = (os.getenv("VOICE_STT_AGENT_URL", "http://voice-stt-agent:8095").strip() or "http://voice-stt-agent:8095").rstrip("/")
+        self._endpoint = f"{base}/v1/audio/chunks"
+        self._token = os.getenv("VOICE_STT_SHARED_TOKEN", "change_me").strip() or "change_me"
+        self._timeout_sec = max(3, int(os.getenv("VOICE_STT_HTTP_TIMEOUT_SEC", "10").strip() or "10"))
+
+    def start(self) -> None:
+        if self._worker_task is None:
+            self._worker_task = self._loop.create_task(self._worker())
+
+    def enqueue(self, *, guild_id: int, channel_id: int, user_id: int, ext: str, payload: bytes) -> None:
+        if not payload:
+            return
+
+        item = (
+            {
+                "guild_id": int(guild_id),
+                "channel_id": int(channel_id),
+                "user_id": int(user_id),
+                "ext": str(ext or "wav"),
+            },
+            payload,
+        )
+
+        def _put() -> None:
+            try:
+                self._queue.put_nowait(item)
+            except asyncio.QueueFull:
+                try:
+                    self._queue.get_nowait()
+                    self._queue.task_done()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    self._queue.put_nowait(item)
+                except asyncio.QueueFull:
+                    pass
+
+        self._loop.call_soon_threadsafe(_put)
+
+    async def _worker(self) -> None:
+        logger = logging.getLogger(__name__)
+        while True:
+            headers_meta, payload = await self._queue.get()
+            try:
+                await asyncio.to_thread(self._post_chunk, headers_meta, payload)
+            except Exception as exc:
+                logger.warning("voice chunk forward failed: %s", exc)
+            finally:
+                self._queue.task_done()
+
+    def _post_chunk(self, headers_meta: dict[str, int | str], payload: bytes) -> None:
+        req = Request(
+            self._endpoint,
+            method="POST",
+            data=payload,
+            headers={
+                "Content-Type": "application/octet-stream",
+                "Accept": "application/json",
+                "X-Voice-Token": self._token,
+                "X-Guild-Id": str(headers_meta.get("guild_id", 0)),
+                "X-Channel-Id": str(headers_meta.get("channel_id", 0)),
+                "X-User-Id": str(headers_meta.get("user_id", 0)),
+                "X-Audio-Ext": str(headers_meta.get("ext", "wav")),
+                "User-Agent": "main-agent/voice-audio-forwarder",
+            },
+        )
+        with urlopen(req, timeout=self._timeout_sec):
+            pass
+
+
+class DiscordAudioBridgeSink(AudioSinkBase):
+    def __init__(
+        self,
+        *,
+        forwarder: VoiceChunkForwarder,
+        guild_id: int,
+        channel_id: int,
+    ) -> None:
+        if voice_recv is None:
+            raise RuntimeError("discord-ext-voice-recv is not available")
+        super().__init__()
+        self.forwarder = forwarder
+        self.guild_id = int(guild_id)
+        self.channel_id = int(channel_id)
+        self.sample_rate = max(8000, int(os.getenv("VOICE_STT_SAMPLE_RATE", "48000").strip() or "48000"))
+        self.channels = max(1, int(os.getenv("VOICE_STT_CHANNELS", "2").strip() or "2"))
+        self.sample_width = 2
+        chunk_ms = max(500, int(os.getenv("VOICE_STT_CHUNK_MS", "4000").strip() or "4000"))
+        self.max_chunk_bytes = int(self.sample_rate * self.channels * self.sample_width * (chunk_ms / 1000.0))
+        self._buffers: dict[int, bytearray] = {}
+        self._lock = threading.Lock()
+
+    def wants_opus(self) -> bool:
+        return False
+
+    def write(self, user: object, data: object) -> None:
+        if user is None or data is None:
+            return
+        user_id = int(getattr(user, "id", 0) or 0)
+        if user_id <= 0:
+            return
+        if bool(getattr(user, "bot", False)):
+            return
+
+        pcm = getattr(data, "pcm", None)
+        if not isinstance(pcm, (bytes, bytearray)) or not pcm:
+            return
+
+        flush_payload: bytes | None = None
+        with self._lock:
+            buf = self._buffers.setdefault(user_id, bytearray())
+            buf.extend(pcm)
+            if len(buf) >= self.max_chunk_bytes:
+                flush_payload = bytes(buf)
+                self._buffers[user_id] = bytearray()
+
+        if flush_payload:
+            self._emit_wav_chunk(user_id=user_id, pcm=flush_payload)
+
+    def cleanup(self) -> None:
+        pending: list[tuple[int, bytes]] = []
+        with self._lock:
+            for user_id, buf in self._buffers.items():
+                if buf:
+                    pending.append((user_id, bytes(buf)))
+            self._buffers.clear()
+        for user_id, pcm in pending:
+            self._emit_wav_chunk(user_id=user_id, pcm=pcm)
+
+    def _emit_wav_chunk(self, *, user_id: int, pcm: bytes) -> None:
+        wave_buffer = io.BytesIO()
+        with wave.open(wave_buffer, "wb") as wav:
+            wav.setnchannels(self.channels)
+            wav.setsampwidth(self.sample_width)
+            wav.setframerate(self.sample_rate)
+            wav.writeframes(pcm)
+        self.forwarder.enqueue(
+            guild_id=self.guild_id,
+            channel_id=self.channel_id,
+            user_id=user_id,
+            ext="wav",
+            payload=wave_buffer.getvalue(),
+        )
 
 
 def setup_logging() -> None:
@@ -137,6 +298,48 @@ def _inject_research_controls_hint_with_values(
         lines.append("- timeout_sec は指定秒数を厳守（加算・減算・丸め禁止）")
     lines.append("- dispatch_research_job を使わない場合は、この指定を無視してよい")
     return (question or "").rstrip() + "\n" + "\n".join(lines)
+
+
+def _forward_music_intent_transcript(payload: dict[str, object]) -> tuple[dict[str, object], str | None, int | None]:
+    default_base = "http://voice-stt-agent:8095"
+    base_url = (
+        os.getenv("VOICE_STT_AGENT_URL", "").strip()
+        or os.getenv("MUSIC_INTENT_AGENT_URL", "").strip()
+        or default_base
+    ).rstrip("/")
+    token = os.getenv("VOICE_STT_SHARED_TOKEN", "change_me").strip() or "change_me"
+    timeout_sec = max(3, _safe_int_env("VOICE_STT_HTTP_TIMEOUT_SEC", _safe_int_env("MUSIC_INTENT_HTTP_TIMEOUT_SEC", 10)))
+
+    req = Request(
+        f"{base_url}/v1/transcripts",
+        method="POST",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-Voice-Token": token,
+            "User-Agent": "main-agent/voice-bridge",
+        },
+    )
+
+    try:
+        with urlopen(req, timeout=timeout_sec) as res:
+            status = int(getattr(res, "status", 200))
+            raw = res.read().decode("utf-8", errors="replace")
+        payload_out = json.loads(raw) if raw else {}
+        if not isinstance(payload_out, dict):
+            payload_out = {"status": "error", "detail": str(payload_out)[:600]}
+        return payload_out, None, status
+    except HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            detail = str(exc)
+        return {}, detail[:1200], int(getattr(exc, "code", 500))
+    except URLError as exc:
+        return {}, str(exc)[:1200], None
+    except Exception as exc:
+        return {}, str(exc)[:1200], None
 
 
 def _extract_urls_from_text(text: str) -> list[str]:
@@ -404,6 +607,26 @@ def _build_research_digest(report: str) -> str:
     return head
 
 
+def _extract_used_tools_from_status(status_payload: dict[str, object]) -> list[str]:
+    raw = status_payload.get("decision_log")
+    if not isinstance(raw, list):
+        return []
+
+    seen: set[str] = set()
+    tools: list[str] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("action", "")).strip().lower() != "tool":
+            continue
+        name = str(item.get("tool", "")).strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        tools.append(name)
+    return tools
+
+
 async def send_response(
     interaction: discord.Interaction,
     response_text: str,
@@ -665,84 +888,6 @@ def _safe_int_env(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         return default
-
-
-def _gemma_rerank_logsearch_records(
-    *,
-    keyword: str,
-    records: list[object],
-    endpoint: str,
-    timeout_sec: int,
-) -> list[object]:
-    if not keyword or not endpoint or len(records) <= 1:
-        return records
-
-    candidates: list[dict[str, object]] = []
-    for idx, record in enumerate(records):
-        content = str(getattr(record, "content", "") or "")
-        if not content:
-            continue
-        metadata = getattr(record, "metadata", None) or {}
-        candidates.append(
-            {
-                "index": idx,
-                "content": content,
-                "timestamp": str(getattr(record, "timestamp", "") or ""),
-                "channel_id": str(metadata.get("channel_id", "")),
-                "channel_name": str(metadata.get("channel_name", "")),
-                "role": str(getattr(record, "role", "") or ""),
-            }
-        )
-
-    if len(candidates) <= 1:
-        return records
-
-    payload = json.dumps({"query": keyword, "candidates": candidates}, ensure_ascii=False).encode("utf-8")
-    request = Request(
-        endpoint,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
-    try:
-        with urlopen(request, timeout=max(1, int(timeout_sec))) as response:
-            raw = response.read().decode("utf-8", errors="ignore")
-        parsed = json.loads(raw)
-    except (HTTPError, OSError, TimeoutError, json.JSONDecodeError):
-        logging.getLogger(__name__).warning("Gemma logsearch rerank failed; fallback to local ranking", exc_info=True)
-        return records
-
-    ranking_raw = []
-    if isinstance(parsed, dict):
-        ranking_raw = parsed.get("ranking") or parsed.get("results") or []
-    if not isinstance(ranking_raw, list):
-        return records
-
-    ordered_indexes: list[int] = []
-    seen: set[int] = set()
-    for item in ranking_raw:
-        if isinstance(item, dict):
-            idx_raw = item.get("index")
-        else:
-            idx_raw = item
-        try:
-            idx = int(idx_raw)
-        except (TypeError, ValueError):
-            continue
-        if idx < 0 or idx >= len(records) or idx in seen:
-            continue
-        seen.add(idx)
-        ordered_indexes.append(idx)
-
-    if not ordered_indexes:
-        return records
-
-    reranked = [records[i] for i in ordered_indexes]
-    for idx, record in enumerate(records):
-        if idx not in seen:
-            reranked.append(record)
-    return reranked
 
 
 def _extract_time_range(text: str) -> tuple[int, int, int, int] | None:
@@ -1288,12 +1433,6 @@ def main() -> None:
     logsearch_include_score = os.getenv("LOGSEARCH_INCLUDE_SCORE", "true").strip().lower() == "true"
     score_overlap_weight = _safe_float_env("LOGSEARCH_SCORE_OVERLAP_WEIGHT", 0.7)
     score_recency_weight = _safe_float_env("LOGSEARCH_SCORE_RECENCY_WEIGHT", 0.3)
-    logsearch_gemma_enabled = os.getenv("LOGSEARCH_GEMMA_ENABLED", "false").strip().lower() == "true"
-    logsearch_gemma_endpoint = os.getenv("LOGSEARCH_GEMMA_ENDPOINT", "http://gemma-worker:8093/v1/logsearch/rerank").strip()
-    logsearch_gemma_timeout_sec = _safe_int_env("LOGSEARCH_GEMMA_TIMEOUT_SEC", 8)
-    logsearch_gemma_candidate_multiplier = _safe_int_env("LOGSEARCH_GEMMA_CANDIDATE_MULTIPLIER", 3)
-    logsearch_gemma_timeout_sec = max(2, min(logsearch_gemma_timeout_sec, 30))
-    logsearch_gemma_candidate_multiplier = max(1, min(logsearch_gemma_candidate_multiplier, 6))
     if score_overlap_weight < 0:
         score_overlap_weight = 0.0
     if score_recency_weight < 0:
@@ -1335,9 +1474,13 @@ def main() -> None:
 
     intents = discord.Intents.default()
     intents.message_content = enable_message_content_intent
+    intents.voice_states = True
     client = discord.Client(intents=intents)
     tree = app_commands.CommandTree(client)
     research_notify_tasks: set[asyncio.Task[None]] = set()
+    voice_recv_enabled = os.getenv("VOICE_RECV_ENABLED", "true").strip().lower() == "true"
+    voice_chunk_forwarder = VoiceChunkForwarder(asyncio.get_event_loop())
+    active_voice_sinks: dict[int, object] = {}
 
     async def _resolve_channel(channel_id: int) -> discord.abc.Messageable | None:
         channel = client.get_channel(channel_id)
@@ -1450,11 +1593,16 @@ def main() -> None:
                     )
                     channel = await _resolve_channel(channel_id)
                     if channel is not None:
+                        used_tools = _extract_used_tools_from_status(status_payload)
+                        tool_lines = "\n".join(f"- {name}" for name in used_tools) if used_tools else "- なし"
                         summary = "\n".join([
                             "調査が完了しました。",
                             "",
                             "[要約]",
                             _build_research_digest(report),
+                            "",
+                            "[使用ツール]",
+                            tool_lines,
                         ])
                         artifact_file_path = Path(artifact_path) if artifact_path else None
                         if artifact_file_path is not None and artifact_file_path.exists():
@@ -2081,7 +2229,7 @@ def main() -> None:
                     args={
                         "topic": topic,
                         "source": source_value,
-                        "wait": "false",
+                        "wait": "true",
                         "mode": mode_value,
                         "timeout_sec": timeout_value,
                     },
@@ -2141,6 +2289,166 @@ def main() -> None:
             logger.exception("Failed to handle /deepdive")
             await interaction.followup.send("deep diveの実行に失敗しました。")
 
+    @tree.command(name="vc_join", description="実行者がいるVCへこのBotを参加させます")
+    async def vc_join(interaction: discord.Interaction) -> None:
+        if interaction.guild_id is None or interaction.guild_id not in allowed_guild_ids:
+            await interaction.response.send_message(
+                "このサーバーではこのBotを利用できません。",
+                ephemeral=True,
+            )
+            return
+        if interaction.guild is None or interaction.user is None:
+            await interaction.response.send_message("Guild内で実行してください。", ephemeral=True)
+            return
+
+        member = interaction.guild.get_member(interaction.user.id)
+        voice_state = member.voice if member is not None else None
+        if voice_state is None or voice_state.channel is None:
+            await interaction.response.send_message("先にVCへ参加してください。", ephemeral=True)
+            return
+
+        target = voice_state.channel
+        existing = discord.utils.get(client.voice_clients, guild=interaction.guild)
+        if (
+            existing is not None
+            and existing.channel is not None
+            and existing.channel.id == target.id
+            and int(interaction.guild.id) in active_voice_sinks
+        ):
+            await interaction.response.send_message(f"既に {target.name} に参加しています。", ephemeral=True)
+            return
+
+        try:
+            if existing is not None and voice_recv_enabled and voice_recv is not None and not hasattr(existing, "listen"):
+                await existing.disconnect(force=True)
+                existing = None
+
+            if existing is not None:
+                await existing.move_to(target)
+            else:
+                if voice_recv_enabled and voice_recv is not None:
+                    await target.connect(self_deaf=True, cls=voice_recv.VoiceRecvClient)
+                else:
+                    await target.connect(self_deaf=True)
+
+            current = discord.utils.get(client.voice_clients, guild=interaction.guild)
+            if voice_recv_enabled and voice_recv is not None and current is not None and hasattr(current, "listen"):
+                sink = DiscordAudioBridgeSink(
+                    forwarder=voice_chunk_forwarder,
+                    guild_id=int(interaction.guild.id),
+                    channel_id=int(target.id),
+                )
+                try:
+                    if hasattr(current, "stop_listening"):
+                        current.stop_listening()
+                except Exception:
+                    pass
+                current.listen(sink)
+                active_voice_sinks[int(interaction.guild.id)] = sink
+
+            await interaction.response.send_message(f"VC `{target.name}` に参加しました。", ephemeral=True)
+        except Exception:
+            logger.exception("Failed to handle /vc_join")
+            await interaction.response.send_message("VC参加に失敗しました。権限と接続状態を確認してください。", ephemeral=True)
+
+    @tree.command(name="vc_leave", description="このBotをVCから退出させます")
+    async def vc_leave(interaction: discord.Interaction) -> None:
+        if interaction.guild_id is None or interaction.guild_id not in allowed_guild_ids:
+            await interaction.response.send_message(
+                "このサーバーではこのBotを利用できません。",
+                ephemeral=True,
+            )
+            return
+        if interaction.guild is None:
+            await interaction.response.send_message("Guild内で実行してください。", ephemeral=True)
+            return
+
+        existing = discord.utils.get(client.voice_clients, guild=interaction.guild)
+        if existing is None:
+            await interaction.response.send_message("VCに参加していません。", ephemeral=True)
+            return
+
+        try:
+            if hasattr(existing, "stop_listening"):
+                try:
+                    existing.stop_listening()
+                except Exception:
+                    pass
+            active_voice_sinks.pop(int(interaction.guild.id), None)
+            await existing.disconnect(force=True)
+            await interaction.response.send_message("VCから退出しました。", ephemeral=True)
+        except Exception:
+            logger.exception("Failed to handle /vc_leave")
+            await interaction.response.send_message("VC退出に失敗しました。", ephemeral=True)
+
+    @tree.command(name="vc_status", description="このBotのVC参加状態を表示します")
+    async def vc_status(interaction: discord.Interaction) -> None:
+        if interaction.guild_id is None or interaction.guild_id not in allowed_guild_ids:
+            await interaction.response.send_message(
+                "このサーバーではこのBotを利用できません。",
+                ephemeral=True,
+            )
+            return
+        if interaction.guild is None:
+            await interaction.response.send_message("Guild内で実行してください。", ephemeral=True)
+            return
+
+        existing = discord.utils.get(client.voice_clients, guild=interaction.guild)
+        if existing is None or existing.channel is None:
+            await interaction.response.send_message("VC未参加です。", ephemeral=True)
+            return
+
+        recv_state = "on" if int(interaction.guild.id) in active_voice_sinks else "off"
+
+        await interaction.response.send_message(
+            f"参加中: `{existing.channel.name}` (guild={interaction.guild.id}, voice_recv={recv_state})",
+            ephemeral=True,
+        )
+
+    @tree.command(name="vc_transcript_mock", description="検証用: 音声文字起こしテキストを voice-stt-agent へ送信")
+    @app_commands.describe(text="文字起こし結果として扱うテキスト")
+    async def vc_transcript_mock(interaction: discord.Interaction, text: str) -> None:
+        if interaction.guild_id is None or interaction.guild_id not in allowed_guild_ids:
+            await interaction.response.send_message(
+                "このサーバーではこのBotを利用できません。",
+                ephemeral=True,
+            )
+            return
+        if interaction.guild is None or interaction.channel is None or interaction.user is None:
+            await interaction.response.send_message("Guild内で実行してください。", ephemeral=True)
+            return
+
+        clean_text = (text or "").strip()
+        if not clean_text:
+            await interaction.response.send_message("text が空です。", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        payload = {
+            "guild_id": int(interaction.guild.id),
+            "channel_id": int(interaction.channel.id),
+            "user_id": int(interaction.user.id),
+            "text": clean_text,
+            "started_at": now_iso,
+            "ended_at": now_iso,
+            "source": "main_agent_slash_mock",
+            "created_at": now_iso,
+        }
+
+        result, err, status_code = _forward_music_intent_transcript(payload)
+        if err is not None:
+            await interaction.followup.send(
+                f"転送失敗: status={status_code} detail={err[:300]}",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            f"転送成功: status={status_code} action={result.get('action', 'unknown')} intent={result.get('intent', 'unknown')}",
+            ephemeral=True,
+        )
+
     @tree.command(name="logsearch", description="Discord過去ログをキーワード検索します")
     @app_commands.describe(keyword="検索キーワード", scope="検索範囲", limit="表示件数(1-12)")
     @app_commands.choices(
@@ -2173,7 +2481,7 @@ def main() -> None:
             selected_scope = scope.value if scope is not None else "default"
             query_scope = logsearch_default_scope if selected_scope == "default" else selected_scope
             requested_limit = int(limit)
-            candidate_limit = min(24, max(requested_limit, requested_limit * logsearch_gemma_candidate_multiplier))
+            candidate_limit = min(24, max(requested_limit, requested_limit))
 
             records = await orchestrator.memory.fetch_relevant_messages(
                 guild_id=interaction.guild_id,
@@ -2182,15 +2490,6 @@ def main() -> None:
                 limit=candidate_limit,
                 scope=query_scope,
             )
-
-            if logsearch_gemma_enabled and len(records) > requested_limit:
-                records = await asyncio.to_thread(
-                    _gemma_rerank_logsearch_records,
-                    keyword=clean_keyword,
-                    records=records,
-                    endpoint=logsearch_gemma_endpoint,
-                    timeout_sec=logsearch_gemma_timeout_sec,
-                )
 
             records = records[:requested_limit]
 
@@ -2280,7 +2579,7 @@ def main() -> None:
                 task_label_prefix="ask_url_compare",
             )
             if combined is not None:
-                await send_response(interaction, combined, max_message_len=max_message_len)
+                await send_message_response(source_message, combined, max_message_len=max_message_len)
                 return
 
         mode, timeout_sec = _extract_research_controls(question)
@@ -2537,6 +2836,9 @@ def main() -> None:
     @client.event
     async def on_ready() -> None:
         logger.info("Logged in as %s (%s)", client.user, client.user.id if client.user else "unknown")
+        voice_chunk_forwarder.start()
+        if voice_recv_enabled and voice_recv is None:
+            logger.warning("VOICE_RECV_ENABLED=true but discord-ext-voice-recv is unavailable; VC audio capture is disabled")
 
         removed_global_defs: list[str] = []
         for command in list(tree.get_commands(guild=None)):

@@ -127,7 +127,7 @@ def dispatch_research_job(
         )
     wait_enabled = str(wait or "true").strip().lower() not in {"false", "0", "no", "off"}
 
-    poll_interval = max(0.5, _safe_int("RESEARCH_AGENT_POLL_INTERVAL_SEC", 1))  # Shortened to 0.5-1 sec
+    poll_interval = max(1.0, _safe_int("RESEARCH_AGENT_POLL_INTERVAL_SEC", 3))
 
     # Research time (actual research budget, not polling timeout)
     # Default is intentionally short for normal (non time-specified) requests.

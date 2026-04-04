@@ -30,6 +30,7 @@ services:
     container_name: ollama
     profiles:
       - gemma
+      - voice
     env_file:
       - ./.env
     volumes:
@@ -42,20 +43,17 @@ services:
       start_period: 20s
     restart: unless-stopped
 
-  gemma-worker:
+  voice-stt-agent:
     build:
       context: .
-      dockerfile: docker/Dockerfile.gemma
-    container_name: gemma-worker
+      dockerfile: docker/Dockerfile.voice_stt
+    container_name: voice-stt-agent
+    profiles:
+      - voice
     env_file:
       - ./.env
-    environment:
-      OLLAMA_BASE_URL: http://ollama:11434
-    profiles:
-      - gemma
-    depends_on:
-      ollama:
-        condition: service_healthy
     volumes:
       - ./data/runtime:/app/data/runtime
+    depends_on:
+      - ollama
     restart: unless-stopped

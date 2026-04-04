@@ -73,6 +73,83 @@ Research Agent の状態確認:
 docker compose logs -f research-agent
 ```
 
+## Voice Jam 拡張（main-agent非経由パス）
+
+新規サービスを `voice` プロファイルで追加しています。
+
+- `voice-stt-agent` : transcript受信・意図判定・Spotify API操作を統合
+
+起動:
+
+```bash
+docker compose --profile voice up -d --build
+```
+
+疎通確認:
+
+```bash
+docker compose --profile voice logs -f voice-stt-agent
+```
+
+モックtranscript投入（main-agentを介さない）:
+
+```bash
+curl -X POST http://localhost:8095/v1/transcripts/mock \
+  -H "Content-Type: application/json" \
+  -H "X-Voice-Token: change_me" \
+  -d '{
+    "guild_id": 1228693698632618117,
+    "channel_id": 1488500275294502942,
+    "user_id": 123456789012345678,
+    "text": "次は chill な曲を流して"
+  }'
+```
+
+VC検証（main-agentのDiscordコマンド）:
+
+- `/vc_join` : 実行者がいるVCへ参加
+- `/vc_status` : 参加状態の確認
+- `/vc_transcript_mock text:<...>` : transcript転送の即時確認
+- `/vc_leave` : VCから退出
+
+## 権限/設定の変更が必要な項目
+
+Discord Developer Portal (既存main-agent Bot):
+
+- Privileged Gateway Intents:
+  - `MESSAGE CONTENT INTENT` (任意: slash運用のみなら不要)
+- OAuth2 Scopes:
+  - `bot`
+  - `applications.commands`
+- Bot Permissions (最低限):
+  - `View Channels`
+  - `Connect`
+  - `Speak` (音を流さないなら必須ではないが、環境差対策で推奨)
+  - `Use Application Commands`
+  - `Send Messages`
+
+注記:
+
+- `VOICE_STT_ENABLE_DISCORD=false` が既定です。voice-stt-agent はHTTP受け口のみを担当し、Discord接続はmain-agentのみが行います。
+- voice機能は `voice-stt-agent` に統合されています（意図判定とSpotify操作を同コンテナで実行）。
+
+Spotify API:
+
+- 必須スコープ:
+  - `user-modify-playback-state`
+  - `user-read-playback-state` (デバッグ用推奨)
+- `.env` へ `SPOTIFY_ACCESS_TOKEN` を設定（未設定時は `noop`）
+
+OpenWeatherMap:
+
+- 現段階では未使用（Phase 2で `weather_recommend` 実装時にAPIキー追加）
+
+注記:
+
+- `SPOTIFY_ACCESS_TOKEN` が未設定の場合、意図判定は実行されますがSpotify操作は `noop` になります。
+- `MUSIC_INTENT_USE_OLLAMA=false` (既定) の場合、意図判定はルールベースで即時実行されます。Ollama判定を有効化する場合は `true` に変更してください。
+- 実装済みエンドポイントは最小構成です（`/healthz`, `/v1/transcripts`, `/v1/transcripts/mock`, `/v1/audio/chunks`）。
+
 ## 外部アクション実行（コード内）
 
 このプロジェクトは n8n 中継を使わず、Botコード内で action を直接実行します。

@@ -5,9 +5,7 @@ import json
 import logging
 import os
 import re
-import shlex
 import sqlite3
-import subprocess
 import threading
 import time
 from datetime import datetime, timezone
@@ -15,7 +13,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
 
 from tools.deep_dive_tools import source_deep_dive
 from research_agent.core.orchestrator import build_research_orchestrator
@@ -153,55 +150,6 @@ def _build_job_id() -> str:
     return f"rj-{int(time.time() * 1000)}-{os.getpid()}-{threading.get_ident()}"
 
 
-def _run_gemini_cli(topic: str, source: str) -> tuple[str, str | None]:
-    cmd = os.getenv("RESEARCH_AGENT_GEMINI_COMMAND", "gemini").strip() or "gemini"
-    model = os.getenv("RESEARCH_AGENT_GEMINI_MODEL", "gemini-2.5-flash").strip()
-    timeout = max(30, _safe_int("RESEARCH_AGENT_GEMINI_TIMEOUT_SEC", 240))
-    prompt = (
-        "あなたは調査エージェントです。以下のトピックについて日本語で要点をまとめてください。\n"
-        f"topic: {topic}\n"
-        f"source_hint: {source}\n"
-        "出力: 結論→根拠→次の確認ポイント の順で簡潔に。"
-    )
-
-    argv = shlex.split(cmd)
-    if not argv:
-        return "", "gemini_cli_command_empty"
-    if model:
-        argv.extend(["--model", model])
-    argv.extend(["--prompt", prompt])
-    logger.info(
-        "[research-agent][gemini-cli] exec command=%s model=%s topic=%s source=%s",
-        argv[0],
-        model or "(default)",
-        topic,
-        source,
-    )
-    logger.info("[route] research-agent -> gemini-cli command=%s model=%s", argv[0], model or "(default)")
-
-    try:
-        completed = subprocess.run(
-            argv,
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
-        )
-    except FileNotFoundError:
-        return "", "gemini_cli_not_found"
-    except Exception as exc:
-        return "", f"gemini_cli_exec_failed:{exc}"
-
-    if completed.returncode != 0:
-        err = (completed.stderr or completed.stdout or "gemini_cli_non_zero_exit").strip()
-        return "", err[:1200]
-
-    out = (completed.stdout or "").strip()
-    if not out:
-        return "", "gemini_cli_empty_output"
-    return out, None
-
-
 def _safe_bool(value: object, default: bool = False) -> bool:
     if isinstance(value, bool):
         return value
@@ -213,61 +161,26 @@ def _safe_bool(value: object, default: bool = False) -> bool:
     return text in {"1", "true", "yes", "on"}
 
 
-def _contains_deep_intent(text: str) -> bool:
-    lowered = (text or "").strip().lower()
-    if not lowered:
-        return False
-    markers = (
-        "網羅",
-        "徹底",
-        "全部",
-        "比較表",
-        "じっくり",
-        "deep",
-        "thorough",
-        "comprehensive",
-    )
-    return any(marker in lowered for marker in markers)
-
-
-def _is_high_precision_exception_task(text: str) -> bool:
-    lowered = (text or "").strip().lower()
-    if not lowered:
-        return False
-    patterns = (
-        r"規約|利用規約|terms|policy",
-        r"学術|論文|paper|survey",
-        r"矛盾|contradiction|conflict",
-    )
-    return any(re.search(pattern, lowered) for pattern in patterns)
-
-
-def _should_trigger_gemma_stage(topic: str, timeout_sec: int, time_specified: bool) -> bool:
-    gemma_enabled = os.getenv("RESEARCH_AGENT_GEMMA_ENABLED", "false").strip().lower() == "true"
-    if not gemma_enabled:
-        return False
-
-    min_minutes = max(1, _safe_int("RESEARCH_AGENT_GEMMA_TRIGGER_MIN_MINUTES", 10))
-    min_seconds = min_minutes * 60
-    allow_exception = os.getenv("RESEARCH_AGENT_GEMMA_ALLOW_EXCEPTION_TRIGGER", "false").strip().lower() == "true"
-    has_deep_intent = _contains_deep_intent(topic)
-
-    if time_specified and timeout_sec >= min_seconds:
-        return True
-    if time_specified and has_deep_intent:
-        return True
-    if allow_exception and _is_high_precision_exception_task(topic):
-        return True
-    return False
-
-
-def _run_gemini_runner(topic: str, source: str, timeout_sec: int) -> tuple[str, str, list[dict[str, Any]], str | None]:
+def _run_gemini_runner(
+    topic: str,
+    source: str,
+    timeout_sec: int,
+    *,
+    time_specified: bool,
+) -> tuple[str, str, list[dict[str, Any]], str | None]:
     try:
         orchestrator = asyncio.run(build_research_orchestrator())
-        report, decision_log = asyncio.run(orchestrator.answer(topic=topic, source=source, timeout_sec=timeout_sec))
+        report, decision_log = asyncio.run(
+            orchestrator.answer(
+                topic=topic,
+                source=source,
+                timeout_sec=timeout_sec,
+                time_specified=time_specified,
+            )
+        )
         transcript = getattr(orchestrator, "last_transcript", "") or report
         logger.info(
-            "[route] research-agent -> gemini-api topic=%s source=%s timeout_sec=%s report_chars=%s transcript_chars=%s",
+            "[route] research-agent -> gemini-cli topic=%s source=%s timeout_sec=%s report_chars=%s transcript_chars=%s",
             topic[:160],
             source,
             timeout_sec,
@@ -278,78 +191,6 @@ def _run_gemini_runner(topic: str, source: str, timeout_sec: int) -> tuple[str, 
     except Exception as exc:
         logger.exception("Gemini runner failed: %s", exc)
         return "", "", [], f"gemini_runner_failed:{exc}"
-
-
-def _run_gemma_worker(topic: str, source: str, initial_report: str, timeout_sec: int) -> tuple[str, str, list[dict[str, Any]], str | None]:
-    endpoint = (
-        os.getenv("RESEARCH_AGENT_GEMMA_ENDPOINT", "http://gemma-worker:8093/v1/research/analyze").strip()
-        or "http://gemma-worker:8093/v1/research/analyze"
-    )
-    call_timeout = max(10, _safe_int("RESEARCH_AGENT_GEMMA_TIMEOUT_SEC", 180))
-    # Keep transport timeout at least research budget + buffer.
-    # Using min() here causes premature abort for long jobs (e.g. 600s -> 180s).
-    call_timeout = max(call_timeout, max(15, timeout_sec + 60))
-
-    payload = {
-        "topic": topic,
-        "source": source,
-        "initial_report": initial_report,
-        "timeout_sec": timeout_sec,
-        "output_format": "evidence_summary",
-    }
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = Request(
-        endpoint,
-        data=data,
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "discord-ai-agent-research/1.0",
-        },
-    )
-    try:
-        logger.info(
-            "[route] research-agent -> gemma-worker endpoint=%s topic=%s source=%s timeout_sec=%s",
-            endpoint,
-            topic[:160],
-            source,
-            call_timeout,
-        )
-        with urlopen(req, timeout=call_timeout) as res:
-            raw = res.read().decode("utf-8", errors="replace")
-    except Exception as exc:
-        return "", "", [], f"gemma_worker_http_error:{exc}"
-
-    try:
-        parsed = json.loads(raw) if raw else {}
-    except Exception:
-        parsed = {"report": raw}
-
-    report = ""
-    if isinstance(parsed, dict):
-        for key in ("report", "result", "output", "text"):
-            value = parsed.get(key)
-            if isinstance(value, str) and value.strip():
-                report = value.strip()
-                break
-        status = str(parsed.get("status", "ok")).strip().lower()
-        if status in {"error", "failed"} and not report:
-            detail = str(parsed.get("detail") or parsed.get("error") or "gemma_worker_failed")
-            return "", "", [], f"gemma_worker_failed:{detail[:800]}"
-    elif isinstance(parsed, str):
-        report = parsed.strip()
-
-    if not report:
-        return "", "", [], "gemma_worker_empty_output"
-    transcript = ""
-    decision_log: list[dict[str, Any]] = []
-    if isinstance(parsed, dict):
-        transcript = str(parsed.get("transcript", "") or "").strip()
-        candidate_log = parsed.get("decision_log", [])
-        if isinstance(candidate_log, list):
-            decision_log = [item for item in candidate_log if isinstance(item, dict)]
-    return report[:12000], transcript[:24000] or report[:12000], decision_log, None
 
 
 def _build_research_artifact(job_id: str, engine: str, report: str, transcript: str, decision_log: list[dict[str, Any]]) -> str:
@@ -387,6 +228,44 @@ def _report_is_returnable(report: str) -> bool:
     return body not in placeholders and len(body) >= 40
 
 
+def _extract_used_tools(decision_log: list[dict[str, Any]]) -> list[str]:
+    seen: set[str] = set()
+    tools: list[str] = []
+    for entry in decision_log:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("action", "")).strip().lower() != "tool":
+            continue
+        name = str(entry.get("tool", "")).strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        tools.append(name)
+    return tools
+
+
+def _assess_report_quality(report: str, decision_log: list[dict[str, Any]]) -> tuple[bool, list[str], dict[str, Any]]:
+    reasons: list[str] = []
+    body = (report or "").strip()
+    tools = _extract_used_tools(decision_log)
+
+    if not _report_is_returnable(body):
+        reasons.append("weak_or_placeholder_report")
+    if len(body) < 280:
+        reasons.append("report_too_short")
+    if "[参考URL]" not in body and "http://" not in body and "https://" not in body:
+        reasons.append("missing_sources")
+    if not tools:
+        reasons.append("no_tool_usage")
+
+    meta = {
+        "report_chars": len(body),
+        "tool_count": len(tools),
+        "tools": tools,
+    }
+    return len(reasons) == 0, reasons, meta
+
+
 def _coerce_runner_result(raw: Any) -> tuple[str, str, list[dict[str, Any]], str | None]:
     if isinstance(raw, tuple):
         if len(raw) == 4:
@@ -411,7 +290,6 @@ def _run_research(
 ) -> tuple[str, str | None, str, list[dict[str, Any]], str]:
     clean_mode = (mode or "auto").strip().lower() or "auto"
     decision_log: list[dict[str, Any]] = []
-    allow_gemma_fallback = os.getenv("RESEARCH_AGENT_GEMMA_FALLBACK_TO_GEMINI", "true").strip().lower() == "true"
     logger.info(
         "[research-agent][run] start topic=%s source=%s mode=%s time_specified=%s timeout_sec=%s",
         topic,
@@ -420,110 +298,167 @@ def _run_research(
         time_specified,
         timeout_sec,
     )
-
-    gemma_enabled = os.getenv("RESEARCH_AGENT_GEMMA_ENABLED", "false").strip().lower() == "true"
-    min_minutes = max(1, _safe_int("RESEARCH_AGENT_GEMMA_TRIGGER_MIN_MINUTES", 10))
-    allow_exception = os.getenv("RESEARCH_AGENT_GEMMA_ALLOW_EXCEPTION_TRIGGER", "false").strip().lower() == "true"
-    has_deep_intent = _contains_deep_intent(topic)
-    is_exception_task = _is_high_precision_exception_task(topic)
-    gemma_triggered = _should_trigger_gemma_stage(topic=topic, timeout_sec=timeout_sec, time_specified=time_specified)
-    logger.info(
-        "[research-agent][gemma] decision enabled=%s triggered=%s time_specified=%s timeout_sec=%s min_minutes=%s deep_intent=%s exception_task=%s allow_exception=%s auto_prefer_orchestrator=%s",
-        gemma_enabled,
-        gemma_triggered,
-        time_specified,
-        timeout_sec,
-        min_minutes,
-        has_deep_intent,
-        is_exception_task,
-        allow_exception,
-        "n/a",
-    )
-    decision_log.append(
-        {
-            "stage": "gemma_trigger_decision",
-            "triggered": gemma_triggered,
-            "time_specified": time_specified,
-            "timeout_sec": timeout_sec,
-            "gemma_enabled": gemma_enabled,
-            "min_minutes": min_minutes,
-            "has_deep_intent": has_deep_intent,
-            "is_exception_task": is_exception_task,
-            "allow_exception": allow_exception,
-            "auto_prefer_orchestrator": False,
-        }
-    )
-
     transcript = ""
-    if clean_mode == "gemini_cli":
-        logger.info("[route] research-agent mode=gemini_cli path=gemini-api")
-        report, transcript, runner_log, err = _coerce_runner_result(
-            _run_gemini_runner(topic=topic, source=source, timeout_sec=timeout_sec)
+    if clean_mode not in {"auto", "gemini_cli", "fallback"}:
+        logger.warning("[research-agent][run] unknown mode=%s; defaulting to gemini-cli", clean_mode)
+    logger.info("[route] research-agent mode=%s path=gemini-cli", clean_mode)
+    engine = "gemini_cli"
+    run_started = time.time()
+    min_explore_sec = int(timeout_sec * 0.9) if time_specified else 0
+    planned_attempts = 1 if not time_specified else max(1, min(5, timeout_sec // 120 + 1))
+
+    best_report = ""
+    best_transcript = ""
+    best_quality_score = -1
+
+    for attempt in range(1, planned_attempts + 1):
+        elapsed_before = int(time.time() - run_started)
+        remaining = max(0, timeout_sec - elapsed_before)
+        if time_specified and remaining <= 5:
+            decision_log.append(
+                {
+                    "stage": "budget_gate",
+                    "attempt": attempt,
+                    "status": "stop_no_budget",
+                    "elapsed_sec": elapsed_before,
+                    "remaining_sec": remaining,
+                }
+            )
+            break
+
+        call_timeout = max(10, remaining) if time_specified else timeout_sec
+        decision_log.append(
+            {
+                "stage": "attempt_start",
+                "attempt": attempt,
+                "call_timeout_sec": call_timeout,
+                "elapsed_sec": elapsed_before,
+            }
         )
-        engine = "gemini_api"
-    elif clean_mode == "fallback":
-        logger.info("[route] research-agent mode=fallback path=gemma-worker")
+
         report, transcript, runner_log, err = _coerce_runner_result(
-            _run_gemma_worker(
+            _run_gemini_runner(
                 topic=topic,
                 source=source,
-                initial_report="",
-                timeout_sec=timeout_sec,
+                timeout_sec=call_timeout,
+                time_specified=time_specified,
             )
         )
-        engine = "gemma4"
-    elif gemma_triggered:
-        logger.info("[route] research-agent mode=auto path=gemma-worker gemma_triggered=%s", gemma_triggered)
-        report, transcript, runner_log, err = _coerce_runner_result(
-            _run_gemma_worker(
-                topic=topic,
-                source=source,
-                initial_report="",
-                timeout_sec=timeout_sec,
+        decision_log.extend(runner_log)
+
+        elapsed_after = int(time.time() - run_started)
+        explored_enough = (elapsed_after >= min_explore_sec) if time_specified else True
+
+        if err:
+            decision_log.append(
+                {
+                    "stage": "attempt_error",
+                    "attempt": attempt,
+                    "elapsed_sec": elapsed_after,
+                    "error": str(err)[:300],
+                }
             )
+            if time_specified and attempt < planned_attempts and not explored_enough:
+                continue
+            logger.warning("[research-agent][run] runner failed engine=%s err=%s", engine, err)
+            return "", err, engine, decision_log, transcript
+
+        if not time_specified:
+            quality_ok, quality_reasons, quality_meta = _assess_report_quality(report, runner_log)
+            decision_log.append(
+                {
+                    "stage": "quality_eval",
+                    "attempt": attempt,
+                    "elapsed_sec": elapsed_after,
+                    "explored_enough": explored_enough,
+                    "quality_ok": quality_ok,
+                    "quality_reasons": quality_reasons,
+                    **quality_meta,
+                }
+            )
+
+            quality_score = (
+                (100 if quality_ok else 0)
+                + (quality_meta.get("tool_count", 0) * 10)
+                + min(50, int(quality_meta.get("report_chars", 0)) // 120)
+            )
+            if _report_is_returnable(report) and quality_score > best_quality_score:
+                best_quality_score = quality_score
+                best_report = report
+                best_transcript = transcript
+
+            if quality_ok:
+                return report[:12000], None, engine, decision_log, transcript
+            break
+
+        if _report_is_returnable(report):
+            candidate_score = len(report) + len(transcript)
+            if candidate_score > best_quality_score:
+                best_quality_score = candidate_score
+                best_report = report
+                best_transcript = transcript
+
+        if not explored_enough and attempt < planned_attempts:
+            decision_log.append(
+                {
+                    "stage": "budget_gate",
+                    "attempt": attempt,
+                    "status": "continue_exploration_until_90pct",
+                    "elapsed_sec": elapsed_after,
+                    "target_sec": min_explore_sec,
+                }
+            )
+            continue
+
+        quality_ok, quality_reasons, quality_meta = _assess_report_quality(report, runner_log)
+        decision_log.append(
+            {
+                "stage": "quality_eval",
+                "attempt": attempt,
+                "elapsed_sec": elapsed_after,
+                "explored_enough": explored_enough,
+                "quality_ok": quality_ok,
+                "quality_reasons": quality_reasons,
+                **quality_meta,
+            }
         )
-        engine = "gemma4"
-    else:
-        logger.info("[route] research-agent mode=auto path=gemini-api gemma_triggered=%s", gemma_triggered)
-        report, transcript, runner_log, err = _coerce_runner_result(
-            _run_gemini_runner(topic=topic, source=source, timeout_sec=timeout_sec)
+
+        quality_score = (
+            (100 if quality_ok else 0)
+            + (quality_meta.get("tool_count", 0) * 10)
+            + min(50, int(quality_meta.get("report_chars", 0)) // 120)
         )
-        engine = "gemini_api"
+        if _report_is_returnable(report) and quality_score > best_quality_score:
+            best_quality_score = quality_score
+            best_report = report
+            best_transcript = transcript
 
-    decision_log.extend(runner_log)
-    if err:
-        if engine == "gemma4" and allow_gemma_fallback:
-            logger.warning("[research-agent][run] gemma failed; fallback to gemini-api err=%s", err)
-            decision_log.append({"stage": "fallback", "from": "gemma4", "to": "gemini_api", "reason": str(err)[:400]})
-            fb_timeout = max(60, min(timeout_sec, timeout_sec // 2 if timeout_sec > 120 else timeout_sec))
-            fb_report, fb_transcript, fb_log, fb_err = _coerce_runner_result(
-                _run_gemini_runner(topic=topic, source=source, timeout_sec=fb_timeout)
+        if quality_ok:
+            return report[:12000], None, engine, decision_log, transcript
+
+        if attempt < planned_attempts:
+            decision_log.append(
+                {
+                    "stage": "quality_gate",
+                    "attempt": attempt,
+                    "status": "return_to_gemini_cli",
+                    "quality_reasons": quality_reasons,
+                }
             )
-            decision_log.extend(fb_log)
-            if not fb_err and _report_is_returnable(fb_report):
-                return fb_report[:12000], None, "gemma4->gemini_api", decision_log, fb_transcript
-            if fb_err:
-                decision_log.append({"stage": "fallback", "status": "failed", "detail": str(fb_err)[:400]})
-        logger.warning("[research-agent][run] runner failed engine=%s err=%s", engine, err)
-        return "", err, engine, decision_log, transcript
+            continue
 
-    if not _report_is_returnable(report):
-        if engine == "gemma4" and allow_gemma_fallback:
-            logger.warning("[research-agent][run] gemma weak report; fallback to gemini-api report_chars=%s", len(report))
-            decision_log.append({"stage": "fallback", "from": "gemma4", "to": "gemini_api", "reason": "weak_report"})
-            fb_timeout = max(60, min(timeout_sec, timeout_sec // 2 if timeout_sec > 120 else timeout_sec))
-            fb_report, fb_transcript, fb_log, fb_err = _coerce_runner_result(
-                _run_gemini_runner(topic=topic, source=source, timeout_sec=fb_timeout)
-            )
-            decision_log.extend(fb_log)
-            if not fb_err and _report_is_returnable(fb_report):
-                return fb_report[:12000], None, "gemma4->gemini_api", decision_log, fb_transcript
-        logger.warning("[research-agent][run] report looks weak engine=%s report_chars=%s", engine, len(report))
-        decision_log.append({"stage": "review", "status": "weak_report", "engine": engine, "report_chars": len(report)})
-        if not report.strip():
-            return "", "empty_report", engine, decision_log, transcript
+    if _report_is_returnable(best_report):
+        decision_log.append(
+            {
+                "stage": "finalize",
+                "status": "use_best_attempt",
+                "best_report_chars": len(best_report),
+            }
+        )
+        return best_report[:12000], None, engine, decision_log, best_transcript
 
-    return report[:12000], None, engine, decision_log, transcript
+    logger.warning("[research-agent][run] report looks weak engine=%s report_chars=%s", engine, len(best_report))
+    return "", "empty_report", engine, decision_log, best_transcript
 
 
 def _check_need_orchestrator(report: str) -> bool:
@@ -594,7 +529,7 @@ class ResearchHandler(BaseHTTPRequestHandler):
                 self._send_json(500, {"status": "error", "code": "store_unavailable"})
                 return
             job_id = parsed.path.split("/v1/jobs/", 1)[1].strip()
-            logger.info("[route] research-agent -> job_status_lookup job_id=%s", job_id)
+            logger.debug("[route] research-agent -> job_status_lookup job_id=%s", job_id)
             if not job_id:
                 self._send_json(400, {"status": "error", "code": "invalid_job_id"})
                 return

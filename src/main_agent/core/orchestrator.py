@@ -56,9 +56,16 @@ class DiscordOrchestrator:
 
         self.max_concurrent_heavy_tasks = max(1, int(os.getenv("MAX_CONCURRENT_HEAVY_TASKS", "1")))
         self.heavy_task_timeout_sec = max(30, int(os.getenv("HEAVY_TASK_TIMEOUT_SEC", "180")))
+        self.ask_heavy_task_timeout_sec = max(
+            self.heavy_task_timeout_sec,
+            int(os.getenv("ASK_HEAVY_TASK_TIMEOUT_SEC", "900")),
+        )
         self._heavy_task_semaphore = asyncio.Semaphore(self.max_concurrent_heavy_tasks)
         self._queued_task_count = 0
         self._queued_task_lock = asyncio.Lock()
+        self.heavy_task_priority_enabled = os.getenv("HEAVY_TASK_PRIORITY_ENABLED", "true").strip().lower() == "true"
+        self.heavy_task_priority_poll_ms = max(10, int(os.getenv("HEAVY_TASK_PRIORITY_POLL_MS", "50")))
+        self._priority_waiting: dict[str, int] = {"high": 0, "low": 0}
 
         checkpoint_path = os.getenv("CHECKPOINT_DB_PATH", "./data/runtime/checkpoints.sqlite3").strip()
         self._checkpoint_store: TaskCheckpointStore | None = None
@@ -138,31 +145,67 @@ class DiscordOrchestrator:
         task_label: str,
         work: Callable[[], Awaitable[Any]],
     ) -> Any:
+        priority = self._classify_task_priority(task_label)
         queue_depth = 0
         async with self._queued_task_lock:
             self._queued_task_count += 1
             queue_depth = max(0, self._queued_task_count - self.max_concurrent_heavy_tasks)
+            self._priority_waiting[priority] = self._priority_waiting.get(priority, 0) + 1
 
         loop = asyncio.get_running_loop()
         wait_started = loop.time()
+        entered_worker = False
+        waiting_registered = True
 
         try:
+            # Keep a single execution lane, but prefer short tasks when they are queued.
+            if self.heavy_task_priority_enabled and priority == "low":
+                while True:
+                    async with self._queued_task_lock:
+                        high_waiting = int(self._priority_waiting.get("high", 0))
+                    if high_waiting <= 0:
+                        break
+                    await asyncio.sleep(self.heavy_task_priority_poll_ms / 1000.0)
+
             async with self._heavy_task_semaphore:
+                entered_worker = True
+                if waiting_registered:
+                    async with self._queued_task_lock:
+                        self._priority_waiting[priority] = max(0, int(self._priority_waiting.get(priority, 0)) - 1)
+                    waiting_registered = False
                 waited_sec = loop.time() - wait_started
                 logger.info(
-                    "Heavy task start: label=%s waited_sec=%.3f queue_depth=%s concurrency=%s",
+                    "Heavy task start: label=%s priority=%s waited_sec=%.3f queue_depth=%s concurrency=%s",
                     task_label,
+                    priority,
                     waited_sec,
                     queue_depth,
                     self.max_concurrent_heavy_tasks,
                 )
-                return await asyncio.wait_for(work(), timeout=self.heavy_task_timeout_sec)
+                timeout_sec = self.ask_heavy_task_timeout_sec if task_label == "ask" else self.heavy_task_timeout_sec
+                return await asyncio.wait_for(work(), timeout=timeout_sec)
         except asyncio.TimeoutError:
-            logger.warning("Heavy task timed out: label=%s timeout=%s", task_label, self.heavy_task_timeout_sec)
+            timeout_sec = self.ask_heavy_task_timeout_sec if task_label == "ask" else self.heavy_task_timeout_sec
+            logger.warning("Heavy task timed out: label=%s timeout=%s", task_label, timeout_sec)
             raise
         finally:
             async with self._queued_task_lock:
                 self._queued_task_count = max(0, self._queued_task_count - 1)
+                if waiting_registered and not entered_worker:
+                    self._priority_waiting[priority] = max(0, int(self._priority_waiting.get(priority, 0)) - 1)
+
+    def _classify_task_priority(self, task_label: str) -> str:
+        label = (task_label or "").strip().lower()
+        # Long-running asks and deep research should yield to lightweight utility tasks.
+        if label == "ask" or label.startswith("deepdive:research"):
+            return "low"
+        if label.startswith("research_status:"):
+            return "high"
+        if label.startswith("mention_quick:"):
+            return "high"
+        if label.startswith("tool:"):
+            return "high"
+        return "high"
 
     async def save_workflow_checkpoint(
         self,
@@ -560,6 +603,8 @@ class DiscordOrchestrator:
                     continue
 
                 if tool_name == "dispatch_research_job":
+                    # Always wait for research completion to avoid premature user-facing answers.
+                    args["wait"] = "true"
                     clean_runtime_question = self._strip_runtime_hints(runtime_question)
                     if (
                         self._is_explicit_global_source_query(clean_runtime_question)

@@ -1,0 +1,13 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app/src
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir discord.py==2.5.2 PyNaCl==1.5.0 faster-whisper
+
+COPY src /app/src
+
+CMD ["python", "-m", "voice_stt_agent.main"]
