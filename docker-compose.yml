@@ -50,6 +50,8 @@ services:
     container_name: voice-stt-agent
     profiles:
       - voice
+    ports:
+      - "8095:8095"
     env_file:
       - ./.env
     volumes:
