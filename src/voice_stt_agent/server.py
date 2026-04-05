@@ -6,6 +6,7 @@ import os
 import threading
 import tempfile
 import time
+import base64
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -17,6 +18,7 @@ from urllib.request import Request, urlopen
 logger = logging.getLogger(__name__)
 _stt_model_lock = threading.Lock()
 _stt_model: object | None = None
+_spotify_token_cache: dict[str, object] = {"access_token": "", "expires_at": 0}
 
 
 def _safe_int(name: str, default: int) -> int:
@@ -31,23 +33,98 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _rule_based_intent(text: str) -> tuple[str, float, str]:
+    lowered = (text or "").lower()
+    if any(k in lowered for k in ("流して", "再生", "spotify", "曲", "かけて", "jam", "キュー", "queue")):
+        return "add_to_jam", 0.65, "rule_music_keyword"
+    if any(k in lowered for k in ("天気", "weather", "雨", "晴れ")):
+        return "weather_recommend", 0.6, "rule_weather_keyword"
+    return "ignore", 0.5, "rule_default"
+
+
+def _get_spotify_access_token() -> tuple[str | None, str | None]:
+    """Return a valid Spotify access token.
+
+    Priority:
+    1) Refresh token flow (`SPOTIFY_REFRESH_TOKEN`, `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`)
+    2) Static `SPOTIFY_ACCESS_TOKEN`
+    """
+    refresh_token = os.getenv("SPOTIFY_REFRESH_TOKEN", "").strip()
+    client_id = os.getenv("SPOTIFY_CLIENT_ID", "").strip()
+    client_secret = os.getenv("SPOTIFY_CLIENT_SECRET", "").strip()
+    now = int(time.time())
+
+    if refresh_token and client_id and client_secret:
+        try:
+            cached_token = str(_spotify_token_cache.get("access_token", "") or "")
+            expires_at = int(_spotify_token_cache.get("expires_at", 0) or 0)
+        except Exception:
+            cached_token = ""
+            expires_at = 0
+
+        if cached_token and expires_at and now < (expires_at - 15):
+            return cached_token, None
+
+        token_url = "https://accounts.spotify.com/api/token"
+        body = f"grant_type=refresh_token&refresh_token={quote(refresh_token)}".encode("utf-8")
+        basic = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("ascii")
+        req = Request(
+            token_url,
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": f"Basic {basic}",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urlopen(req, timeout=15) as res:
+                raw = res.read().decode("utf-8", errors="replace")
+            payload = json.loads(raw) if raw else {}
+            token = str(payload.get("access_token", "") or "").strip()
+            if not token:
+                detail = str(payload.get("error_description") or payload.get("error") or "refresh_failed")
+                return None, f"spotify_refresh_failed:{detail[:200]}"
+            expires_in = int(payload.get("expires_in", 3600) or 3600)
+            _spotify_token_cache["access_token"] = token
+            _spotify_token_cache["expires_at"] = int(time.time()) + expires_in
+            return token, None
+        except HTTPError as exc:
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                detail = str(exc)
+            return None, f"spotify_token_http_error:{int(getattr(exc, 'code', 500))}:{detail[:200]}"
+        except URLError as exc:
+            return None, f"spotify_token_url_error:{exc}"
+        except Exception as exc:
+            return None, f"spotify_token_error:{exc}"
+
+    token = os.getenv("SPOTIFY_ACCESS_TOKEN", "").strip()
+    if token:
+        return token, None
+    return None, "spotify_access_token_missing"
+
+
 def _call_ollama_intent(text: str) -> tuple[str, float, str]:
     use_ollama = os.getenv("MUSIC_INTENT_USE_OLLAMA", "false").strip().lower() == "true"
     if not use_ollama:
-        lowered = text.lower()
-        if any(k in lowered for k in ("流して", "再生", "spotify", "曲", "かけて", "jam")):
-            return "add_to_jam", 0.65, "rule_only_mode_music_keyword"
-        if any(k in lowered for k in ("天気", "weather", "雨", "晴れ")):
-            return "weather_recommend", 0.6, "rule_only_mode_weather_keyword"
-        return "ignore", 0.5, "rule_only_mode_default"
+        intent, confidence, reason = _rule_based_intent(text)
+        return intent, confidence, f"rule_only_mode:{reason}"
 
     base = (os.getenv("OLLAMA_BASE_URL", "http://ollama:11434").strip() or "http://ollama:11434").rstrip("/")
     model = os.getenv("MUSIC_INTENT_OLLAMA_MODEL", os.getenv("OLLAMA_MODEL", "gemma4:e2b")).strip() or "gemma4:e2b"
     timeout_sec = max(5, _safe_int("MUSIC_INTENT_OLLAMA_TIMEOUT_SEC", 30))
 
     prompt = (
-        "Classify the user utterance for Discord voice assistant. Return JSON only with keys: "
-        "intent (add_to_jam|weather_recommend|ignore), confidence (0..1), reason. "
+        "You are an intent classifier for a Discord voice assistant. "
+        "Return JSON only with keys: intent, confidence, reason. "
+        "Allowed intents are strictly: add_to_jam, weather_recommend, ignore. "
+        "If the utterance asks to play/add a song, artist, or music (Japanese examples: '流して', 'かけて', '再生', '曲', 'キュー'), "
+        "intent MUST be add_to_jam. "
+        "If weather-based music suggestion is requested, intent MUST be weather_recommend. "
+        "Otherwise use ignore. "
         f"Utterance: {text}"
     )
     body = {
@@ -76,20 +153,26 @@ def _call_ollama_intent(text: str) -> tuple[str, float, str]:
         intent = str(data.get("intent", "ignore")).strip() or "ignore"
         confidence = float(data.get("confidence", 0.0) or 0.0)
         reason = str(data.get("reason", ""))[:200]
+        intent = intent if intent in {"add_to_jam", "weather_recommend", "ignore"} else "ignore"
+
+        # Guardrail: when LLM misses obvious music/weather keywords, rule-based result takes precedence.
+        rule_intent, rule_conf, rule_reason = _rule_based_intent(text)
+        if intent == "ignore" and rule_intent != "ignore":
+            return rule_intent, max(rule_conf, confidence), f"llm_override_by_rule:{rule_reason}"
+
         return intent, max(0.0, min(confidence, 1.0)), reason
     except Exception as exc:
         logger.debug("ollama intent failed, fallback to rules: %s", exc)
 
-    lowered = text.lower()
-    if any(k in lowered for k in ("流して", "再生", "spotify", "曲", "かけて", "jam")):
-        return "add_to_jam", 0.65, "rule_fallback_music_keyword"
-    if any(k in lowered for k in ("天気", "weather", "雨", "晴れ")):
-        return "weather_recommend", 0.6, "rule_fallback_weather_keyword"
-    return "ignore", 0.5, "rule_fallback_default"
+    intent, confidence, reason = _rule_based_intent(text)
+    return intent, confidence, f"rule_fallback:{reason}"
 
 
 def _spotify_search_track_uri(query: str) -> tuple[str | None, str | None]:
-    token = os.getenv("SPOTIFY_ACCESS_TOKEN", "").strip()
+    token, tok_err = _get_spotify_access_token()
+    if tok_err is not None:
+        return None, tok_err
+    token = str(token or "").strip()
     if not token:
         return None, "spotify_access_token_missing"
 
@@ -124,7 +207,10 @@ def _spotify_search_track_uri(query: str) -> tuple[str | None, str | None]:
 
 
 def _spotify_add_to_queue(track_uri: str) -> str | None:
-    token = os.getenv("SPOTIFY_ACCESS_TOKEN", "").strip()
+    token, tok_err = _get_spotify_access_token()
+    if tok_err is not None:
+        return tok_err
+    token = str(token or "").strip()
     if not token:
         return "spotify_access_token_missing"
 

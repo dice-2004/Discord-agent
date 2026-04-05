@@ -138,7 +138,11 @@ Spotify API:
 - 必須スコープ:
   - `user-modify-playback-state`
   - `user-read-playback-state` (デバッグ用推奨)
-- `.env` へ `SPOTIFY_ACCESS_TOKEN` を設定（未設定時は `noop`）
+- 推奨（本番想定）: `.env` に以下を設定し、refresh token で自動更新
+  - `SPOTIFY_CLIENT_ID`
+  - `SPOTIFY_CLIENT_SECRET`
+  - `SPOTIFY_REFRESH_TOKEN`
+- 代替（簡易テスト）: `SPOTIFY_ACCESS_TOKEN` を直接設定（期限切れに注意）
 
 OpenWeatherMap:
 
@@ -147,6 +151,7 @@ OpenWeatherMap:
 注記:
 
 - `SPOTIFY_ACCESS_TOKEN` が未設定の場合、意図判定は実行されますがSpotify操作は `noop` になります。
+- `SPOTIFY_REFRESH_TOKEN` 方式を設定した場合、`voice-stt-agent` は内部でアクセストークンを自動取得・更新します。
 - `MUSIC_INTENT_USE_OLLAMA=false` (既定) の場合、意図判定はルールベースで即時実行されます。Ollama判定を有効化する場合は `true` に変更してください。
 - 実装済みエンドポイントは最小構成です（`/healthz`, `/v1/transcripts`, `/v1/transcripts/mock`, `/v1/audio/chunks`）。
 
