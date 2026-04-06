@@ -48,7 +48,7 @@ class VoiceChunkForwarder:
         self._worker_task: asyncio.Task[None] | None = None
         base = (os.getenv("VOICE_STT_AGENT_URL", "http://voice-stt-agent:8095").strip() or "http://voice-stt-agent:8095").rstrip("/")
         self._endpoint = f"{base}/v1/audio/chunks"
-        self._token = os.getenv("VOICE_STT_SHARED_TOKEN", "change_me").strip() or "change_me"
+        self._token = os.getenv("VOICE_STT_SHARED_TOKEN", "").strip()
         self._timeout_sec = max(3, int(os.getenv("VOICE_STT_HTTP_TIMEOUT_SEC", "10").strip() or "10"))
 
     def start(self) -> None:
@@ -97,20 +97,23 @@ class VoiceChunkForwarder:
                 self._queue.task_done()
 
     def _post_chunk(self, headers_meta: dict[str, int | str], payload: bytes) -> None:
+        headers = {
+            "Content-Type": "application/octet-stream",
+            "Accept": "application/json",
+            "X-Guild-Id": str(headers_meta.get("guild_id", 0)),
+            "X-Channel-Id": str(headers_meta.get("channel_id", 0)),
+            "X-User-Id": str(headers_meta.get("user_id", 0)),
+            "X-Audio-Ext": str(headers_meta.get("ext", "wav")),
+            "User-Agent": "main-agent/voice-audio-forwarder",
+        }
+        if self._token:
+            headers["X-Voice-Token"] = self._token
+
         req = Request(
             self._endpoint,
             method="POST",
             data=payload,
-            headers={
-                "Content-Type": "application/octet-stream",
-                "Accept": "application/json",
-                "X-Voice-Token": self._token,
-                "X-Guild-Id": str(headers_meta.get("guild_id", 0)),
-                "X-Channel-Id": str(headers_meta.get("channel_id", 0)),
-                "X-User-Id": str(headers_meta.get("user_id", 0)),
-                "X-Audio-Ext": str(headers_meta.get("ext", "wav")),
-                "User-Agent": "main-agent/voice-audio-forwarder",
-            },
+            headers=headers,
         )
         with urlopen(req, timeout=self._timeout_sec):
             pass
@@ -307,19 +310,22 @@ def _forward_music_intent_transcript(payload: dict[str, object]) -> tuple[dict[s
         or os.getenv("MUSIC_INTENT_AGENT_URL", "").strip()
         or default_base
     ).rstrip("/")
-    token = os.getenv("VOICE_STT_SHARED_TOKEN", "change_me").strip() or "change_me"
+    token = os.getenv("VOICE_STT_SHARED_TOKEN", "").strip()
     timeout_sec = max(3, _safe_int_env("VOICE_STT_HTTP_TIMEOUT_SEC", _safe_int_env("MUSIC_INTENT_HTTP_TIMEOUT_SEC", 10)))
+
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "main-agent/voice-bridge",
+    }
+    if token:
+        headers["X-Voice-Token"] = token
 
     req = Request(
         f"{base_url}/v1/transcripts",
         method="POST",
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "X-Voice-Token": token,
-            "User-Agent": "main-agent/voice-bridge",
-        },
+        headers=headers,
     )
 
     try:

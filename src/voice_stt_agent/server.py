@@ -385,7 +385,9 @@ class VoiceSttHandler(BaseHTTPRequestHandler):
     def _authorized(self) -> bool:
         sent = self.headers.get("X-Voice-Token", "").strip()
         expected = self.shared_token.strip() if self.shared_token else ""
-        return bool(sent and expected and sent == expected)
+        if not expected:
+            return True
+        return bool(sent and sent == expected)
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/healthz":
@@ -516,7 +518,7 @@ def main() -> None:
     )
     host = os.getenv("VOICE_STT_HOST", "0.0.0.0").strip() or "0.0.0.0"
     port = _safe_int("VOICE_STT_PORT", 8095)
-    VoiceSttHandler.shared_token = os.getenv("VOICE_STT_SHARED_TOKEN", "change_me").strip() or "change_me"
+    VoiceSttHandler.shared_token = os.getenv("VOICE_STT_SHARED_TOKEN", "").strip()
 
     server = build_http_server(host=host, port=port)
     logger.info("Voice STT Agent started at %s:%s", host, port)

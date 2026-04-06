@@ -142,7 +142,6 @@ Spotify API:
   - `SPOTIFY_CLIENT_ID`
   - `SPOTIFY_CLIENT_SECRET`
   - `SPOTIFY_REFRESH_TOKEN`
-- 代替（簡易テスト）: `SPOTIFY_ACCESS_TOKEN` を直接設定（期限切れに注意）
 
 OpenWeatherMap:
 
@@ -150,7 +149,6 @@ OpenWeatherMap:
 
 注記:
 
-- `SPOTIFY_ACCESS_TOKEN` が未設定の場合、意図判定は実行されますがSpotify操作は `noop` になります。
 - `SPOTIFY_REFRESH_TOKEN` 方式を設定した場合、`voice-stt-agent` は内部でアクセストークンを自動取得・更新します。
 - `MUSIC_INTENT_USE_OLLAMA=false` (既定) の場合、意図判定はルールベースで即時実行されます。Ollama判定を有効化する場合は `true` に変更してください。
 - 実装済みエンドポイントは最小構成です（`/healthz`, `/v1/transcripts`, `/v1/transcripts/mock`, `/v1/audio/chunks`）。
@@ -275,7 +273,6 @@ Main Agent (dispatch_research_job)
 | 環境変数 | 役割 | デフォルト | 説明 |
 |---------|------|----------|------|
 | `RESEARCH_AGENT_GEMINI_TIMEOUT_SEC` | Gemini CLI プロセス | 240秒 | CLI 実行のプロセスタイムアウト |
-| `RESEARCH_GEMINI_TIMEOUT_SEC` | Orchestrator API | 60秒 | 管理AI（Gemini API）呼び出しタイムアウト |
 | `RESEARCH_AGENT_JOB_TIMEOUT_SEC` | ジョブ全体 | 600秒 | 投入から完了までの全体タイムアウト |
 
 ### 環境設定
@@ -297,10 +294,10 @@ docker compose up -d --build research-agent
 管理AI（Gemini API）の有効化:
 
 ```bash
-# .env で以下を設定（別プロジェクトの API キー推奨）
-RESEARCH_GEMINI_API_KEY=your_research_project_api_key
-RESEARCH_GEMINI_MODEL=gemini-3.1-flash-lite-preview
-RESEARCH_GEMINI_TIMEOUT_SEC=60
+# .env で以下を設定
+GEMINI_API_KEY=your_gemini_api_key
+RESEARCH_AGENT_GEMINI_MODEL=gemini-3.1-flash-lite-preview
+RESEARCH_AGENT_GEMINI_TIMEOUT_SEC=240
 ```
 
 ### Bot からの利用方法
@@ -321,7 +318,7 @@ RESEARCH_GEMINI_TIMEOUT_SEC=60
 ### 認証情報の保存先
 
 - Gemini CLI 認証: `data/runtime/gemini_home/.gemini/`（コンテナ再作成後も保持）
-- Gemini API キー: `.env` の `RESEARCH_GEMINI_API_KEY`（環境変数経由）
+- Gemini API キー: `.env` の `GEMINI_API_KEY`（環境変数経由）
 
 ## Discord Botセットアップ手順（初学者向け）
 
