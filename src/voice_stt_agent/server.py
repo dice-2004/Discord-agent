@@ -42,69 +42,7 @@ def _rule_based_intent(text: str) -> tuple[str, float, str]:
     return "ignore", 0.5, "rule_default"
 
 
-def _get_spotify_access_token() -> tuple[str | None, str | None]:
-    """Return a valid Spotify access token.
-
-    Priority:
-    1) Refresh token flow (`SPOTIFY_REFRESH_TOKEN`, `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`)
-    2) Static `SPOTIFY_ACCESS_TOKEN`
-    """
-    refresh_token = os.getenv("SPOTIFY_REFRESH_TOKEN", "").strip()
-    client_id = os.getenv("SPOTIFY_CLIENT_ID", "").strip()
-    client_secret = os.getenv("SPOTIFY_CLIENT_SECRET", "").strip()
-    now = int(time.time())
-
-    if refresh_token and client_id and client_secret:
-        try:
-            cached_token = str(_spotify_token_cache.get("access_token", "") or "")
-            expires_at = int(_spotify_token_cache.get("expires_at", 0) or 0)
-        except Exception:
-            cached_token = ""
-            expires_at = 0
-
-        if cached_token and expires_at and now < (expires_at - 15):
-            return cached_token, None
-
-        token_url = "https://accounts.spotify.com/api/token"
-        body = f"grant_type=refresh_token&refresh_token={quote(refresh_token)}".encode("utf-8")
-        basic = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("ascii")
-        req = Request(
-            token_url,
-            data=body,
-            method="POST",
-            headers={
-                "Authorization": f"Basic {basic}",
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "application/json",
-            },
-        )
-        try:
-            with urlopen(req, timeout=15) as res:
-                raw = res.read().decode("utf-8", errors="replace")
-            payload = json.loads(raw) if raw else {}
-            token = str(payload.get("access_token", "") or "").strip()
-            if not token:
-                detail = str(payload.get("error_description") or payload.get("error") or "refresh_failed")
-                return None, f"spotify_refresh_failed:{detail[:200]}"
-            expires_in = int(payload.get("expires_in", 3600) or 3600)
-            _spotify_token_cache["access_token"] = token
-            _spotify_token_cache["expires_at"] = int(time.time()) + expires_in
-            return token, None
-        except HTTPError as exc:
-            try:
-                detail = exc.read().decode("utf-8", errors="replace")
-            except Exception:
-                detail = str(exc)
-            return None, f"spotify_token_http_error:{int(getattr(exc, 'code', 500))}:{detail[:200]}"
-        except URLError as exc:
-            return None, f"spotify_token_url_error:{exc}"
-        except Exception as exc:
-            return None, f"spotify_token_error:{exc}"
-
-    token = os.getenv("SPOTIFY_ACCESS_TOKEN", "").strip()
-    if token:
-        return token, None
-    return None, "spotify_access_token_missing"
+# Spotify API handling moved to src/tools/music_tools.py
 
 
 def _call_ollama_intent(text: str) -> tuple[str, float, str]:
@@ -168,79 +106,7 @@ def _call_ollama_intent(text: str) -> tuple[str, float, str]:
     return intent, confidence, f"rule_fallback:{reason}"
 
 
-def _spotify_search_track_uri(query: str) -> tuple[str | None, str | None]:
-    token, tok_err = _get_spotify_access_token()
-    if tok_err is not None:
-        return None, tok_err
-    token = str(token or "").strip()
-    if not token:
-        return None, "spotify_access_token_missing"
-
-    timeout_sec = max(5, _safe_int("MUSIC_INTENT_SPOTIFY_TIMEOUT_SEC", 15))
-    url = f"https://api.spotify.com/v1/search?q={quote(query)}&type=track&limit=1"
-    req = Request(
-        url,
-        method="GET",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-        },
-    )
-    try:
-        with urlopen(req, timeout=timeout_sec) as res:
-            raw = res.read().decode("utf-8", errors="replace")
-        payload = json.loads(raw) if raw else {}
-        items = (((payload.get("tracks") or {}).get("items")) or [])
-        if not items:
-            return None, "track_not_found"
-        return str(items[0].get("uri", "")).strip() or None, None
-    except HTTPError as exc:
-        try:
-            detail = exc.read().decode("utf-8", errors="replace")
-        except Exception:
-            detail = str(exc)
-        return None, f"spotify_search_http_error:{int(getattr(exc, 'code', 500))}:{detail[:200]}"
-    except URLError as exc:
-        return None, f"spotify_search_url_error:{exc}"
-    except Exception as exc:
-        return None, f"spotify_search_error:{exc}"
-
-
-def _spotify_add_to_queue(track_uri: str) -> str | None:
-    token, tok_err = _get_spotify_access_token()
-    if tok_err is not None:
-        return tok_err
-    token = str(token or "").strip()
-    if not token:
-        return "spotify_access_token_missing"
-
-    timeout_sec = max(5, _safe_int("MUSIC_INTENT_SPOTIFY_TIMEOUT_SEC", 15))
-    device_id = os.getenv("SPOTIFY_DEVICE_ID", "").strip()
-    url = f"https://api.spotify.com/v1/me/player/queue?uri={quote(track_uri)}"
-    if device_id:
-        url += f"&device_id={quote(device_id)}"
-    req = Request(
-        url,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-        },
-    )
-    try:
-        with urlopen(req, timeout=timeout_sec):
-            pass
-        return None
-    except HTTPError as exc:
-        try:
-            detail = exc.read().decode("utf-8", errors="replace")
-        except Exception:
-            detail = str(exc)
-        return f"spotify_queue_http_error:{int(getattr(exc, 'code', 500))}:{detail[:200]}"
-    except URLError as exc:
-        return f"spotify_queue_url_error:{exc}"
-    except Exception as exc:
-        return f"spotify_queue_error:{exc}"
+# Spotify tracking logics moved to src/tools/music_tools.py
 
 
 def _process_transcript(payload: dict[str, Any]) -> dict[str, Any]:
@@ -263,19 +129,19 @@ def _process_transcript(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
     if intent == "add_to_jam":
-        track_uri, err = _spotify_search_track_uri(text)
+        from tools.music_tools import add_to_jam
+        err = add_to_jam(text)
         if err is not None:
             result.update({"action": "noop", "detail": err})
-        elif track_uri is None:
-            result.update({"action": "noop", "detail": "track_uri_missing"})
         else:
-            queue_err = _spotify_add_to_queue(track_uri)
-            if queue_err is not None:
-                result.update({"action": "noop", "detail": queue_err, "track_uri": track_uri})
-            else:
-                result.update({"action": "spotify_queue_add", "track_uri": track_uri})
+            result.update({"action": "spotify_queue_add", "detail": "added dynamically"})
     elif intent == "weather_recommend":
-        result.update({"action": "weather_recommend_todo"})
+        from tools.music_tools import weather_recommend
+        err = weather_recommend()
+        if err is not None:
+            result.update({"action": "noop", "detail": err})
+        else:
+            result.update({"action": "weather_recommend_added"})
     else:
         result.update({"action": "noop"})
 

@@ -2052,6 +2052,7 @@ def execute_internal_action(action: str, payload_json: str = "{}") -> str:
         payload = _normalize_add_calendar_payload(payload)
 
     allowed = _allowed_actions()
+    allowed.add("add_to_jam")
     if clean_action not in allowed:
         return _as_json_line(
             {
@@ -2191,12 +2192,21 @@ def execute_internal_action(action: str, payload_json: str = "{}") -> str:
     if clean_action == "add_notion_memo":
         return _handle_add_notion_memo(payload)
 
+    if clean_action == "add_to_jam":
+        from tools.music_tools import add_to_jam
+        query = str(payload.get("query", "")).strip() or str(payload.get("title", "")).strip()
+        status_err = add_to_jam(query)
+        if status_err:
+            return _as_json_line({"status": "error", "code": "add_to_jam_failed", "action": "add_to_jam", "detail": status_err})
+        return _as_json_line({"status": "ok", "action": "add_to_jam", "detail": "success"})
+
     if clean_action == "backup_server_data":
         return _handle_backup_server_data(payload)
 
     return _as_json_line(
         {
             "status": "error",
+            "code": "invalid_action",
             "code": "not_implemented_action",
             "action": clean_action,
             "detail": "このactionはまだコード内実装されていません。",
