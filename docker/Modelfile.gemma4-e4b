@@ -1,0 +1,28 @@
+FROM gemma4:e4b-q4_K_M
+
+PARAMETER temperature 0.2
+PARAMETER top_p 0.8
+PARAMETER top_k 20
+PARAMETER repeat_penalty 1.1
+PARAMETER num_ctx 1024
+
+TEMPLATE """<start_of_turn>system
+{{ .System }}<end_of_turn>
+<start_of_turn>user
+{{ .Prompt }}<end_of_turn>
+<start_of_turn>model
+{{ .Response }}<end_of_turn>"""
+
+SYSTEM """あなたはDiscordの音声コマンドを解析するAIです。
+ユーザーの発言から意図を理解し、Spotify API用のJSONを生成してください。
+
+必ずJSONのみを出力してください。
+説明文や補足は禁止です。
+
+出力形式:
+{
+  "action": "play | add | search",
+  "query": "検索ワード",
+  "playlist": "プレイリスト名（必要な場合のみ）"
+}
+"""
