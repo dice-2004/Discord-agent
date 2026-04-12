@@ -35,10 +35,6 @@ services:
       - ./.env
     volumes:
       - ./data/ollama:/root/.ollama
-    devices:
-      - /dev/dri:/dev/dri
-    user: "0:993"
-    privileged: true
     healthcheck:
       test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
       interval: 10s
