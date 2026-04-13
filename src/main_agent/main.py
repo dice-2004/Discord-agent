@@ -2324,6 +2324,9 @@ def main() -> None:
             await interaction.response.send_message(f"既に {target.name} に参加しています。", ephemeral=True)
             return
 
+        # Voice handshake can take longer than Discord interaction timeout.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
         try:
             if existing is not None and voice_recv_enabled and voice_recv is not None and not hasattr(existing, "listen"):
                 await existing.disconnect(force=True)
@@ -2339,6 +2342,14 @@ def main() -> None:
 
             current = discord.utils.get(client.voice_clients, guild=interaction.guild)
             if voice_recv_enabled and voice_recv is not None and current is not None and hasattr(current, "listen"):
+                for _ in range(12):
+                    if current.is_connected():
+                        break
+                    await asyncio.sleep(0.25)
+
+                if not current.is_connected():
+                    raise RuntimeError("voice_not_connected_after_handshake")
+
                 sink = DiscordAudioBridgeSink(
                     forwarder=voice_chunk_forwarder,
                     guild_id=int(interaction.guild.id),
@@ -2352,10 +2363,13 @@ def main() -> None:
                 current.listen(sink)
                 active_voice_sinks[int(interaction.guild.id)] = sink
 
-            await interaction.response.send_message(f"VC `{target.name}` に参加しました。", ephemeral=True)
+            await interaction.followup.send(f"VC `{target.name}` に参加しました。", ephemeral=True)
         except Exception:
             logger.exception("Failed to handle /vc_join")
-            await interaction.response.send_message("VC参加に失敗しました。権限と接続状態を確認してください。", ephemeral=True)
+            try:
+                await interaction.followup.send("VC参加に失敗しました。権限と接続状態を確認してください。", ephemeral=True)
+            except discord.NotFound:
+                logger.warning("vc_join followup failed: interaction expired")
 
     @tree.command(name="vc_leave", description="このBotをVCから退出させます")
     async def vc_leave(interaction: discord.Interaction) -> None:
@@ -3072,10 +3086,13 @@ def main() -> None:
     @tree.error
     async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
         logger.exception("App command error: %s", error)
-        if interaction.response.is_done():
-            await interaction.followup.send("コマンド実行中にエラーが発生しました。")
-        else:
-            await interaction.response.send_message("コマンド実行中にエラーが発生しました。", ephemeral=True)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("コマンド実行中にエラーが発生しました。", ephemeral=True)
+            else:
+                await interaction.response.send_message("コマンド実行中にエラーが発生しました。", ephemeral=True)
+        except discord.NotFound:
+            logger.warning("App command error response skipped: interaction expired")
 
     try:
         client.run(discord_token, log_handler=None)
