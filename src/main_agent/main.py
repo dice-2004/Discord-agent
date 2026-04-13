@@ -2351,9 +2351,9 @@ def main() -> None:
                     await asyncio.sleep(0.5)
 
                 if voice_recv_enabled and voice_recv is not None:
-                    await target.connect(self_deaf=True, reconnect=False, cls=voice_recv.VoiceRecvClient)
+                    await target.connect(self_deaf=True, reconnect=True, cls=voice_recv.VoiceRecvClient)
                 else:
-                    await target.connect(self_deaf=True, reconnect=False)
+                    await target.connect(self_deaf=True, reconnect=True)
 
                 current = discord.utils.get(client.voice_clients, guild=interaction.guild)
                 if current is None or not current.is_connected():
