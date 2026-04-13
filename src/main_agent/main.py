@@ -1487,6 +1487,14 @@ def main() -> None:
     voice_recv_enabled = os.getenv("VOICE_RECV_ENABLED", "true").strip().lower() == "true"
     voice_chunk_forwarder = VoiceChunkForwarder(asyncio.get_event_loop())
     active_voice_sinks: dict[int, object] = {}
+    voice_locks: dict[int, asyncio.Lock] = {}
+
+    def _voice_lock(guild_id: int) -> asyncio.Lock:
+        lock = voice_locks.get(guild_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            voice_locks[guild_id] = lock
+        return lock
 
     async def _resolve_channel(channel_id: int) -> discord.abc.Messageable | None:
         channel = client.get_channel(channel_id)
@@ -2313,63 +2321,71 @@ def main() -> None:
             await interaction.response.send_message("先にVCへ参加してください。", ephemeral=True)
             return
 
-        target = voice_state.channel
-        existing = discord.utils.get(client.voice_clients, guild=interaction.guild)
-        if (
-            existing is not None
-            and existing.channel is not None
-            and existing.channel.id == target.id
-            and int(interaction.guild.id) in active_voice_sinks
-        ):
-            await interaction.response.send_message(f"既に {target.name} に参加しています。", ephemeral=True)
-            return
-
         # Voice handshake can take longer than Discord interaction timeout.
         await interaction.response.defer(ephemeral=True, thinking=True)
 
-        try:
-            if existing is not None and voice_recv_enabled and voice_recv is not None and not hasattr(existing, "listen"):
-                await existing.disconnect(force=True)
-                existing = None
+        guild_id = int(interaction.guild.id)
+        async with _voice_lock(guild_id):
+            target = voice_state.channel
+            existing = discord.utils.get(client.voice_clients, guild=interaction.guild)
+            if (
+                existing is not None
+                and existing.channel is not None
+                and existing.channel.id == target.id
+                and guild_id in active_voice_sinks
+                and existing.is_connected()
+            ):
+                await interaction.followup.send(f"既に {target.name} に参加しています。", ephemeral=True)
+                return
 
-            if existing is not None:
-                await existing.move_to(target)
-            else:
+            try:
+                if existing is not None:
+                    if guild_id in active_voice_sinks:
+                        active_voice_sinks.pop(guild_id, None)
+                    if hasattr(existing, "stop_listening"):
+                        try:
+                            existing.stop_listening()
+                        except Exception:
+                            pass
+                    await existing.disconnect(force=True, wait=True)
+                    await asyncio.sleep(0.5)
+
                 if voice_recv_enabled and voice_recv is not None:
-                    await target.connect(self_deaf=True, cls=voice_recv.VoiceRecvClient)
+                    await target.connect(self_deaf=True, reconnect=False, cls=voice_recv.VoiceRecvClient)
                 else:
-                    await target.connect(self_deaf=True)
+                    await target.connect(self_deaf=True, reconnect=False)
 
-            current = discord.utils.get(client.voice_clients, guild=interaction.guild)
-            if voice_recv_enabled and voice_recv is not None and current is not None and hasattr(current, "listen"):
-                for _ in range(12):
-                    if current.is_connected():
-                        break
-                    await asyncio.sleep(0.25)
-
-                if not current.is_connected():
+                current = discord.utils.get(client.voice_clients, guild=interaction.guild)
+                if current is None or not current.is_connected():
                     raise RuntimeError("voice_not_connected_after_handshake")
 
-                sink = DiscordAudioBridgeSink(
-                    forwarder=voice_chunk_forwarder,
-                    guild_id=int(interaction.guild.id),
-                    channel_id=int(target.id),
-                )
-                try:
-                    if hasattr(current, "stop_listening"):
-                        current.stop_listening()
-                except Exception:
-                    pass
-                current.listen(sink)
-                active_voice_sinks[int(interaction.guild.id)] = sink
+                if voice_recv_enabled and voice_recv is not None and hasattr(current, "listen"):
+                    sink = DiscordAudioBridgeSink(
+                        forwarder=voice_chunk_forwarder,
+                        guild_id=guild_id,
+                        channel_id=int(target.id),
+                    )
+                    try:
+                        if hasattr(current, "stop_listening"):
+                            current.stop_listening()
+                    except Exception:
+                        pass
+                    current.listen(sink)
+                    active_voice_sinks[guild_id] = sink
 
-            await interaction.followup.send(f"VC `{target.name}` に参加しました。", ephemeral=True)
-        except Exception:
-            logger.exception("Failed to handle /vc_join")
-            try:
-                await interaction.followup.send("VC参加に失敗しました。権限と接続状態を確認してください。", ephemeral=True)
-            except discord.NotFound:
-                logger.warning("vc_join followup failed: interaction expired")
+                await interaction.followup.send(f"VC `{target.name}` に参加しました。", ephemeral=True)
+            except Exception:
+                logger.exception("Failed to handle /vc_join")
+                try:
+                    current = discord.utils.get(client.voice_clients, guild=interaction.guild)
+                    if current is not None:
+                        await current.disconnect(force=True, wait=True)
+                except Exception:
+                    logger.exception("Failed to cleanup voice client after /vc_join error")
+                try:
+                    await interaction.followup.send("VC参加に失敗しました。権限と接続状態を確認してください。", ephemeral=True)
+                except discord.NotFound:
+                    logger.warning("vc_join followup failed: interaction expired")
 
     @tree.command(name="vc_leave", description="このBotをVCから退出させます")
     async def vc_leave(interaction: discord.Interaction) -> None:
@@ -2388,18 +2404,23 @@ def main() -> None:
             await interaction.response.send_message("VCに参加していません。", ephemeral=True)
             return
 
-        try:
-            if hasattr(existing, "stop_listening"):
+        guild_id = int(interaction.guild.id)
+        async with _voice_lock(guild_id):
+            try:
+                if hasattr(existing, "stop_listening"):
+                    try:
+                        existing.stop_listening()
+                    except Exception:
+                        pass
+                active_voice_sinks.pop(guild_id, None)
+                await existing.disconnect(force=True, wait=True)
+                await interaction.response.send_message("VCから退出しました。", ephemeral=True)
+            except Exception:
+                logger.exception("Failed to handle /vc_leave")
                 try:
-                    existing.stop_listening()
-                except Exception:
-                    pass
-            active_voice_sinks.pop(int(interaction.guild.id), None)
-            await existing.disconnect(force=True)
-            await interaction.response.send_message("VCから退出しました。", ephemeral=True)
-        except Exception:
-            logger.exception("Failed to handle /vc_leave")
-            await interaction.response.send_message("VC退出に失敗しました。", ephemeral=True)
+                    await interaction.response.send_message("VC退出に失敗しました。", ephemeral=True)
+                except discord.NotFound:
+                    logger.warning("vc_leave response failed: interaction expired")
 
     @tree.command(name="vc_status", description="このBotのVC参加状態を表示します")
     async def vc_status(interaction: discord.Interaction) -> None:
