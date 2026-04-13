@@ -6,6 +6,6 @@ __pycache__/
 *.pyd
 *.log
 .env
+data/ollama/
 data/chromadb/
-data/
 log.log

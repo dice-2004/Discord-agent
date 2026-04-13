@@ -18,6 +18,5 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY src /app/src
-COPY data /app/data
 
 CMD ["sh", "-lc", "mkdir -p \"$HOME/.gemini\" && python -m research_agent.research_agent_server"]

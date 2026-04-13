@@ -7,9 +7,7 @@ services:
     env_file:
       - ./.env
     volumes:
-      - ./data/chromadb:/app/data/chromadb
-      - ./data/profiles:/app/data/profiles
-      - ./data/runtime:/app/data/runtime
+      - ./data:/app/data
     depends_on:
       - research-agent
     restart: unless-stopped
