@@ -13,17 +13,6 @@ from voice_stt_agent.server import _forward_transcript, _safe_int, start_http_se
 
 logger = logging.getLogger(__name__)
 
-
-from __future__ import annotations
-
-import asyncio
-import logging
-import os
-
-from voice_stt_agent.server import _safe_int, start_http_server_in_thread
-
-logger = logging.getLogger(__name__)
-
 def main() -> None:
     logging.basicConfig(
         level=getattr(logging, (os.getenv("LOG_LEVEL", "INFO").upper().strip() or "INFO"), logging.INFO),
@@ -40,4 +29,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
