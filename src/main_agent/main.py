@@ -2347,16 +2347,24 @@ def main() -> None:
                             existing.stop_listening()
                         except Exception:
                             pass
-                    await existing.disconnect(force=True, wait=True)
-                    await asyncio.sleep(0.5)
+                    await existing.disconnect(force=True)
+                    for _ in range(20):
+                        if not existing.is_connected():
+                            break
+                        await asyncio.sleep(0.1)
 
                 if voice_recv_enabled and voice_recv is not None:
-                    await target.connect(self_deaf=True, reconnect=True, cls=voice_recv.VoiceRecvClient)
+                    connected = await target.connect(self_deaf=True, reconnect=True, cls=voice_recv.VoiceRecvClient)
                 else:
-                    await target.connect(self_deaf=True, reconnect=True)
+                    connected = await target.connect(self_deaf=True, reconnect=True)
 
-                current = discord.utils.get(client.voice_clients, guild=interaction.guild)
-                if current is None or not current.is_connected():
+                for _ in range(20):
+                    if connected.is_connected():
+                        break
+                    await asyncio.sleep(0.1)
+
+                current = discord.utils.get(client.voice_clients, guild=interaction.guild) or connected
+                if not current.is_connected():
                     raise RuntimeError("voice_not_connected_after_handshake")
 
                 if voice_recv_enabled and voice_recv is not None and hasattr(current, "listen"):
@@ -2379,7 +2387,7 @@ def main() -> None:
                 try:
                     current = discord.utils.get(client.voice_clients, guild=interaction.guild)
                     if current is not None:
-                        await current.disconnect(force=True, wait=True)
+                        await current.disconnect(force=True)
                 except Exception:
                     logger.exception("Failed to cleanup voice client after /vc_join error")
                 try:
@@ -2413,7 +2421,7 @@ def main() -> None:
                     except Exception:
                         pass
                 active_voice_sinks.pop(guild_id, None)
-                await existing.disconnect(force=True, wait=True)
+                await existing.disconnect(force=True)
                 await interaction.response.send_message("VCから退出しました。", ephemeral=True)
             except Exception:
                 logger.exception("Failed to handle /vc_leave")
