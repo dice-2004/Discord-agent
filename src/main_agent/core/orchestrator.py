@@ -7,6 +7,8 @@ import json
 import logging
 import os
 import re
+import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -76,6 +78,11 @@ class DiscordOrchestrator:
             logger.exception("Failed to initialize checkpoint store: path=%s", checkpoint_path)
 
         self.last_tool_executions: list[dict[str, object]] = []
+
+        self.gemini_max_requests_per_min = max(1, int(os.getenv("GEMINI_MAX_REQUESTS_PER_MIN", "12")))
+        self._gemini_request_timestamps: deque[float] = deque()
+        self._gemini_rate_limit_lock = asyncio.Lock()
+        self._gemini_inflight_lock = asyncio.Lock()
 
         genai.configure(api_key=config.gemini_api_key)
         self.model = genai.GenerativeModel(model_name=config.gemini_model)
@@ -1540,28 +1547,61 @@ class DiscordOrchestrator:
         retries = 2
         last_error: Exception | None = None
 
+        def _retry_wait_seconds(error: Exception, fallback: float) -> float:
+            # Gemini quota errors often include "Please retry in 51.3s".
+            message = str(error)
+            match = re.search(r"retry\s+in\s+([0-9]+(?:\.[0-9]+)?)s", message, flags=re.IGNORECASE)
+            if not match:
+                return fallback
+            try:
+                recommended = float(match.group(1))
+            except Exception:
+                return fallback
+            # Cap wait so the command remains responsive even on long quota delays.
+            return max(fallback, min(recommended, 90.0))
+
+        async def _acquire_gemini_slot() -> None:
+            window_sec = 60.0
+            while True:
+                wait_sec = 0.0
+                async with self._gemini_rate_limit_lock:
+                    now = time.monotonic()
+                    while self._gemini_request_timestamps and (now - self._gemini_request_timestamps[0]) >= window_sec:
+                        self._gemini_request_timestamps.popleft()
+
+                    if len(self._gemini_request_timestamps) < self.gemini_max_requests_per_min:
+                        self._gemini_request_timestamps.append(now)
+                        return
+
+                    oldest = self._gemini_request_timestamps[0]
+                    wait_sec = max(0.05, window_sec - (now - oldest))
+
+                await asyncio.sleep(wait_sec)
+
         for attempt in range(retries + 1):
             try:
-                response = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        self.model.generate_content,
-                        prompt,
-                        generation_config=genai.types.GenerationConfig(
-                            **{
-                                "temperature": 0.2,
-                                "top_p": 0.95,
-                                "top_k": 40,
-                                "max_output_tokens": max_output_tokens,
-                                **(
-                                    {"response_mime_type": response_mime_type}
-                                    if response_mime_type
-                                    else {}
-                                ),
-                            }
+                await _acquire_gemini_slot()
+                async with self._gemini_inflight_lock:
+                    response = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            self.model.generate_content,
+                            prompt,
+                            generation_config=genai.types.GenerationConfig(
+                                **{
+                                    "temperature": 0.2,
+                                    "top_p": 0.95,
+                                    "top_k": 40,
+                                    "max_output_tokens": max_output_tokens,
+                                    **(
+                                        {"response_mime_type": response_mime_type}
+                                        if response_mime_type
+                                        else {}
+                                    ),
+                                }
+                            ),
                         ),
-                    ),
-                    timeout=self.config.gemini_timeout_sec,
-                )
+                        timeout=self.config.gemini_timeout_sec,
+                    )
                 text = (getattr(response, "text", "") or "").strip()
                 log_ai_exchange(
                     component="main-agent",
@@ -1594,7 +1634,7 @@ class DiscordOrchestrator:
                 )
                 last_error = exc
                 if attempt < retries:
-                    await asyncio.sleep(2**attempt)
+                    await asyncio.sleep(_retry_wait_seconds(exc, fallback=2**attempt))
 
         raise RuntimeError("Gemini invocation failed after retries") from last_error
 
