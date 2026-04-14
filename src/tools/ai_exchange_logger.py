@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,28 @@ def _truncate(text: str) -> str:
     return text[: _max_chars()] + "..."
 
 
+def _strip_control_chars(text: str) -> str:
+    if not text:
+        return ""
+    cleaned: list[str] = []
+    for ch in text:
+        # Keep common whitespace for readability.
+        if ch in ("\n", "\r", "\t"):
+            cleaned.append(ch)
+            continue
+        cat = unicodedata.category(ch)
+        # Remove control/format/surrogate/private-use/unassigned codepoints.
+        if cat in {"Cc", "Cf", "Cs", "Co", "Cn"}:
+            continue
+        cleaned.append(ch)
+    return "".join(cleaned)
+
+
+def _normalize_text(text: str) -> str:
+    # Normalize Unicode width/composition for stable logs.
+    return unicodedata.normalize("NFKC", _strip_control_chars(text))
+
+
 def _log_path() -> Path:
     raw = os.getenv("AI_EXCHANGE_LOG_PATH", "./data/audit/ai_exchange.log").strip() or "./data/audit/ai_exchange.log"
     return Path(raw)
@@ -59,12 +82,12 @@ def log_ai_exchange(
         "ts": datetime.now(timezone.utc).isoformat(),
         "component": (component or "unknown").strip() or "unknown",
         "model": (model or "unknown").strip() or "unknown",
-        "prompt": _truncate(prompt or ""),
-        "response": _truncate(response or ""),
+        "prompt": _truncate(_normalize_text(prompt or "")),
+        "response": _truncate(_normalize_text(response or "")),
         "metadata": metadata or {},
     }
     if error:
-        entry["error"] = _truncate(error)
+        entry["error"] = _truncate(_normalize_text(error))
 
     line = json.dumps(entry, ensure_ascii=False)
     try:
