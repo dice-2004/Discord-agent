@@ -328,12 +328,11 @@ def _google_calendar_creds() -> dict[str, str]:
     }
 
 
-def _google_access_token() -> tuple[str | None, str | None]:
-    creds = _google_calendar_creds()
+def _google_access_token_from_creds(creds: dict[str, str], provider: str) -> tuple[str | None, str | None]:
     required = ["client_id", "client_secret", "refresh_token"]
     missing = [key for key in required if not creds.get(key)]
     if missing:
-        return None, f"missing_credentials:{','.join(missing)}"
+        return None, f"missing_credentials:{provider}:{','.join(missing)}"
 
     body = urlencode(
         {
@@ -364,9 +363,20 @@ def _google_access_token() -> tuple[str | None, str | None]:
             raw = exc.read().decode("utf-8", errors="replace")
         except Exception:
             raw = str(exc)
+        lowered = raw.lower()
+        if "invalid_grant" in lowered:
+            hint = (
+                f"invalid_grant:{provider}:refresh tokenが無効です。"
+                " refresh tokenを発行したOAuthクライアントID/Secretの組み合わせと現在値が一致しているか確認してください。"
+            )
+            return None, _truncate_text(hint)
         return None, _truncate_text(raw)
     except Exception as exc:
         return None, _truncate_text(str(exc))
+
+
+def _google_access_token() -> tuple[str | None, str | None]:
+    return _google_access_token_from_creds(_google_calendar_creds(), "google_oauth2")
 
 
 def _google_calendar_insert_event(

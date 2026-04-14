@@ -16,6 +16,7 @@ from uuid import uuid4
 import google.generativeai as genai
 
 from main_agent.core.memory import ChannelMemoryStore, MemoryRecord, TaskCheckpointStore
+from tools.ai_exchange_logger import log_ai_exchange
 from tools import ToolRegistry, build_default_tool_registry
 
 logger = logging.getLogger(__name__)
@@ -125,7 +126,21 @@ class DiscordOrchestrator:
                 message_id=message_id,
             )
 
-        return await self._run_heavy_task("ask", _job)
+        answer_text = await self._run_heavy_task("ask", _job)
+        log_ai_exchange(
+            component="main-agent",
+            model=self.config.gemini_model,
+            prompt=question,
+            response=answer_text,
+            metadata={
+                "phase": "final_answer",
+                "guild_id": guild_id,
+                "channel_id": channel_id,
+                "user_id": user_id,
+                "message_id": message_id,
+            },
+        )
+        return answer_text
 
     async def execute_tool_job(
         self,
@@ -1548,10 +1563,35 @@ class DiscordOrchestrator:
                     timeout=self.config.gemini_timeout_sec,
                 )
                 text = (getattr(response, "text", "") or "").strip()
+                log_ai_exchange(
+                    component="main-agent",
+                    model=self.config.gemini_model,
+                    prompt=prompt,
+                    response=text,
+                    metadata={
+                        "phase": "model_call",
+                        "attempt": attempt + 1,
+                        "max_output_tokens": max_output_tokens,
+                        "response_mime_type": response_mime_type or "",
+                    },
+                )
                 if text:
                     return text
                 return "回答を生成できませんでした。質問を少し変えて再試行してください。"
             except Exception as exc:
+                log_ai_exchange(
+                    component="main-agent",
+                    model=self.config.gemini_model,
+                    prompt=prompt,
+                    response="",
+                    metadata={
+                        "phase": "model_call",
+                        "attempt": attempt + 1,
+                        "max_output_tokens": max_output_tokens,
+                        "response_mime_type": response_mime_type or "",
+                    },
+                    error=str(exc),
+                )
                 last_error = exc
                 if attempt < retries:
                     await asyncio.sleep(2**attempt)

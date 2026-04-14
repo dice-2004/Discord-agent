@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from tools import ToolRegistry, build_default_tool_registry
+from tools.ai_exchange_logger import log_ai_exchange
 from tools.research_loop import run_model_research_loop
 
 logger = logging.getLogger(__name__)
@@ -103,6 +104,17 @@ class ResearchOrchestrator:
             cli_timeout,
             len(prompt),
         )
+        log_ai_exchange(
+            component="research-agent",
+            model=self.config.gemini_model,
+            prompt=prompt,
+            response="",
+            metadata={
+                "phase": "gemini_cli_request",
+                "command": argv[0],
+                "timeout_sec": cli_timeout,
+            },
+        )
 
         try:
             completed = subprocess.run(
@@ -121,11 +133,43 @@ class ResearchOrchestrator:
 
         if completed.returncode != 0:
             err = (completed.stderr or completed.stdout or "gemini_cli_non_zero_exit").strip()
+            log_ai_exchange(
+                component="research-agent",
+                model=self.config.gemini_model,
+                prompt=prompt,
+                response="",
+                metadata={
+                    "phase": "gemini_cli_response",
+                    "returncode": completed.returncode,
+                },
+                error=err,
+            )
             raise RuntimeError(err[:1200])
 
         output = (completed.stdout or "").strip()
         if not output:
+            log_ai_exchange(
+                component="research-agent",
+                model=self.config.gemini_model,
+                prompt=prompt,
+                response="",
+                metadata={
+                    "phase": "gemini_cli_response",
+                    "returncode": completed.returncode,
+                },
+                error="gemini_cli_empty_output",
+            )
             raise RuntimeError("gemini_cli_empty_output")
+        log_ai_exchange(
+            component="research-agent",
+            model=self.config.gemini_model,
+            prompt=prompt,
+            response=output,
+            metadata={
+                "phase": "gemini_cli_response",
+                "returncode": completed.returncode,
+            },
+        )
         return output
 
     def _build_thinking_prompt(

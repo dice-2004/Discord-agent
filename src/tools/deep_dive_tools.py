@@ -6,6 +6,7 @@ import os
 import re
 from urllib.request import Request, urlopen
 
+from tools.ai_exchange_logger import log_ai_exchange
 from tools.search_tools import web_search
 
 
@@ -35,6 +36,17 @@ def source_deep_dive(topic: str, source: str = "auto") -> str:
 
     for idx, query in enumerate(query_plan, start=1):
         result = web_search(query)
+        log_ai_exchange(
+            component="deepdive",
+            model="web_search",
+            prompt=query,
+            response=result,
+            metadata={
+                "phase": "deep_dive_query",
+                "query_index": idx,
+                "source": clean_source,
+            },
+        )
         outputs.append(f"[DeepDive Query {idx}] {query}\n{result}")
         if "レート制限" in result:
             outputs.append("[DeepDive] レート制限を検知したため、残りクエリはスキップしました。")

@@ -15,6 +15,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
+from tools.ai_exchange_logger import log_ai_exchange
+
 logger = logging.getLogger(__name__)
 _stt_model_lock = threading.Lock()
 _stt_model: object | None = None
@@ -87,6 +89,16 @@ def _call_ollama_intent(text: str) -> tuple[str, float, str]:
             raw = res.read().decode("utf-8", errors="replace")
         payload = json.loads(raw) if raw else {}
         llm_text = str(payload.get("response", "")).strip()
+        log_ai_exchange(
+            component="voice-stt-agent",
+            model=model,
+            prompt=prompt,
+            response=llm_text,
+            metadata={
+                "phase": "ollama_intent",
+                "base": base,
+            },
+        )
         data = json.loads(llm_text) if llm_text else {}
         intent = str(data.get("intent", "ignore")).strip() or "ignore"
         confidence = float(data.get("confidence", 0.0) or 0.0)
@@ -100,6 +112,17 @@ def _call_ollama_intent(text: str) -> tuple[str, float, str]:
 
         return intent, max(0.0, min(confidence, 1.0)), reason
     except Exception as exc:
+        log_ai_exchange(
+            component="voice-stt-agent",
+            model=model,
+            prompt=prompt,
+            response="",
+            metadata={
+                "phase": "ollama_intent",
+                "base": base,
+            },
+            error=str(exc),
+        )
         logger.debug("ollama intent failed, fallback to rules: %s", exc)
 
     intent, confidence, reason = _rule_based_intent(text)
