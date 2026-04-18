@@ -328,6 +328,22 @@ def _google_calendar_creds() -> dict[str, str]:
     }
 
 
+def _google_tasks_creds() -> dict[str, str]:
+    """Return Tasks OAuth credentials.
+
+    If task-specific credentials are not configured, fallback to Calendar credentials.
+    """
+    calendar = _google_calendar_creds()
+    client_id = os.getenv("GOOGLE_TASKS_CLIENT_ID", "").strip() or calendar["client_id"]
+    client_secret = os.getenv("GOOGLE_TASKS_CLIENT_SECRET", "").strip() or calendar["client_secret"]
+    refresh_token = os.getenv("GOOGLE_TASKS_REFRESH_TOKEN", "").strip() or calendar["refresh_token"]
+    return {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "refresh_token": refresh_token,
+    }
+
+
 def _google_access_token_from_creds(creds: dict[str, str], provider: str) -> tuple[str | None, str | None]:
     required = ["client_id", "client_secret", "refresh_token"]
     missing = [key for key in required if not creds.get(key)]
@@ -377,6 +393,10 @@ def _google_access_token_from_creds(creds: dict[str, str], provider: str) -> tup
 
 def _google_access_token() -> tuple[str | None, str | None]:
     return _google_access_token_from_creds(_google_calendar_creds(), "google_oauth2")
+
+
+def _google_tasks_access_token() -> tuple[str | None, str | None]:
+    return _google_access_token_from_creds(_google_tasks_creds(), "google_tasks_oauth2")
 
 
 def _google_calendar_insert_event(
@@ -506,7 +526,7 @@ def _google_calendar_insert_event(
 
 def _google_tasks_insert_task(title: str, due_date: str | None = None, notes: str = "") -> str:
     """Insert a task into Google Tasks via API (default task list)."""
-    token, err = _google_access_token()
+    token, err = _google_tasks_access_token()
     if not token:
         return _as_json_line(
             {

@@ -2,7 +2,26 @@
 
 このファイルを本プロジェクトの正式な変更履歴として運用します。
 
+## 2026-04-16
+
+### バグ修正
+
+- Gemma フォールバック時に「内部整形で問題が発生したため、この依頼は実行結果を確定できませんでした」エラーが誤発生する問題を修正した
+  - 原因: Gemma (gemma-4-31b-it) が chain-of-thought（思考プロセス）テキストを応答に含め、`_looks_like_internal_prompt_leak` が `The user wants to` / `[Tool Results]` 等のマーカーを誤検知していた
+  - `_strip_gemma_thinking()` メソッドを新規追加し、Gemma の思考行（`*   ` で始まる分析テキスト）を除去して最終回答のみを返すようにした
+  - `_compose_final_response()` および `_generate_with_tools()` のレスポンスパス（2箇所）で、prompt-leak チェック前に stripping を適用した
+
+### 設定変更
+
+- RAG（会話履歴コンテキストのプロンプト注入）を再有効化した（`PROMPT_INCLUDE_HISTORY_CONTEXT=true`）
+- ペルソナ記憶のプロンプト注入を再有効化した（`PROMPT_INCLUDE_PERSONA_CONTEXT=true`）
+- メモリ検索スコープを `guild` → `channel` に変更し、無関係な別チャンネルメッセージのノイズ混入を低減した
+- メモリ取得件数を `MEMORY_TOP_K=8` → `4` に変更し、プロンプトサイズとノイズを削減した
+- 全エージェント（Main, Research, Voice STT）のログおよび監査ログ（ai_exchange.log, research_audit, runcli_audit等）のタイムスタンプを UTC から JST (日本標準時) に変更した
+  - `timedelta(hours=9)` を明示的に使用して、ログの可視性とデバッグの効率を向上させた
+
 ## 2026-04-01
+
 
 ## 2026-04-02
 

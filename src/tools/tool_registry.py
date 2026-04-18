@@ -7,6 +7,7 @@ from typing import Any, Callable
 from tools.action_tools import execute_internal_action
 from tools.cli_tools import run_local_cli
 from tools.deep_dive_tools import source_deep_dive
+from tools.memory_tools import get_discord_conversation_status, get_user_memory, search_memory
 from tools.research_tools import dispatch_research_job, get_research_job_status
 from tools.reader_tools import read_url_markdown
 from tools.search_tools import web_search
@@ -183,6 +184,44 @@ def build_default_tool_registry() -> ToolRegistry:
             args_schema={"action": "string", "payload_json": "string(JSON object)"},
             required_args=["action"],
             func=execute_internal_action,
+        ),
+        ToolSpec(
+            name="get_discord_conversation_status",
+            description="Discord会話メモリの状況と最近の記録を取得する",
+            args_schema={
+                "guild_id": "string(int, optional)",
+                "channel_id": "string(int, optional)",
+                "scope": "string(guild/channel)",
+                "limit": "string(int, optional)",
+            },
+            required_args=[],
+            func=get_discord_conversation_status,
+        ),
+        ToolSpec(
+            name="get_user_memory",
+            description="指定ユーザーの会話メモリとプロファイル記憶を取得する",
+            args_schema={
+                "user_id": "string(int)",
+                "guild_id": "string(int, optional)",
+                "channel_id": "string(int, optional)",
+                "scope": "string(guild/channel)",
+                "limit": "string(int, optional)",
+            },
+            required_args=["user_id"],
+            func=get_user_memory,
+        ),
+        ToolSpec(
+            name="search_memory",
+            description="Discord内の過去の会話から類似する発言を検索する",
+            args_schema={
+                "query": "string",
+                "guild_id": "string(int, optional)",
+                "channel_id": "string(int, optional)",
+                "scope": "string(guild/channel)",
+                "limit": "string(int, optional)",
+            },
+            required_args=["query"],
+            func=search_memory,
         ),
     ]
     return ToolRegistry(specs)

@@ -4,7 +4,7 @@ import json
 import os
 import threading
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -78,8 +78,9 @@ def log_ai_exchange(
     except Exception:
         return
 
+    jst = timezone(timedelta(hours=9), "JST")
     entry: dict[str, Any] = {
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "ts": datetime.now(jst).strftime("%Y-%m-%d %H:%M:%S"),
         "component": (component or "unknown").strip() or "unknown",
         "model": (model or "unknown").strip() or "unknown",
         "prompt": _truncate(_normalize_text(prompt or "")),

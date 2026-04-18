@@ -726,8 +726,9 @@ def _drop_guild_cursor_entries(cursor_map: dict[str, int], guild_id: int) -> int
     return removed
 
 
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def _jst_now_iso() -> str:
+    jst = timezone(timedelta(hours=9))
+    return datetime.now(jst).isoformat()
 
 
 def resolve_runcli_audit_log_path() -> Path:
@@ -756,7 +757,7 @@ def resolve_debug_probe_audit_log_path() -> Path:
 
 def append_research_audit(path: Path, payload: dict[str, object]) -> None:
     logger = logging.getLogger(__name__)
-    row = {"ts": _utc_now_iso(), **payload}
+    row = {"ts": _jst_now_iso(), **payload}
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fp:
@@ -767,7 +768,7 @@ def append_research_audit(path: Path, payload: dict[str, object]) -> None:
 
 def append_debug_probe_audit(path: Path, payload: dict[str, object]) -> None:
     logger = logging.getLogger(__name__)
-    row = {"ts": _utc_now_iso(), **payload}
+    row = {"ts": _jst_now_iso(), **payload}
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fp:
@@ -778,7 +779,7 @@ def append_debug_probe_audit(path: Path, payload: dict[str, object]) -> None:
 
 def append_runcli_audit(path: Path, payload: dict[str, object]) -> None:
     logger = logging.getLogger(__name__)
-    row = {"ts": _utc_now_iso(), **payload}
+    row = {"ts": _jst_now_iso(), **payload}
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fp:
@@ -1398,9 +1399,14 @@ def main() -> None:
     logger = logging.getLogger(__name__)
 
     discord_token = _resolve_discord_token()
-    gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    gemini_api_key = (
+        os.getenv("MAIN_AGENT_GEMINI_API_KEY", "").strip()
+        or os.getenv("GEMINI_API_KEY", "").strip()
+    )
     if not discord_token or not gemini_api_key:
-        raise RuntimeError("DISCORD_TOKEN (or DISCORD_BOT_TOKEN) and GEMINI_API_KEY are required")
+        raise RuntimeError(
+            "DISCORD_TOKEN (or DISCORD_BOT_TOKEN) and MAIN_AGENT_GEMINI_API_KEY are required"
+        )
 
     allowed_guild_ids = parse_allowed_guild_ids()
     max_message_len = int(os.getenv("MAX_DISCORD_MESSAGE_LEN", "1900"))
@@ -3080,24 +3086,6 @@ def main() -> None:
             except Exception:
                 logger.exception("Failed to send mention usage hint")
             return
-
-        if mention_quick_calendar_enabled:
-            quick_action = build_quick_calendar_action(question)
-            if quick_action is not None:
-                action_name, payload = quick_action
-                try:
-                    result = await orchestrator.execute_tool_job(
-                        tool_name="execute_internal_action",
-                        args={
-                            "action": action_name,
-                            "payload_json": json.dumps(payload, ensure_ascii=False),
-                        },
-                        task_label=f"mention_quick:{action_name}",
-                    )
-                    await send_message_response(message, result, max_message_len=max_message_len)
-                    return
-                except Exception:
-                    logger.exception("Failed to handle mention quick calendar action")
 
         try:
             await _handle_mention_question(

@@ -8,7 +8,7 @@ import re
 import sqlite3
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -60,7 +60,8 @@ class ResearchJobStore:
                 conn.execute("ALTER TABLE research_jobs ADD COLUMN decision_log TEXT NOT NULL DEFAULT '[]'")
 
     def create_job(self, job_id: str, topic: str, source: str, mode: str) -> None:
-        now = datetime.now(timezone.utc).isoformat()
+        jst = timezone(timedelta(hours=9))
+        now = datetime.now(jst).isoformat()
         with self._lock:
             with sqlite3.connect(self._db_path, timeout=5.0) as conn:
                 conn.execute(
@@ -82,7 +83,8 @@ class ResearchJobStore:
         engine: str | None = None,
         decision_log: list[dict[str, Any]] | None = None,
     ) -> None:
-        now = datetime.now(timezone.utc).isoformat()
+        jst = timezone(timedelta(hours=9))
+        now = datetime.now(jst).isoformat()
         with self._lock:
             with sqlite3.connect(self._db_path, timeout=5.0) as conn:
                 log_json = json.dumps(decision_log or [], ensure_ascii=False)
@@ -180,7 +182,7 @@ def _run_gemini_runner(
         )
         transcript = getattr(orchestrator, "last_transcript", "") or report
         logger.info(
-            "[route] research-agent -> gemini-cli topic=%s source=%s timeout_sec=%s report_chars=%s transcript_chars=%s",
+            "[route] research-agent -> gemini-api topic=%s source=%s timeout_sec=%s report_chars=%s transcript_chars=%s",
             topic[:160],
             source,
             timeout_sec,
@@ -300,9 +302,9 @@ def _run_research(
     )
     transcript = ""
     if clean_mode not in {"auto", "gemini_cli", "fallback"}:
-        logger.warning("[research-agent][run] unknown mode=%s; defaulting to gemini-cli", clean_mode)
-    logger.info("[route] research-agent mode=%s path=gemini-cli", clean_mode)
-    engine = "gemini_cli"
+        logger.warning("[research-agent][run] unknown mode=%s; defaulting to gemini-api", clean_mode)
+    logger.info("[route] research-agent mode=%s path=gemini-api", clean_mode)
+    engine = "gemini_api"
     run_started = time.time()
     min_explore_sec = int(timeout_sec * 0.9) if time_specified else 0
     planned_attempts = 1 if not time_specified else max(1, min(5, timeout_sec // 120 + 1))
@@ -441,7 +443,7 @@ def _run_research(
                 {
                     "stage": "quality_gate",
                     "attempt": attempt,
-                    "status": "return_to_gemini_cli",
+                    "status": "return_to_gemini_api",
                     "quality_reasons": quality_reasons,
                 }
             )
@@ -489,7 +491,7 @@ async def _run_orchestrator_deepdive(
         logger.info("[research-agent][orchestrator] start topic=%s source=%s timeout_sec=%s", topic, source, timeout_sec)
         orchestrator = await build_research_orchestrator()
         # Pass timeout_sec to orchestrator for decision loop planning
-        question = f"{topic}\n\n[Initial Gemini CLI report]\n{initial_report}"
+        question = f"{topic}\n\n[Initial Gemini API report]\n{initial_report}"
         answer, decision_log = await orchestrator.answer(topic=question, source=source, timeout_sec=timeout_sec)
         logger.info("[research-agent][orchestrator] done decision_log_len=%s timeout_sec=%s", len(decision_log), timeout_sec)
         return answer, decision_log

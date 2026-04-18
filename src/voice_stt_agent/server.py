@@ -7,7 +7,7 @@ import threading
 import tempfile
 import time
 import base64
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -32,7 +32,8 @@ def _safe_int(name: str, default: int) -> int:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    jst = timezone(timedelta(hours=9))
+    return datetime.now(jst).isoformat()
 
 
 def _rule_based_intent(text: str) -> tuple[str, float, str]:

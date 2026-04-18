@@ -6,13 +6,14 @@ import asyncio
 import json
 import logging
 import os
-import shlex
 import re
-import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
+
+import google.generativeai as genai
+from google.generativeai.types import RequestOptions
 
 from tools import ToolRegistry, build_default_tool_registry
 from tools.ai_exchange_logger import log_ai_exchange
@@ -23,8 +24,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class OrchestratorConfig:
-    use_gemini_cli: bool = True
-    gemini_command: str = "gemini"
+    gemini_api_key: str = ""
     gemini_model: str = "gemini-3.1-flash-lite-preview"
     gemini_timeout_sec: int = 60
 
@@ -32,10 +32,37 @@ class OrchestratorConfig:
 class ResearchOrchestrator:
     def __init__(self, config: OrchestratorConfig | None = None) -> None:
         self.config = config or OrchestratorConfig()
+        if not self.config.gemini_api_key:
+            raise RuntimeError("RESEARCH_AGENT_GEMINI_API_KEY is required")
+        genai.configure(api_key=self.config.gemini_api_key)
+        self.model = genai.GenerativeModel(self.config.gemini_model)
+        self.gemini_503_fallback_model = (
+            os.getenv("RESEARCH_AGENT_GEMINI_503_FALLBACK_MODEL", "gemma-4-31b-it").strip()
+            or "gemma-4-31b-it"
+        )
+        self.gemini_503_fallback_cooldown_sec = max(
+            30,
+            int(os.getenv("RESEARCH_AGENT_GEMINI_503_FALLBACK_COOLDOWN_SEC", "300")),
+        )
+        self._prefer_fallback_until_monotonic = 0.0
+        self._fallback_model: Any | None = None
+        if self.gemini_503_fallback_model != self.config.gemini_model:
+            try:
+                self._fallback_model = genai.GenerativeModel(self.gemini_503_fallback_model)
+            except Exception:
+                logger.exception(
+                    "Failed to initialize research fallback model: %s",
+                    self.gemini_503_fallback_model,
+                )
         self.tool_registry = build_default_tool_registry()
         self.max_tool_turns = 2
         self.last_transcript = ""
         self._deadline_monotonic: float | None = None
+
+    @staticmethod
+    def _is_503_error(error: Exception) -> bool:
+        msg = str(error or "").lower()
+        return "503" in msg or "service unavailable" in msg
 
     async def answer(
         self,
@@ -44,7 +71,7 @@ class ResearchOrchestrator:
         timeout_sec: int = 60,
         time_specified: bool = False,
     ) -> tuple[str, list[dict[str, Any]]]:
-        """Run the Gemini CLI-based research loop and keep its raw transcript for later attachment."""
+        """Run the research-manager loop with the dedicated Gemini API key and keep raw transcript."""
         await asyncio.sleep(0)
         if time_specified:
             self._deadline_monotonic = time.monotonic() + max(10, int(timeout_sec))
@@ -59,9 +86,7 @@ class ResearchOrchestrator:
         question = f"topic: {topic}\nsource: {source}"
 
         def _call_model(prompt: str) -> str:
-            if not self.config.use_gemini_cli:
-                logger.warning("Gemini CLI is disabled in config; using CLI path anyway")
-            return self._call_gemini_cli(prompt)
+            return self._call_gemini_api(prompt)
 
         try:
             loop_result = await asyncio.to_thread(
@@ -71,7 +96,7 @@ class ResearchOrchestrator:
                 timeout_sec=timeout_sec,
                 model_name=self.config.gemini_model,
                 model_call=_call_model,
-                loop_label="gemini-cli-research",
+                loop_label="research-manager",
                 tool_registry=self.tool_registry,
                 max_turns=self.max_tool_turns if self.max_tool_turns > 0 else None,
             )
@@ -80,16 +105,7 @@ class ResearchOrchestrator:
         finally:
             self._deadline_monotonic = None
 
-    def _call_gemini_cli(self, prompt: str) -> str:
-        command = (self.config.gemini_command or "gemini").strip() or "gemini"
-        argv = shlex.split(command)
-        if not argv:
-            raise RuntimeError("gemini_cli_command_empty")
-
-        if self.config.gemini_model:
-            argv.extend(["--model", self.config.gemini_model])
-        argv.extend(["--prompt", prompt])
-
+    def _call_gemini_api(self, prompt: str) -> str:
         cli_timeout = int(self.config.gemini_timeout_sec)
         if self._deadline_monotonic is not None:
             remaining = int(self._deadline_monotonic - time.monotonic())
@@ -97,80 +113,108 @@ class ResearchOrchestrator:
                 raise RuntimeError("research_timeout_reached_before_gemini_call")
             cli_timeout = max(5, min(cli_timeout, remaining))
 
-        logger.info(
-            "[route] research-agent -> gemini-cli command=%s model=%s timeout_sec=%s prompt_chars=%s",
-            argv[0],
-            self.config.gemini_model,
-            cli_timeout,
-            len(prompt),
-        )
-        log_ai_exchange(
-            component="research-agent",
-            model=self.config.gemini_model,
-            prompt=prompt,
-            response="",
-            metadata={
-                "phase": "gemini_cli_request",
-                "command": argv[0],
-                "timeout_sec": cli_timeout,
-            },
-        )
+        def _call_once(active_model: Any, active_model_name: str, phase_request: str, phase_response: str) -> str:
+            logger.info(
+                "[route] research-agent -> model=%s timeout_sec=%s prompt_chars=%s",
+                active_model_name,
+                cli_timeout,
+                len(prompt),
+            )
+            log_ai_exchange(
+                component="research-agent",
+                model=active_model_name,
+                prompt=prompt,
+                response="",
+                metadata={
+                    "phase": phase_request,
+                    "timeout_sec": cli_timeout,
+                },
+            )
+            response = active_model.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.2,
+                    top_p=0.95,
+                    top_k=40,
+                    max_output_tokens=2048,
+                ),
+                request_options=RequestOptions(timeout=cli_timeout, retry=None),
+            )
+            output = (getattr(response, "text", "") or "").strip()
+            if not output:
+                raise RuntimeError("gemini_api_empty_output")
+            log_ai_exchange(
+                component="research-agent",
+                model=active_model_name,
+                prompt=prompt,
+                response=output,
+                metadata={
+                    "phase": phase_response,
+                    "attempt": 1,
+                },
+            )
+            return output
+
+        if (
+            self._fallback_model is not None
+            and time.monotonic() < self._prefer_fallback_until_monotonic
+        ):
+            return _call_once(
+                self._fallback_model,
+                self.gemini_503_fallback_model,
+                "gemini_api_request_fallback",
+                "gemini_api_response_fallback",
+            )
 
         try:
-            completed = subprocess.run(
-                argv,
-                text=True,
-                capture_output=True,
-                timeout=cli_timeout,
-                check=False,
+            return _call_once(
+                self.model,
+                self.config.gemini_model,
+                "gemini_api_request",
+                "gemini_api_response",
             )
-        except FileNotFoundError as exc:
-            raise RuntimeError(f"gemini_cli_not_found:{exc}") from exc
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(f"gemini_cli_timeout:{int(cli_timeout)}s") from exc
         except Exception as exc:
-            raise RuntimeError(f"gemini_cli_exec_failed:{exc}") from exc
-
-        if completed.returncode != 0:
-            err = (completed.stderr or completed.stdout or "gemini_cli_non_zero_exit").strip()
             log_ai_exchange(
                 component="research-agent",
                 model=self.config.gemini_model,
                 prompt=prompt,
                 response="",
                 metadata={
-                    "phase": "gemini_cli_response",
-                    "returncode": completed.returncode,
+                    "phase": "gemini_api_response",
+                    "attempt": 1,
                 },
-                error=err,
+                error=str(exc),
             )
-            raise RuntimeError(err[:1200])
-
-        output = (completed.stdout or "").strip()
-        if not output:
-            log_ai_exchange(
-                component="research-agent",
-                model=self.config.gemini_model,
-                prompt=prompt,
-                response="",
-                metadata={
-                    "phase": "gemini_cli_response",
-                    "returncode": completed.returncode,
-                },
-                error="gemini_cli_empty_output",
-            )
-            raise RuntimeError("gemini_cli_empty_output")
-        log_ai_exchange(
-            component="research-agent",
-            model=self.config.gemini_model,
-            prompt=prompt,
-            response=output,
-            metadata={
-                "phase": "gemini_cli_response",
-                "returncode": completed.returncode,
-            },
-        )
-        return output
+            if self._is_503_error(exc) and self._fallback_model is not None:
+                self._prefer_fallback_until_monotonic = (
+                    time.monotonic() + float(self.gemini_503_fallback_cooldown_sec)
+                )
+                logger.warning(
+                    "Research Gemini returned 503; switch to fallback model=%s (cooldown=%ss)",
+                    self.gemini_503_fallback_model,
+                    self.gemini_503_fallback_cooldown_sec,
+                )
+                try:
+                    return _call_once(
+                        self._fallback_model,
+                        self.gemini_503_fallback_model,
+                        "gemini_api_request_fallback",
+                        "gemini_api_response_fallback",
+                    )
+                except Exception as fallback_exc:
+                    log_ai_exchange(
+                        component="research-agent",
+                        model=self.gemini_503_fallback_model,
+                        prompt=prompt,
+                        response="",
+                        metadata={
+                            "phase": "gemini_api_response_fallback",
+                            "attempt": 1,
+                        },
+                        error=str(fallback_exc),
+                    )
+                    raise RuntimeError("gemini_api_call_failed") from fallback_exc
+            raise RuntimeError("gemini_api_call_failed") from exc
 
     def _build_thinking_prompt(
         self,
@@ -508,6 +552,10 @@ class ResearchOrchestrator:
 
 def load_research_orchestrator_config() -> OrchestratorConfig:
     """Load Research orchestrator config from environment."""
+    api_key = (
+        os.getenv("RESEARCH_AGENT_GEMINI_API_KEY", "").strip()
+        or os.getenv("GEMINI_API_KEY", "").strip()
+    )
     cli_model = (
         os.getenv("RESEARCH_AGENT_GEMINI_MODEL", "").strip()
         or os.getenv("RESEARCH_GEMINI_MODEL", "gemini-3.1-flash-lite-preview").strip()
@@ -522,8 +570,7 @@ def load_research_orchestrator_config() -> OrchestratorConfig:
         cli_timeout = 60
 
     return OrchestratorConfig(
-        use_gemini_cli=os.getenv("RESEARCH_AGENT_USE_GEMINI_CLI", "true").strip().lower() == "true",
-        gemini_command=os.getenv("RESEARCH_AGENT_GEMINI_COMMAND", "gemini").strip() or "gemini",
+        gemini_api_key=api_key,
         gemini_model=cli_model,
         gemini_timeout_sec=max(30, cli_timeout),
     )

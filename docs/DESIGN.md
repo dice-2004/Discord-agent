@@ -318,7 +318,7 @@ N100導入時は、Main Agentの即応性を守るために以下の分離を標
 * **時刻整合:** 保存時刻は取り込み時刻ではなくDiscordメッセージの作成時刻を優先して保持する
 * **遅延対策:** `/ask` 処理とは分離し、履歴取り込みで応答遅延を増やさない
 * **前提条件:** 全会話収集にはDiscord Developer PortalでMessage Content Intentを有効化し、`DISCORD_ENABLE_MESSAGE_CONTENT_INTENT=true` を設定する
-* **参照範囲:** 回答時の既定参照はチャンネル限定ではなく、同一ギルド全体（`MEMORY_RETRIEVAL_SCOPE=guild`）とする
+* **参照範囲:** 回答時の既定参照はチャンネル内（`MEMORY_RETRIEVAL_SCOPE=channel`）とし、ノイズを低減する。ギルド全体参照（`guild`）も設定可能だが、無関係メッセージ混入のリスクがある
 * **検証モード:** 回答末尾に参照メモリを表示する `MEMORY_RESPONSE_INCLUDE_EVIDENCE` をサポートする
 * **可読性:** 参照メモリ表示ではチャンネルIDではなくチャンネル名を優先表示し、同一内容の重複行を抑制する
 * **日時表示:** 参照メモリ表示の時刻はJST表記へ統一し、Discord上での確認を容易にする
@@ -469,6 +469,11 @@ AI-agent-bot/
   * `.env` 設定漏れ
   * Discord送信失敗
 * ユーザー向けには簡潔な失敗メッセージを返し、詳細はログに出すこと
+* **Gemini 503フォールバック方針:**
+  * Gemini APIが503を返した場合、`GEMINI_503_FALLBACK_MODEL`（既定: `gemma-4-31b-it`）へ即時フォールバックし、クールダウン期間中はGeminiを叩かない
+  * Gemmaモデルはchain-of-thought（`*   ` で始まる思考プロセス行）を応答に含むため、`_strip_gemma_thinking()` で除去してからユーザーに返す
+  * stripping後もなおプロンプトリーク（内部指示文の漏出）が検出された場合のみ、安全なエラーメッセージに置換する
+
 
 ### 7.4. Discord運用ルール
 
@@ -773,8 +778,8 @@ MEMORY_BOOTSTRAP_BATCH_SIZE=200
 MEMORY_BOOTSTRAP_FORCE_REINDEX=false
 MEMORY_BOOTSTRAP_INCLUDE_ARCHIVED_THREADS=true
 MEMORY_BOOTSTRAP_ARCHIVED_LIMIT_PER_PARENT=0
-MEMORY_RETRIEVAL_SCOPE=guild
-MEMORY_TOP_K=8
+MEMORY_RETRIEVAL_SCOPE=channel
+MEMORY_TOP_K=4
 MEMORY_RESPONSE_INCLUDE_EVIDENCE=false
 MEMORY_RESPONSE_EVIDENCE_ITEMS=3
 DIRECTIONAL_MEMORY_ENABLED=false

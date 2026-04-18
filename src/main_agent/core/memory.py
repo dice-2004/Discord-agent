@@ -490,6 +490,38 @@ class ChannelMemoryStore:
     async def get_guild_memory_stats(self, guild_id: int | None) -> dict[str, Any]:
         return await asyncio.to_thread(self._get_guild_memory_stats_sync, guild_id)
 
+    async def get_recent_messages(
+        self,
+        guild_id: int | None,
+        channel_id: int,
+        limit: int = 20,
+        scope: str = "channel",
+    ) -> list[MemoryRecord]:
+        return await asyncio.to_thread(
+            self._get_recent_messages_sync,
+            guild_id,
+            channel_id,
+            limit,
+            scope,
+        )
+
+    async def get_user_messages(
+        self,
+        user_id: int,
+        guild_id: int | None,
+        channel_id: int,
+        limit: int = 20,
+        scope: str = "guild",
+    ) -> list[MemoryRecord]:
+        return await asyncio.to_thread(
+            self._get_user_messages_sync,
+            user_id,
+            guild_id,
+            channel_id,
+            limit,
+            scope,
+        )
+
     def _get_guild_memory_stats_sync(self, guild_id: int | None) -> dict[str, Any]:
         guild_part = str(guild_id) if guild_id is not None else "dm"
         prefix = f"mem_g{guild_part}_"
@@ -516,6 +548,133 @@ class ChannelMemoryStore:
             "total_records": total,
             "collections": stats,
         }
+
+    def _get_recent_messages_sync(
+        self,
+        guild_id: int | None,
+        channel_id: int,
+        limit: int,
+        scope: str,
+    ) -> list[MemoryRecord]:
+        normalized_scope = (scope or "channel").strip().lower()
+        if normalized_scope == "guild":
+            collection_name = self._normalize_guild_collection_name(guild_id)
+        else:
+            collection_name = self._normalize_collection_name(guild_id, channel_id)
+
+        try:
+            collection = self._client.get_collection(name=collection_name)
+        except Exception:
+            return []
+
+        fetch_limit = max(1, min(int(limit), 200))
+        try:
+            result = collection.get(include=["documents", "metadatas"], limit=max(fetch_limit * 4, 80))
+        except Exception:
+            logger.exception("Failed to get recent messages: %s", collection_name)
+            return []
+
+        docs = result.get("documents", []) or []
+        mds = result.get("metadatas", []) or []
+        rows: list[tuple[float, MemoryRecord]] = []
+        for idx, content in enumerate(docs):
+            md = mds[idx] if idx < len(mds) else {}
+            ts_text = str(md.get("timestamp", "") or "")
+            ts_score = 0.0
+            if ts_text:
+                try:
+                    ts_score = datetime.fromisoformat(ts_text.replace("Z", "+00:00")).timestamp()
+                except Exception:
+                    ts_score = 0.0
+            rows.append(
+                (
+                    ts_score,
+                    MemoryRecord(
+                        role=str(md.get("role", "unknown")),
+                        content=str(content or ""),
+                        timestamp=ts_text,
+                        user_id=str(md.get("user_id", "")),
+                        message_id=str(md.get("message_id", "")) or None,
+                        metadata=md,
+                    ),
+                )
+            )
+
+        rows.sort(key=lambda x: x[0], reverse=True)
+        out: list[MemoryRecord] = []
+        for _, rec in rows:
+            if not rec.content.strip():
+                continue
+            out.append(rec)
+            if len(out) >= fetch_limit:
+                break
+        return out
+
+    def _get_user_messages_sync(
+        self,
+        user_id: int,
+        guild_id: int | None,
+        channel_id: int,
+        limit: int,
+        scope: str,
+    ) -> list[MemoryRecord]:
+        normalized_scope = (scope or "guild").strip().lower()
+        if normalized_scope == "channel":
+            collection_name = self._normalize_collection_name(guild_id, channel_id)
+        else:
+            collection_name = self._normalize_guild_collection_name(guild_id)
+
+        try:
+            collection = self._client.get_collection(name=collection_name)
+        except Exception:
+            return []
+
+        fetch_limit = max(1, min(int(limit), 200))
+        try:
+            result = collection.get(
+                where={"user_id": str(user_id)},
+                include=["documents", "metadatas"],
+                limit=max(fetch_limit * 4, 80),
+            )
+        except Exception:
+            logger.exception("Failed to get user messages: user_id=%s collection=%s", user_id, collection_name)
+            return []
+
+        docs = result.get("documents", []) or []
+        mds = result.get("metadatas", []) or []
+        rows: list[tuple[float, MemoryRecord]] = []
+        for idx, content in enumerate(docs):
+            md = mds[idx] if idx < len(mds) else {}
+            ts_text = str(md.get("timestamp", "") or "")
+            ts_score = 0.0
+            if ts_text:
+                try:
+                    ts_score = datetime.fromisoformat(ts_text.replace("Z", "+00:00")).timestamp()
+                except Exception:
+                    ts_score = 0.0
+            rows.append(
+                (
+                    ts_score,
+                    MemoryRecord(
+                        role=str(md.get("role", "unknown")),
+                        content=str(content or ""),
+                        timestamp=ts_text,
+                        user_id=str(md.get("user_id", "")),
+                        message_id=str(md.get("message_id", "")) or None,
+                        metadata=md,
+                    ),
+                )
+            )
+
+        rows.sort(key=lambda x: x[0], reverse=True)
+        out: list[MemoryRecord] = []
+        for _, rec in rows:
+            if not rec.content.strip():
+                continue
+            out.append(rec)
+            if len(out) >= fetch_limit:
+                break
+        return out
 
     def _fetch_relevant_messages_sync(
         self,

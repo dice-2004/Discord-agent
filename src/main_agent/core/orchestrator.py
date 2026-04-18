@@ -16,6 +16,7 @@ from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
 import google.generativeai as genai
+from google.generativeai.types import RequestOptions
 
 from main_agent.core.memory import ChannelMemoryStore, MemoryRecord, TaskCheckpointStore
 from tools.ai_exchange_logger import log_ai_exchange
@@ -40,8 +41,14 @@ class DiscordOrchestrator:
         self.memory = ChannelMemoryStore(persist_dir=config.chromadb_path, top_k=4)
         self._profile_cache: str | None = None
         self.tool_registry: ToolRegistry = build_default_tool_registry()
-        self.max_tool_turns = int(os.getenv("MAX_TOOL_TURNS", "3"))
-        self.max_review_turns = int(os.getenv("MAX_REVIEW_TURNS", "1"))
+        self.max_tool_turns = max(1, int(os.getenv("MAX_TOOL_TURNS", "1")))
+        self.max_review_turns = int(os.getenv("MAX_REVIEW_TURNS", "0"))
+        self.prompt_include_history_context = (
+            os.getenv("PROMPT_INCLUDE_HISTORY_CONTEXT", "false").strip().lower() == "true"
+        )
+        self.prompt_include_persona_context = (
+            os.getenv("PROMPT_INCLUDE_PERSONA_CONTEXT", "false").strip().lower() == "true"
+        )
         self.memory_scope = os.getenv("MEMORY_RETRIEVAL_SCOPE", "guild").strip().lower() or "guild"
         self.memory_top_k = int(os.getenv("MEMORY_TOP_K", "8"))
         self.memory_response_include_evidence = (
@@ -86,6 +93,25 @@ class DiscordOrchestrator:
 
         genai.configure(api_key=config.gemini_api_key)
         self.model = genai.GenerativeModel(model_name=config.gemini_model)
+        self.gemini_503_fallback_model = (
+            os.getenv("GEMINI_503_FALLBACK_MODEL", "gemma-4-31b-it").strip()
+            or "gemma-4-31b-it"
+        )
+        self.gemini_503_fallback_cooldown_sec = max(
+            30,
+            int(os.getenv("GEMINI_503_FALLBACK_COOLDOWN_SEC", "300")),
+        )
+        self._prefer_fallback_until_monotonic = 0.0
+        self._last_model_used_name = config.gemini_model
+        self._fallback_model: Any | None = None
+        if self.gemini_503_fallback_model != config.gemini_model:
+            try:
+                self._fallback_model = genai.GenerativeModel(model_name=self.gemini_503_fallback_model)
+            except Exception:
+                logger.exception(
+                    "Failed to initialize 503 fallback model: %s",
+                    self.gemini_503_fallback_model,
+                )
 
     def configure_directional_memory_policy(
         self,
@@ -294,7 +320,8 @@ class DiscordOrchestrator:
         recall_intent = self._is_history_recall_query(retrieval_question)
         retrieval_limit = max(self.memory_top_k, 24) if recall_intent else self.memory_top_k
         retrieval_scope = "guild" if recall_intent else self.memory_scope
-        use_history_context = True
+        # Keep prompt payload minimal by default; only include history when recall/follow-up needs it.
+        use_history_context = bool(recall_intent or has_followup_marker)
         if is_explicit_global_query and not has_followup_marker:
             use_history_context = False
             retrieval_scope = "disabled(explicit_global_query)"
@@ -365,7 +392,7 @@ class DiscordOrchestrator:
             context_lines.append(f"- [{record.timestamp}] {record.role}{channel_tag}: {record.content[:240]}")
         history_context = "\n".join(context_lines) if context_lines else "(関連履歴なし)"
         persona_context = "(ユーザープロファイル未設定)"
-        if self.persona_memory_enabled and self.persona_memory_include_in_prompt:
+        if self.prompt_include_persona_context and self.persona_memory_enabled and self.persona_memory_include_in_prompt:
             try:
                 facts = await self.memory.get_user_profile_facts(user_id=user_id, limit=self.persona_memory_max_facts)
                 if facts:
@@ -381,15 +408,23 @@ class DiscordOrchestrator:
             except Exception:
                 logger.exception("Failed to load persona profile for prompt")
 
-        system_prompt = await self._build_system_prompt(history_context, persona_context)
+        prompt_history_context = history_context if self.prompt_include_history_context else "(省略)"
+        prompt_persona_context = persona_context if self.prompt_include_persona_context else "(省略)"
+        system_prompt = await self._build_system_prompt(prompt_history_context, prompt_persona_context)
 
         try:
             answer_text = await self._generate_with_tools(system_prompt, question)
             if not answer_text.strip():
                 answer_text = "回答を生成できませんでした。質問を少し変えて再試行してください。"
             answer_text = self._sanitize_user_facing_error_phrases(answer_text)
+            if self._last_model_is_gemma() and self._looks_like_internal_prompt_leak(answer_text):
+                logger.warning("Detected internal prompt-leak style output; replacing with safe error message")
+                answer_text = "内部整形で問題が発生したため、この依頼は実行結果を確定できませんでした。もう一度依頼してください。"
             if self.memory_response_include_evidence:
                 answer_text = self._append_memory_evidence(answer_text, history_records)
+        except RuntimeError as exc:
+            logger.warning("LLM invocation failed without crashing response: %s", str(exc)[:300])
+            answer_text = "現在AI応答で一時的な問題が発生しています。少し時間をおいて再試行してください。"
         except Exception:
             logger.exception("LLM invocation failed")
             answer_text = "現在AI応答で問題が発生しています。時間をおいて再試行してください。"
@@ -536,77 +571,116 @@ class DiscordOrchestrator:
                 scratchpad=scratchpad,
                 turn=turn,
             )
-            action = str(decision.get("action", "respond")).strip().lower()
-            tool_names = self.tool_registry.tool_names()
-            if action in tool_names:
-                decision = {
-                    "action": "tool",
-                    "tool": action,
-                    "args": decision.get("args", {}) if isinstance(decision.get("args", {}), dict) else {},
-                    "reason": decision.get("reason", "fallback:action_as_tool_name"),
-                }
-                action = "tool"
+            decisions = decision if isinstance(decision, list) else [decision]
+            if not decisions:
+                decisions = [{}]
 
-            if action != "tool":
-                alias_tool = str(decision.get("tool", "")).strip()
-                if alias_tool in tool_names and not str(decision.get("action", "")).strip().lower() == "respond":
+            tool_names = self.tool_registry.tool_names()
+            force_tool_decision: dict[str, Any] | None = None
+            if len(decisions) == 1 and isinstance(decisions[0], dict):
+                single_decision = decisions[0]
+                action = str(single_decision.get("action", "respond")).strip().lower()
+                if action in tool_names:
+                    single_decision = {
+                        "action": "tool",
+                        "tool": action,
+                        "args": single_decision.get("args", {}) if isinstance(single_decision.get("args", {}), dict) else {},
+                        "reason": single_decision.get("reason", "fallback:action_as_tool_name"),
+                    }
                     action = "tool"
 
-            if self._should_force_research_job(
-                question=runtime_question,
-                turn=turn,
-                action=action,
-                scratchpad=scratchpad,
-            ):
-                forced_source = self._infer_research_source_from_question(runtime_question)
-                forced_topic = self._resolve_research_topic(runtime_question)
-                decision = {
-                    "action": "tool",
-                    "tool": "dispatch_research_job",
-                    "args": {
-                        "topic": forced_topic,
-                        "source": forced_source,
-                        "mode": "auto",
-                    },
-                    "reason": "guard:external_research_intent",
-                }
-                action = "tool"
-                self._log_ai_thought(
-                    stage="force_dispatch_research_job",
-                    source=forced_source,
-                    topic=forced_topic,
-                    reason="guard_external_research_intent",
-                )
-            logger.info(
-                "Agent decision: turn=%s action=%s tool=%s reason=%s",
-                turn,
-                action,
-                str(decision.get("tool", "")),
-                str(decision.get("reason", ""))[:180],
-            )
-            self._log_ai_thought(
-                stage="decision",
-                turn=turn,
-                action=action,
-                tool=str(decision.get("tool", "")),
-                reason=str(decision.get("reason", ""))[:180],
-            )
+                if action != "tool":
+                    alias_tool = str(single_decision.get("tool", "")).strip()
+                    if alias_tool in tool_names and not str(single_decision.get("action", "")).strip().lower() == "respond":
+                        action = "tool"
 
-            if action == "tool":
-                tool_name = str(decision.get("tool", "")).strip()
-                args = decision.get("args", {})
+                if self._should_force_research_job(
+                    question=runtime_question,
+                    turn=turn,
+                    action=action,
+                    scratchpad=scratchpad,
+                ):
+                    forced_source = self._infer_research_source_from_question(runtime_question)
+                    forced_topic = self._resolve_research_topic(runtime_question)
+                    force_tool_decision = {
+                        "action": "tool",
+                        "tool": "dispatch_research_job",
+                        "args": {
+                            "topic": forced_topic,
+                            "source": forced_source,
+                            "mode": "auto",
+                        },
+                        "reason": "guard:external_research_intent",
+                    }
+                    action = "tool"
+                    self._log_ai_thought(
+                        stage="force_dispatch_research_job",
+                        source=forced_source,
+                        topic=forced_topic,
+                        reason="guard_external_research_intent",
+                    )
+                    single_decision = force_tool_decision
+
+                logger.info(
+                    "Agent decision: turn=%s action=%s tool=%s reason=%s",
+                    turn,
+                    action,
+                    str(single_decision.get("tool", "")),
+                    str(single_decision.get("reason", ""))[:180],
+                )
+                self._log_ai_thought(
+                    stage="decision",
+                    turn=turn,
+                    action=action,
+                    tool=str(single_decision.get("tool", "")),
+                    reason=str(single_decision.get("reason", ""))[:180],
+                )
+
+                if action == "tool":
+                    decisions = [single_decision]
+
+            executed_any_tool = False
+            pending_response: str | None = None
+
+            for raw_decision in decisions:
+                if not isinstance(raw_decision, dict):
+                    continue
+
+                action = str(raw_decision.get("action", "respond")).strip().lower()
+                if action in tool_names:
+                    raw_decision = {
+                        "action": "tool",
+                        "tool": action,
+                        "args": raw_decision.get("args", {}) if isinstance(raw_decision.get("args", {}), dict) else {},
+                        "reason": raw_decision.get("reason", "fallback:action_as_tool_name"),
+                    }
+                    action = "tool"
+
+                if action != "tool":
+                    alias_tool = str(raw_decision.get("tool", "")).strip()
+                    if alias_tool in tool_names and not str(raw_decision.get("action", "")).strip().lower() == "respond":
+                        action = "tool"
+
+                if action != "tool":
+                    response = str(raw_decision.get("response", "")).strip()
+                    if response:
+                        pending_response = response
+                    continue
+
+                tool_name = str(raw_decision.get("tool", "")).strip()
+                args = raw_decision.get("args", {})
 
                 # Fallback for malformed model outputs:
                 # {"action":"execute_internal_action","parameters":{...}}
                 if not tool_name:
-                    maybe_action = str(decision.get("action", "")).strip()
+                    maybe_action = str(raw_decision.get("action", "")).strip()
                     if maybe_action in tool_names:
                         tool_name = maybe_action
                     elif maybe_action:
                         tool_name = "execute_internal_action"
-                        raw_payload = decision.get("parameters")
+                        raw_payload = raw_decision.get("parameters")
                         if not isinstance(raw_payload, dict):
-                            raw_payload = decision.get("payload") if isinstance(decision.get("payload"), dict) else {}
+                            raw_payload = raw_decision.get("payload") if isinstance(raw_decision.get("payload"), dict) else {}
                         args = {
                             "action": maybe_action,
                             "payload_json": json.dumps(raw_payload, ensure_ascii=False),
@@ -711,12 +785,60 @@ class DiscordOrchestrator:
                 scratchpad.append(
                     f"[Tool:{tool_name}] args={json.dumps(args, ensure_ascii=False)}\n{tool_output}"
                 )
-                continue
+                executed_any_tool = True
 
-            response = str(decision.get("response", "")).strip()
+            if executed_any_tool:
+                # Keep request fan-out bounded: one decision call + one final response call.
+                composed_after_tool = await self._compose_final_response(
+                    system_prompt=system_prompt,
+                    question=runtime_question,
+                    now_jst=now_jst,
+                    scratchpad=scratchpad,
+                )
+                reviewed_after_tool = await self._self_review_response(
+                    system_prompt=system_prompt,
+                    question=runtime_question,
+                    response=composed_after_tool,
+                    scratchpad=scratchpad,
+                )
+                return self._ensure_sources_in_answer(reviewed_after_tool, scratchpad)
+
+            if pending_response is not None:
+                logger.info("[route] main-agent -> respond turn=%s", turn)
+                if self._is_nonfinal_response(pending_response) or (
+                    self._last_model_is_gemma() and self._looks_like_internal_prompt_leak(pending_response)
+                ):
+                    had_tool_context = bool(scratchpad)
+                    scratchpad.append(f"[Agent] 非最終応答を検知: {pending_response[:120]}")
+                    if had_tool_context:
+                        continue
+                    fallback_response = await self._compose_final_response(
+                        system_prompt=system_prompt,
+                        question=runtime_question,
+                        now_jst=now_jst,
+                        scratchpad=scratchpad,
+                    )
+                    fallback_reviewed = await self._self_review_response(
+                        system_prompt=system_prompt,
+                        question=runtime_question,
+                        response=fallback_response,
+                        scratchpad=scratchpad,
+                    )
+                    return self._ensure_sources_in_answer(fallback_reviewed, scratchpad)
+                reviewed = await self._self_review_response(
+                    system_prompt=system_prompt,
+                    question=runtime_question,
+                    response=pending_response,
+                    scratchpad=scratchpad,
+                )
+                return self._ensure_sources_in_answer(reviewed, scratchpad)
+
+            response = str((decision[0] if isinstance(decision, list) and decision else decision).get("response", "") if isinstance(decision, dict) or (isinstance(decision, list) and decision and isinstance(decision[0], dict)) else "").strip()
             if response:
                 logger.info("[route] main-agent -> respond turn=%s", turn)
-                if self._is_nonfinal_response(response):
+                if self._is_nonfinal_response(response) or (
+                    self._last_model_is_gemma() and self._looks_like_internal_prompt_leak(response)
+                ):
                     had_tool_context = bool(scratchpad)
                     scratchpad.append(f"[Agent] 非最終応答を検知: {response[:120]}")
                     if had_tool_context:
@@ -822,11 +944,17 @@ class DiscordOrchestrator:
         scratchpad: list[str],
     ) -> dict[str, Any]:
         observation = "\n\n".join(scratchpad) if scratchpad else "(ツール結果なし)"
+        strict_json_line = (
+            "思考過程・補足説明・Markdownを出力せず、JSONオブジェクト1つだけを返す。\n"
+            if self._is_gemma_model()
+            else ""
+        )
         prompt = (
             f"{system_prompt}\n\n"
             "[Reviewer Role]\n"
             "あなたは回答品質レビュー担当です。以下の回答を評価し、必要なら修正してください。\n"
             "出力はJSONのみ。\n"
+            f"{strict_json_line}"
             "- 形式1(問題なし): {\"action\":\"approve\"}\n"
             "- 形式2(書き換え): {\"action\":\"rewrite\",\"response\":\"...\"}\n"
             "- 形式3(追加ツール必要): {\"action\":\"needs_tool\",\"tool\":\"...\",\"args\":{...},\"reason\":\"...\"}\n"
@@ -843,7 +971,7 @@ class DiscordOrchestrator:
         raw = await self._invoke_with_retry(
             prompt,
             max_output_tokens=420,
-            response_mime_type="application/json",
+            response_mime_type=None if self._is_gemma_model() else "application/json",
         )
         parsed = self._extract_json_object(raw)
         if parsed:
@@ -859,6 +987,12 @@ class DiscordOrchestrator:
         turn: int,
     ) -> dict[str, Any]:
         observation = "\n\n".join(scratchpad) if scratchpad else "(まだツール未実行)"
+        strict_json_line = (
+            "思考過程・補足説明・Markdownを出力せず、JSONオブジェクト1つだけを返す。"
+            if self._is_gemma_model()
+            else ""
+        )
+        strict_json_policy_line = f"- {strict_json_line}\n" if strict_json_line else ""
         prompt = (
             f"{system_prompt}\n\n"
             "[Agent Role]\n"
@@ -887,6 +1021,7 @@ class DiscordOrchestrator:
             "- ユーザーが「実行して」「登録して」などの明示的指示をした場合、信頼度に関わらず躊躇なく tool 呼び出し実行\n"
             "- 入力が曖昧（例: 「来週のどこか」「時間未定」）な場合のみ追加質問する\n"
             "- 出力はJSONのみ\n"
+            f"{strict_json_policy_line}"
             "- 形式1: {\"action\":\"tool\",\"tool\":\"...\",\"args\":{...},\"reason\":\"...\"}\n"
             "- 形式2: {\"action\":\"respond\",\"response\":\"...\"}\n\n"
             "[User Question]\n"
@@ -897,7 +1032,7 @@ class DiscordOrchestrator:
         raw = await self._invoke_with_retry(
             prompt,
             max_output_tokens=380,
-            response_mime_type="application/json",
+            response_mime_type=None if self._is_gemma_model() else "application/json",
         )
         parsed = self._extract_json_object(raw)
         if parsed:
@@ -995,6 +1130,26 @@ class DiscordOrchestrator:
             "現在AI応答で問題が発生しています",
         ]
         return any(p in body for p in patterns)
+
+    def _last_model_is_gemma(self) -> bool:
+        return (self._last_model_used_name or "").strip().lower().startswith("gemma")
+
+    @staticmethod
+    def _looks_like_internal_prompt_leak(text: str) -> bool:
+        body = (text or "").strip()
+        if not body:
+            return False
+        markers = [
+            "Discord Personal AI Assistant",
+            "[Final Response Policy]",
+            "[Tool Results]",
+            "The user wants to",
+            "Self-correction",
+            "Draft 1",
+            "Draft 2",
+            "Don't be assertive about unknowns",
+        ]
+        return any(marker in body for marker in markers)
 
     @staticmethod
     def _sanitize_user_facing_error_phrases(text: str) -> str:
@@ -1514,7 +1669,7 @@ class DiscordOrchestrator:
             return 0.0
 
     @staticmethod
-    def _extract_json_object(text: str) -> dict[str, Any] | None:
+    def _extract_json_object(text: str) -> Any | None:
         if not text:
             return None
 
@@ -1525,18 +1680,82 @@ class DiscordOrchestrator:
 
         try:
             parsed = json.loads(candidate)
-            return parsed if isinstance(parsed, dict) else None
+            return parsed
         except Exception:
             pass
 
-        match = re.search(r"\{[\s\S]*\}", candidate)
-        if not match:
+        def _decision_score(obj: Any) -> int:
+            if isinstance(obj, dict):
+                score = 0
+                action = str(obj.get("action", "")).strip().lower()
+                if action in {"tool", "respond", "approve", "rewrite", "needs_tool"}:
+                    score += 20
+                if "tool" in obj:
+                    score += 6
+                if "args" in obj and isinstance(obj.get("args"), dict):
+                    score += 6
+                if "response" in obj and isinstance(obj.get("response"), str):
+                    score += 6
+                if "reason" in obj:
+                    score += 3
+                return score
+
+            if isinstance(obj, list):
+                score = 0
+                if obj:
+                    score += 4
+                dict_items = [it for it in obj if isinstance(it, dict)]
+                if dict_items:
+                    score += 4
+                    if all(str(it.get("action", "")).strip().lower() in {"tool", "respond"} for it in dict_items):
+                        score += 14
+                return score
+
+            return 0
+
+        candidates: list[tuple[int, int, Any]] = []
+
+        # Prefer explicit fenced JSON blocks when present.
+        for block in re.findall(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.IGNORECASE):
+            block_candidate = block.strip()
+            if not block_candidate:
+                continue
+            try:
+                parsed = json.loads(block_candidate)
+            except Exception:
+                continue
+            if isinstance(parsed, (dict, list)):
+                candidates.append((0, _decision_score(parsed), parsed))
+
+        decoder = json.JSONDecoder()
+        for idx, ch in enumerate(candidate):
+            if ch not in "[{":
+                continue
+            try:
+                parsed, _ = decoder.raw_decode(candidate[idx:])
+            except Exception:
+                continue
+            if isinstance(parsed, (dict, list)):
+                candidates.append((idx, _decision_score(parsed), parsed))
+
+        if not candidates:
             return None
-        try:
-            parsed = json.loads(match.group(0))
-            return parsed if isinstance(parsed, dict) else None
-        except Exception:
+
+        # Higher score is better. For ties, prefer later occurrences (often the final answer JSON).
+        candidates.sort(key=lambda item: (item[1], item[0]))
+        _, best_score, best_value = candidates[-1]
+        if best_score <= 0:
             return None
+        return best_value
+
+    def _is_gemma_model(self) -> bool:
+        model = (self.config.gemini_model or "").strip().lower()
+        return model.startswith("gemma")
+
+    @staticmethod
+    def _is_503_error(error: Exception) -> bool:
+        msg = str(error or "").lower()
+        return "503" in msg or "service unavailable" in msg
 
     async def _invoke_with_retry(
         self,
@@ -1544,7 +1763,7 @@ class DiscordOrchestrator:
         max_output_tokens: int = 2048,
         response_mime_type: str | None = None,
     ) -> str:
-        retries = 2
+        retries = max(0, int(os.getenv("GEMINI_MAX_RETRIES", "1")))
         last_error: Exception | None = None
 
         def _retry_wait_seconds(error: Exception, fallback: float) -> float:
@@ -1578,8 +1797,71 @@ class DiscordOrchestrator:
 
                 await asyncio.sleep(wait_sec)
 
+        async def _generate_with_model(active_model: Any, active_model_name: str, active_response_mime_type: str | None) -> str:
+            await _acquire_gemini_slot()
+            async with self._gemini_inflight_lock:
+                timeout_sec = None if self.config.gemini_timeout_sec <= 0 else self.config.gemini_timeout_sec
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        active_model.generate_content,
+                        prompt,
+                        generation_config=genai.types.GenerationConfig(
+                            **{
+                                "temperature": 0.2,
+                                "top_p": 0.95,
+                                "top_k": 40,
+                                "max_output_tokens": max_output_tokens,
+                                **(
+                                    {"response_mime_type": active_response_mime_type}
+                                    if active_response_mime_type
+                                    else {}
+                                ),
+                            }
+                        ),
+                        request_options=RequestOptions(timeout=timeout_sec, retry=None),
+                    ),
+                    timeout=timeout_sec,
+                )
+            text = (getattr(response, "text", "") or "").strip()
+            self._last_model_used_name = active_model_name
+            log_ai_exchange(
+                component="main-agent",
+                model=active_model_name,
+                prompt=prompt,
+                response=text,
+                metadata={
+                    "phase": "model_call",
+                    "attempt": 1,
+                    "max_output_tokens": max_output_tokens,
+                    "response_mime_type": active_response_mime_type or "",
+                },
+            )
+            if text:
+                return text
+            return "回答を生成できませんでした。質問を少し変えて再試行してください。"
+
+        # When 503 is observed once, keep using fallback for a cooldown window
+        # to avoid repeated wasted Gemini calls on every turn.
+        if (
+            self._fallback_model is not None
+            and time.monotonic() < self._prefer_fallback_until_monotonic
+        ):
+            fallback_response_mime = response_mime_type
+            if self.gemini_503_fallback_model.strip().lower().startswith("gemma"):
+                fallback_response_mime = None
+            logger.info(
+                "Fallback mode active; route main-agent -> model=%s",
+                self.gemini_503_fallback_model,
+            )
+            return await _generate_with_model(
+                active_model=self._fallback_model,
+                active_model_name=self.gemini_503_fallback_model,
+                active_response_mime_type=fallback_response_mime,
+            )
+
         for attempt in range(retries + 1):
             try:
+                timeout_sec = None if self.config.gemini_timeout_sec <= 0 else self.config.gemini_timeout_sec
                 await _acquire_gemini_slot()
                 async with self._gemini_inflight_lock:
                     response = await asyncio.wait_for(
@@ -1599,10 +1881,12 @@ class DiscordOrchestrator:
                                     ),
                                 }
                             ),
+                            request_options=RequestOptions(timeout=timeout_sec, retry=None),
                         ),
-                        timeout=self.config.gemini_timeout_sec,
+                        timeout=timeout_sec,
                     )
                 text = (getattr(response, "text", "") or "").strip()
+                self._last_model_used_name = self.config.gemini_model
                 log_ai_exchange(
                     component="main-agent",
                     model=self.config.gemini_model,
@@ -1633,9 +1917,61 @@ class DiscordOrchestrator:
                     error=str(exc),
                 )
                 last_error = exc
+                if attempt == 0 and self._is_503_error(exc):
+                    if self._fallback_model is not None:
+                        self._prefer_fallback_until_monotonic = (
+                            time.monotonic() + float(self.gemini_503_fallback_cooldown_sec)
+                        )
+                        logger.warning(
+                            "Gemini returned 503 on first attempt; switching to fallback model=%s (cooldown=%ss)",
+                            self.gemini_503_fallback_model,
+                            self.gemini_503_fallback_cooldown_sec,
+                        )
+                        fallback_response_mime = response_mime_type
+                        if self.gemini_503_fallback_model.strip().lower().startswith("gemma"):
+                            fallback_response_mime = None
+                        try:
+                            return await _generate_with_model(
+                                active_model=self._fallback_model,
+                                active_model_name=self.gemini_503_fallback_model,
+                                active_response_mime_type=fallback_response_mime,
+                            )
+                        except Exception as fallback_exc:
+                            log_ai_exchange(
+                                component="main-agent",
+                                model=self.gemini_503_fallback_model,
+                                prompt=prompt,
+                                response="",
+                                metadata={
+                                    "phase": "model_call_fallback",
+                                    "attempt": 1,
+                                    "max_output_tokens": max_output_tokens,
+                                    "response_mime_type": fallback_response_mime or "",
+                                },
+                                error=str(fallback_exc),
+                            )
+                            last_error = fallback_exc
+                            break
+                    else:
+                        logger.warning(
+                            "Gemini returned 503 on first attempt, but fallback model is unavailable."
+                        )
+                        break
+                if isinstance(exc, asyncio.TimeoutError) and self.config.gemini_timeout_sec > 0:
+                    logger.error(
+                        "Gemini API timeout after %s seconds (attempt %s/%s). Consider increasing GEMINI_TIMEOUT_SEC.",
+                        self.config.gemini_timeout_sec,
+                        attempt + 1,
+                        retries + 1,
+                    )
                 if attempt < retries:
                     await asyncio.sleep(_retry_wait_seconds(exc, fallback=2**attempt))
 
+        logger.error(
+            "All retries exhausted for Gemini invocation. Last error type: %s, msg: %s",
+            type(last_error).__name__,
+            str(last_error)[:200],
+        )
         raise RuntimeError("Gemini invocation failed after retries") from last_error
 
     async def _store_conversation(
@@ -1717,12 +2053,15 @@ class DiscordOrchestrator:
 
 
 def load_orchestrator_config_from_env() -> OrchestratorConfig:
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    api_key = (
+        os.getenv("MAIN_AGENT_GEMINI_API_KEY", "").strip()
+        or os.getenv("GEMINI_API_KEY", "").strip()
+    )
     return OrchestratorConfig(
         gemini_api_key=api_key,
         gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite-preview").strip()
         or "gemini-3.1-flash-lite-preview",
-        gemini_timeout_sec=int(os.getenv("GEMINI_TIMEOUT_SEC", "30")),
+        gemini_timeout_sec=int(os.getenv("GEMINI_TIMEOUT_SEC", "0")),
         profile_path=os.getenv("INITIAL_PROFILE_PATH", "./data/profiles/initial_profile.md").strip(),
         chromadb_path=os.getenv("CHROMADB_PATH", "./data/chromadb").strip(),
     )
