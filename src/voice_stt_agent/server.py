@@ -36,23 +36,26 @@ def _now_iso() -> str:
     return datetime.now(jst).isoformat()
 
 
-def _rule_based_intent(text: str) -> tuple[str, float, str]:
+def _rule_based_intent(text: str) -> tuple[str, float, str, str]:
     lowered = (text or "").lower()
     if any(k in lowered for k in ("流して", "再生", "spotify", "曲", "かけて", "jam", "キュー", "queue")):
-        return "add_to_jam", 0.65, "rule_music_keyword"
+        query = text
+        for kw in ("流して", "再生して", "再生", "かけて", "を", "という曲", "の曲", "spotifyに", "に", "入れて", "追加して", "追加"):
+            query = query.replace(kw, "")
+        return "add_to_jam", 0.65, query.strip(), "rule_music_keyword"
     if any(k in lowered for k in ("天気", "weather", "雨", "晴れ")):
-        return "weather_recommend", 0.6, "rule_weather_keyword"
-    return "ignore", 0.5, "rule_default"
+        return "weather_recommend", 0.6, "", "rule_weather_keyword"
+    return "ignore", 0.5, "", "rule_default"
 
 
 # Spotify API handling moved to src/tools/music_tools.py
 
 
-def _call_ollama_intent(text: str) -> tuple[str, float, str]:
+def _call_ollama_intent(text: str) -> tuple[str, float, str, str]:
     use_ollama = os.getenv("MUSIC_INTENT_USE_OLLAMA", "false").strip().lower() == "true"
     if not use_ollama:
-        intent, confidence, reason = _rule_based_intent(text)
-        return intent, confidence, f"rule_only_mode:{reason}"
+        intent, confidence, rule_q, reason = _rule_based_intent(text)
+        return intent, confidence, rule_q, f"rule_only_mode:{reason}"
 
     base = (os.getenv("OLLAMA_BASE_URL", "http://ollama:11434").strip() or "http://ollama:11434").rstrip("/")
     model = os.getenv("MUSIC_INTENT_OLLAMA_MODEL", os.getenv("OLLAMA_MODEL", "gemma4:e2b")).strip() or "gemma4:e2b"
@@ -60,19 +63,23 @@ def _call_ollama_intent(text: str) -> tuple[str, float, str]:
 
     prompt = (
         "You are an intent classifier for a Discord voice assistant. "
-        "Return JSON only with keys: intent, confidence, reason. "
+        "Return JSON only with keys: intent, confidence, extracted_query, reason. "
         "Allowed intents are strictly: add_to_jam, weather_recommend, ignore. "
         "If the utterance asks to play/add a song, artist, or music (Japanese examples: '流して', 'かけて', '再生', '曲', 'キュー'), "
         "intent MUST be add_to_jam. "
+        "If intent is add_to_jam, extracted_query MUST be ONLY the requested song name or artist. "
         "If weather-based music suggestion is requested, intent MUST be weather_recommend. "
         "Otherwise use ignore. "
         f"Utterance: {text}"
     )
+    keep_alive = os.getenv("OLLAMA_KEEP_ALIVE", "5m").strip() or "5m"
+
     body = {
         "model": model,
         "prompt": prompt,
         "stream": False,
         "format": "json",
+        "keep_alive": keep_alive,
         "options": {
             "temperature": 0.1,
             "num_predict": 96,
@@ -104,14 +111,15 @@ def _call_ollama_intent(text: str) -> tuple[str, float, str]:
         intent = str(data.get("intent", "ignore")).strip() or "ignore"
         confidence = float(data.get("confidence", 0.0) or 0.0)
         reason = str(data.get("reason", ""))[:200]
+        query = str(data.get("extracted_query", ""))
         intent = intent if intent in {"add_to_jam", "weather_recommend", "ignore"} else "ignore"
 
         # Guardrail: when LLM misses obvious music/weather keywords, rule-based result takes precedence.
-        rule_intent, rule_conf, rule_reason = _rule_based_intent(text)
+        rule_intent, rule_conf, rule_query, rule_reason = _rule_based_intent(text)
         if intent == "ignore" and rule_intent != "ignore":
-            return rule_intent, max(rule_conf, confidence), f"llm_override_by_rule:{rule_reason}"
+            return rule_intent, max(rule_conf, confidence), rule_query, f"llm_override_by_rule:{rule_reason}"
 
-        return intent, max(0.0, min(confidence, 1.0)), reason
+        return intent, max(0.0, min(confidence, 1.0)), query, reason
     except Exception as exc:
         log_ai_exchange(
             component="voice-stt-agent",
@@ -126,8 +134,7 @@ def _call_ollama_intent(text: str) -> tuple[str, float, str]:
         )
         logger.debug("ollama intent failed, fallback to rules: %s", exc)
 
-    intent, confidence, reason = _rule_based_intent(text)
-    return intent, confidence, f"rule_fallback:{reason}"
+    return _rule_based_intent(text)
 
 
 # Spotify tracking logics moved to src/tools/music_tools.py
@@ -139,11 +146,16 @@ def _process_transcript(payload: dict[str, Any]) -> dict[str, Any]:
         return {"status": "error", "code": "invalid_text"}
 
     started = time.time()
-    intent, confidence, reason = _call_ollama_intent(text)
+    intent, confidence, query, reason = _call_ollama_intent(text)
+    
+    if not query:
+        query = text
+
     result: dict[str, Any] = {
         "status": "ok",
         "intent": intent,
         "confidence": confidence,
+        "query": query,
         "reason": reason,
         "text": text,
         "guild_id": int(payload.get("guild_id", 0) or 0),
@@ -154,7 +166,7 @@ def _process_transcript(payload: dict[str, Any]) -> dict[str, Any]:
 
     if intent == "add_to_jam":
         from tools.music_tools import add_to_jam
-        err = add_to_jam(text)
+        err = add_to_jam(query)
         if err is not None:
             result.update({"action": "noop", "detail": err})
         else:
