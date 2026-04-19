@@ -153,8 +153,17 @@ class DiscordAudioBridgeSink(AudioSinkBase):
         if user is None or data is None or user_id <= 0 or bool(getattr(user, "bot", False)):
             return
 
-        opus_data = getattr(data, "data", None) # discord-ext-voice-recv typically uses .data for the payload
+        # discord-ext-voice-recv VoiceData structure might vary. Try common locations for opus data.
+        opus_data = None
+        if hasattr(data, "packet") and hasattr(data.packet, "decrypted_data"):
+            opus_data = data.packet.decrypted_data
+        elif hasattr(data, "opus"):
+            opus_data = data.opus
+        elif hasattr(data, "data"):
+            opus_data = data.data
+
         if not isinstance(opus_data, bytes) or not opus_data:
+            logging.getLogger(__name__).warning("Could not find opus payload in VoiceData. Available attributes: %s", dir(data))
             return
 
         # Initialize or get decoder for this user
