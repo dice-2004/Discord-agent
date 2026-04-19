@@ -163,20 +163,20 @@ class DiscordAudioBridgeSink(AudioSinkBase):
             decoder = self._decoders.get(user_id)
             if decoder is None:
                 try:
-                    decoder = discord.opus.Decoder(self.sample_rate, self.channels)
+                    # In newer discord.py, Decoder() takes no init args.
+                    decoder = discord.opus.Decoder()
                     self._decoders[user_id] = decoder
                 except Exception as e:
-                    logger.warning("Failed to create opus decoder for user %s: %s", user_id, e)
+                    logging.getLogger(__name__).warning("Failed to create opus decoder for user %s: %s", user_id, e)
                     return
 
         # Decoding with error handling
         try:
-            # 20ms frame = 960 samples @ 48kHz
+            # Discord standard: 48000Hz, 2 channels, 20ms = 960 samples per channel
+            # decode() returns PCM bytes
             pcm = decoder.decode(opus_data, fec=False)
-        except discord.opus.OpusError as e:
-            # Skip corrupted packets instead of crashing the thread
-            return
-        except Exception as e:
+        except Exception:
+            # Skip corrupted packets
             return
 
         flush_payload: bytes | None = None
