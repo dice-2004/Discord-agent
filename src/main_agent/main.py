@@ -2408,6 +2408,39 @@ def main() -> None:
         except (discord.InteractionResponded, discord.HTTPException):
             pass
 
+        # Background task to preload Ollama model so it's ready when voice command arrives
+        def _bg_preload() -> None:
+            try:
+                base = (os.getenv("OLLAMA_BASE_URL", "http://ollama:11434").strip() or "http://ollama:11434").rstrip("/")
+                model = os.getenv("MUSIC_INTENT_OLLAMA_MODEL", os.getenv("OLLAMA_MODEL", "gemma4:e2b")).strip() or "gemma4:e2b"
+                keep_alive_raw = os.getenv("OLLAMA_KEEP_ALIVE", "-1").strip()
+                keep_alive: int | str = keep_alive_raw
+                try:
+                    if keep_alive_raw.lstrip('-').isdigit():
+                        keep_alive = int(keep_alive_raw)
+                except Exception:
+                    pass
+                
+                body = {
+                    "model": model,
+                    "prompt": "",
+                    "stream": False,
+                    "keep_alive": keep_alive,
+                }
+                req = Request(
+                    f"{base}/api/generate",
+                    method="POST",
+                    data=json.dumps(body).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                )
+                with urlopen(req, timeout=30):
+                    pass
+                logging.getLogger(__name__).info("Background: Preloaded Ollama model %s", model)
+            except Exception as exc:
+                logging.getLogger(__name__).warning("Background preload of Ollama failed: %s", exc)
+
+        asyncio.create_task(asyncio.to_thread(_bg_preload))
+
         guild_id = int(interaction.guild.id)
         async with _voice_lock(guild_id):
             target = voice_state.channel
