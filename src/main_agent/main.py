@@ -2509,7 +2509,7 @@ def main() -> None:
             return
 
         await interaction.followup.send(
-            f"転送成功: status={status_code} action={result.get('action', 'unknown')} intent={result.get('intent', 'unknown')}",
+            f"転送成功: status={status_code} action={result.get('action', 'unknown')} intent={result.get('intent', 'unknown')} detail={result.get('detail', 'none')}",
             ephemeral=True,
         )
 

@@ -56,7 +56,7 @@ def _normalize_text(text: str) -> str:
 
 
 def _log_path() -> Path:
-    raw = os.getenv("AI_EXCHANGE_LOG_PATH", "./data/audit/ai_exchange.log").strip() or "./data/audit/ai_exchange.log"
+    raw = os.getenv("AI_EXCHANGE_LOG_PATH", "/app/data/audit/ai_exchange.log").strip() or "/app/data/audit/ai_exchange.log"
     return Path(raw)
 
 

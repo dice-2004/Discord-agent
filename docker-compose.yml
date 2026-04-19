@@ -8,6 +8,7 @@ services:
       - ./.env
     volumes:
       - ./data:/app/data
+      - ./src:/app/src
     depends_on:
       - research-agent
     restart: unless-stopped
@@ -22,6 +23,7 @@ services:
     volumes:
       - ./data/runtime:/app/data/runtime
       - ./data/audit:/app/data/audit
+      - ./src:/app/src
     restart: unless-stopped
 
   ollama:
@@ -57,6 +59,7 @@ services:
     volumes:
       - ./data/runtime:/app/data/runtime
       - ./data/audit:/app/data/audit
+      - ./src:/app/src
     depends_on:
       - ollama
     restart: unless-stopped
