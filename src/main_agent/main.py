@@ -2500,7 +2500,7 @@ def main() -> None:
             "created_at": now_iso,
         }
 
-        result, err, status_code = _forward_music_intent_transcript(payload)
+        result, err, status_code = await asyncio.to_thread(_forward_music_intent_transcript, payload)
         if err is not None:
             await interaction.followup.send(
                 f"転送失敗: status={status_code} detail={err[:300]}",
