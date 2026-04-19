@@ -72,7 +72,15 @@ def _call_ollama_intent(text: str) -> tuple[str, float, str, str]:
         "Otherwise use ignore. "
         f"Utterance: {text}"
     )
-    keep_alive = os.getenv("OLLAMA_KEEP_ALIVE", "5m").strip() or "5m"
+    keep_alive_raw = os.getenv("OLLAMA_KEEP_ALIVE", "5m").strip() or "5m"
+    # Convert to int if it looks like a number (including negative strings like "-1")
+    try:
+        if keep_alive_raw.lstrip('-').isdigit():
+            keep_alive: int | str = int(keep_alive_raw)
+        else:
+            keep_alive = keep_alive_raw
+    except (ValueError, TypeError):
+        keep_alive = keep_alive_raw
 
     body = {
         "model": model,
