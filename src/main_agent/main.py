@@ -40,11 +40,10 @@ DEBUG_PROBE_AUDIT_LOG_DEFAULT = "./data/audit/debug_probe_audit.jsonl"
 
 
 class VoiceChunkForwarder:
-    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
-        self._loop = loop
-        self._queue: asyncio.Queue[tuple[dict[str, int | str], bytes]] = asyncio.Queue(
-            maxsize=max(10, int(os.getenv("VOICE_STT_CHUNK_QUEUE_MAX", "128").strip() or "128"))
-        )
+    def __init__(self) -> None:
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._queue: asyncio.Queue[tuple[dict[str, int | str], bytes]] | None = None
+        self._maxsize = max(10, int(os.getenv("VOICE_STT_CHUNK_QUEUE_MAX", "128").strip() or "128"))
         self._worker_task: asyncio.Task[None] | None = None
         base = (os.getenv("VOICE_STT_AGENT_URL", "http://voice-stt-agent:8095").strip() or "http://voice-stt-agent:8095").rstrip("/")
         self._endpoint = f"{base}/v1/audio/chunks"
@@ -53,10 +52,12 @@ class VoiceChunkForwarder:
 
     def start(self) -> None:
         if self._worker_task is None:
+            self._loop = asyncio.get_running_loop()
+            self._queue = asyncio.Queue(maxsize=self._maxsize)
             self._worker_task = self._loop.create_task(self._worker())
 
     def enqueue(self, *, guild_id: int, channel_id: int, user_id: int, ext: str, payload: bytes) -> None:
-        if not payload:
+        if not payload or not self._queue or not self._loop:
             return
 
         item = (
@@ -141,12 +142,40 @@ class DiscordAudioBridgeSink(AudioSinkBase):
         self.sample_rate = max(8000, int(os.getenv("VOICE_STT_SAMPLE_RATE", "48000").strip() or "48000"))
         self.channels = max(1, int(os.getenv("VOICE_STT_CHANNELS", "2").strip() or "2"))
         self.sample_width = 2
-        # Default chunk size for testing: 1000ms (1 second) instead of 4000ms
+        # Default chunk size: 1000ms. If silence continues, we flush earlier.
         chunk_ms = max(500, int(os.getenv("VOICE_STT_CHUNK_MS", "1000").strip() or "1000"))
         self.max_chunk_bytes = int(self.sample_rate * self.channels * self.sample_width * (chunk_ms / 1000.0))
         self._buffers: dict[int, bytearray] = {}
         self._decoders: dict[int, Any] = {}
+        self._last_touch: dict[int, float] = {}
         self._lock = threading.Lock()
+        
+        # Start a background thread for flushing silent buffers
+        self._flush_thread_active = True
+        self._flush_thread = threading.Thread(target=self._silence_flush_loop, daemon=True)
+        self._flush_thread.start()
+
+    def _silence_flush_loop(self) -> None:
+        """Flushes buffers that haven't been touched for a while."""
+        while self._flush_thread_active:
+            time.sleep(0.3)
+            now = time.time()
+            to_flush: list[tuple[int, bytes]] = []
+            
+            with self._lock:
+                for user_id, last_time in list(self._last_touch.items()):
+                    # If 0.8s passed since last voice packet, and we have data, flush it.
+                    if now - last_time > 0.8:
+                        buf = self._buffers.get(user_id)
+                        if buf and len(buf) > 0:
+                            to_flush.append((user_id, bytes(buf)))
+                            self._buffers[user_id] = bytearray()
+                        # Clean up touch time to stop checking until new data arrives
+                        del self._last_touch[user_id]
+            
+            for user_id, pcm in to_flush:
+                logging.getLogger(__name__).info("Silence detected for user %s, flushing %d bytes", user_id, len(pcm))
+                self._emit_wav_chunk(user_id=user_id, pcm=pcm)
 
     def wants_opus(self) -> bool:
         # Avoid library-side auto-decoding which causes "corrupted stream" OpusError.
@@ -186,29 +215,31 @@ class DiscordAudioBridgeSink(AudioSinkBase):
 
         # Decoding with error handling
         try:
-            # Discord standard: 48000Hz, 2 channels, 20ms = 960 samples per channel
-            # decode() returns PCM bytes
             pcm = decoder.decode(opus_data, fec=False)
         except Exception:
-            # Skip corrupted packets
             return
 
         flush_payload: bytes | None = None
         with self._lock:
+            self._last_touch[user_id] = time.time() # Record last voice activity
             buf = self._buffers.setdefault(user_id, bytearray())
             buf.extend(pcm)
-            # Log periodically (e.g. every 50 small buffers to avoid spam)
-            if len(buf) % 9600 == 0: # Roughly every 100ms
+            # Log periodically (roughly every 500ms of data)
+            if len(buf) % (9600 * 5) == 0:
                 logging.getLogger(__name__).info("User %s: PCM buffer size %d/%d", user_id, len(buf), self.max_chunk_bytes)
 
             if len(buf) >= self.max_chunk_bytes:
                 flush_payload = bytes(buf)
                 self._buffers[user_id] = bytearray()
+                # If we just flushed 1s chunk, we can remove from silence check until new data comes
+                if user_id in self._last_touch:
+                    del self._last_touch[user_id]
 
         if flush_payload:
             self._emit_wav_chunk(user_id=user_id, pcm=flush_payload)
 
     def cleanup(self) -> None:
+        self._flush_thread_active = False # Stop the silence flush thread
         pending: list[tuple[int, bytes]] = []
         with self._lock:
             for user_id, buf in self._buffers.items():
@@ -216,6 +247,7 @@ class DiscordAudioBridgeSink(AudioSinkBase):
                     pending.append((user_id, bytes(buf)))
             self._buffers.clear()
             self._decoders.clear() # Clear decoders on cleanup
+            self._last_touch.clear()
         for user_id, pcm in pending:
             self._emit_wav_chunk(user_id=user_id, pcm=pcm)
 
@@ -1533,7 +1565,7 @@ def main() -> None:
     tree = app_commands.CommandTree(client)
     research_notify_tasks: set[asyncio.Task[None]] = set()
     voice_recv_enabled = os.getenv("VOICE_RECV_ENABLED", "true").strip().lower() == "true"
-    voice_chunk_forwarder = VoiceChunkForwarder(asyncio.get_event_loop())
+    voice_chunk_forwarder = VoiceChunkForwarder()
     active_voice_sinks: dict[int, object] = {}
     voice_locks: dict[int, asyncio.Lock] = {}
 
