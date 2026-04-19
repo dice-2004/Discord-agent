@@ -136,7 +136,8 @@ class DiscordAudioBridgeSink(AudioSinkBase):
         self.sample_rate = max(8000, int(os.getenv("VOICE_STT_SAMPLE_RATE", "48000").strip() or "48000"))
         self.channels = max(1, int(os.getenv("VOICE_STT_CHANNELS", "2").strip() or "2"))
         self.sample_width = 2
-        chunk_ms = max(500, int(os.getenv("VOICE_STT_CHUNK_MS", "4000").strip() or "4000"))
+        # Default chunk size for testing: 1000ms (1 second) instead of 4000ms
+        chunk_ms = max(500, int(os.getenv("VOICE_STT_CHUNK_MS", "1000").strip() or "1000"))
         self.max_chunk_bytes = int(self.sample_rate * self.channels * self.sample_width * (chunk_ms / 1000.0))
         self._buffers: dict[int, bytearray] = {}
         self._decoders: dict[int, Any] = {}
@@ -149,19 +150,12 @@ class DiscordAudioBridgeSink(AudioSinkBase):
 
     def write(self, user: object, data: object) -> None:
         user_id = int(getattr(user, "id", 0) or 0)
-        logging.getLogger(__name__).info("DEBUG: write called for user %s, data type %s", user_id, type(data))
-
-        if user is None or data is None:
-            return
-        if user_id <= 0 or bool(getattr(user, "bot", False)):
+        if user is None or data is None or user_id <= 0 or bool(getattr(user, "bot", False)):
             return
 
         opus_data = getattr(data, "data", None) # discord-ext-voice-recv typically uses .data for the payload
         if not isinstance(opus_data, bytes) or not opus_data:
             return
-
-        # Debug: Log packet reception occasionally (e.g., every 100 packets or so, but here just simple log)
-        # logging.getLogger(__name__).debug("Received Opus packet from user %s, length %s", user_id, len(opus_data))
 
         # Initialize or get decoder for this user
         with self._lock:
@@ -171,6 +165,7 @@ class DiscordAudioBridgeSink(AudioSinkBase):
                     # In newer discord.py, Decoder() takes no init args.
                     decoder = discord.opus.Decoder()
                     self._decoders[user_id] = decoder
+                    logging.getLogger(__name__).info("Created new Opus decoder for user %s", user_id)
                 except Exception as e:
                     logging.getLogger(__name__).warning("Failed to create opus decoder for user %s: %s", user_id, e)
                     return
@@ -188,6 +183,10 @@ class DiscordAudioBridgeSink(AudioSinkBase):
         with self._lock:
             buf = self._buffers.setdefault(user_id, bytearray())
             buf.extend(pcm)
+            # Log periodically (e.g. every 50 small buffers to avoid spam)
+            if len(buf) % 9600 == 0: # Roughly every 100ms
+                logging.getLogger(__name__).info("User %s: PCM buffer size %d/%d", user_id, len(buf), self.max_chunk_bytes)
+
             if len(buf) >= self.max_chunk_bytes:
                 flush_payload = bytes(buf)
                 self._buffers[user_id] = bytearray()
