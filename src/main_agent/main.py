@@ -148,9 +148,11 @@ class DiscordAudioBridgeSink(AudioSinkBase):
         return True
 
     def write(self, user: object, data: object) -> None:
+        user_id = int(getattr(user, "id", 0) or 0)
+        logging.getLogger(__name__).info("DEBUG: write called for user %s, data type %s", user_id, type(data))
+
         if user is None or data is None:
             return
-        user_id = int(getattr(user, "id", 0) or 0)
         if user_id <= 0 or bool(getattr(user, "bot", False)):
             return
 
