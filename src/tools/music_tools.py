@@ -88,7 +88,12 @@ def spotify_search_track_uri(query: str) -> tuple[str | None, str | None]:
         return None, "spotify_access_token_missing"
 
     timeout_sec = max(5, _safe_int("MUSIC_INTENT_SPOTIFY_TIMEOUT_SEC", 15))
-    url = f"https://api.spotify.com/v1/search?q={quote(query)}&type=track&limit=1"
+    # Pre-process query to remove noise punctuation that might hinder Spotify search
+    search_q = query
+    for char in ("!", "！", ",", "，", "、", "?", "？"):
+        search_q = search_q.replace(char, " ")
+    
+    url = f"https://api.spotify.com/v1/search?q={quote(search_q.strip())}&type=track&limit=1"
     req = Request(
         url,
         method="GET",
