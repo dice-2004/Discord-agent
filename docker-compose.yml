@@ -21,6 +21,7 @@ services:
       - ./.env
     volumes:
       - ./data/runtime:/app/data/runtime
+      - ./data/audit:/app/data/audit
     restart: unless-stopped
 
   ollama:
@@ -55,6 +56,7 @@ services:
       - ./.env
     volumes:
       - ./data/runtime:/app/data/runtime
+      - ./data/audit:/app/data/audit
     depends_on:
       - ollama
     restart: unless-stopped
