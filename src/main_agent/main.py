@@ -72,6 +72,7 @@ class VoiceChunkForwarder:
         def _put() -> None:
             try:
                 self._queue.put_nowait(item)
+                logging.getLogger(__name__).info("Enqueued audio chunk, queue size: %s", self._queue.qsize())
             except asyncio.QueueFull:
                 try:
                     self._queue.get_nowait()
@@ -87,6 +88,7 @@ class VoiceChunkForwarder:
 
     async def _worker(self) -> None:
         logger = logging.getLogger(__name__)
+        logger.info("VoiceChunkForwarder worker started.")
         while True:
             headers_meta, payload = await self._queue.get()
             try:
@@ -115,8 +117,11 @@ class VoiceChunkForwarder:
             data=payload,
             headers=headers,
         )
-        with urlopen(req, timeout=self._timeout_sec):
-            pass
+        logging.getLogger(__name__).info("Sending %s bytes to voice-stt-agent", len(payload))
+        with urlopen(req, timeout=self._timeout_sec) as res:
+            logging.getLogger(__name__).info("voice-stt-agent response: %s", res.status)
+
+
 
 
 class DiscordAudioBridgeSink(AudioSinkBase):
