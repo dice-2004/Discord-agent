@@ -2328,7 +2328,10 @@ def main() -> None:
             return
 
         # Voice handshake can take longer than Discord interaction timeout.
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        except (discord.InteractionResponded, discord.HTTPException):
+            pass
 
         guild_id = int(interaction.guild.id)
         async with _voice_lock(guild_id):
@@ -2360,9 +2363,9 @@ def main() -> None:
                         await asyncio.sleep(0.1)
 
                 if voice_recv_enabled and voice_recv is not None:
-                    connected = await target.connect(self_deaf=True, reconnect=True, cls=voice_recv.VoiceRecvClient)
+                    connected = await target.connect(self_deaf=False, reconnect=True, cls=voice_recv.VoiceRecvClient)
                 else:
-                    connected = await target.connect(self_deaf=True, reconnect=True)
+                    connected = await target.connect(self_deaf=False, reconnect=True)
 
                 for _ in range(20):
                     if connected.is_connected():
@@ -3108,8 +3111,8 @@ def main() -> None:
                 await interaction.followup.send("コマンド実行中にエラーが発生しました。", ephemeral=True)
             else:
                 await interaction.response.send_message("コマンド実行中にエラーが発生しました。", ephemeral=True)
-        except discord.NotFound:
-            logger.warning("App command error response skipped: interaction expired")
+        except (discord.InteractionResponded, discord.HTTPException, discord.NotFound):
+            logger.warning("App command error response skipped: interaction already handled or expired")
 
     try:
         client.run(discord_token, log_handler=None)
