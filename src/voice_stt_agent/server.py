@@ -265,7 +265,9 @@ def _transcribe_audio_bytes(payload: bytes, ext: str) -> tuple[str, str | None]:
     model = _get_stt_model()
     language = os.getenv("VOICE_STT_LANGUAGE", "ja").strip() or "ja"
     beam_size = max(1, _safe_int("VOICE_STT_BEAM_SIZE", 1))
-    vad_filter = os.getenv("VOICE_STT_VAD_FILTER", "true").strip().lower() == "true"
+    # For debugging why VAD removes everything, let's disable VAD filter or make it optional.
+    # We will prefer False if no specific env is set to ensure we capture audio.
+    vad_filter = os.getenv("VOICE_STT_VAD_FILTER", "false").strip().lower() == "true"
 
     suffix = f".{(ext or 'wav').strip().lower()}"
     if not suffix.startswith("."):
@@ -275,13 +277,21 @@ def _transcribe_audio_bytes(payload: bytes, ext: str) -> tuple[str, str | None]:
         tmp.write(payload)
         tmp.flush()
         try:
-            segments, _ = model.transcribe(
+            # transcription options
+            # use task='transcribe' (default)
+            segments, info = model.transcribe(
                 tmp.name,
                 language=language,
                 beam_size=beam_size,
                 vad_filter=vad_filter,
+                word_timestamps=False,
             )
+            segments = list(segments)
             text = " ".join(str(seg.text).strip() for seg in segments if str(seg.text).strip()).strip()
+            
+            logger.info("STT result for %d bytes: 「%s」 (segments=%d, vad=%s)", 
+                        len(payload), text, len(segments), vad_filter)
+            
             if not text:
                 return "", "stt_no_speech"
             return text, None
