@@ -154,9 +154,12 @@ class DiscordAudioBridgeSink(AudioSinkBase):
         if user_id <= 0 or bool(getattr(user, "bot", False)):
             return
 
-        opus_data = getattr(data, "opus", None)
+        opus_data = getattr(data, "data", None) # discord-ext-voice-recv typically uses .data for the payload
         if not isinstance(opus_data, bytes) or not opus_data:
             return
+
+        # Debug: Log packet reception occasionally (e.g., every 100 packets or so, but here just simple log)
+        # logging.getLogger(__name__).debug("Received Opus packet from user %s, length %s", user_id, len(opus_data))
 
         # Initialize or get decoder for this user
         with self._lock:
@@ -202,6 +205,7 @@ class DiscordAudioBridgeSink(AudioSinkBase):
             self._emit_wav_chunk(user_id=user_id, pcm=pcm)
 
     def _emit_wav_chunk(self, *, user_id: int, pcm: bytes) -> None:
+        logging.getLogger(__name__).info("Emitting WAV chunk for user %s, size %s bytes", user_id, len(pcm))
         wave_buffer = io.BytesIO()
         with wave.open(wave_buffer, "wb") as wav:
             wav.setnchannels(self.channels)
