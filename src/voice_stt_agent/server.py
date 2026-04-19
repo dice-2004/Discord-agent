@@ -416,6 +416,7 @@ def main() -> None:
 
 
 def build_http_server(host: str, port: int) -> ThreadingHTTPServer:
+    VoiceSttHandler.shared_token = os.getenv("VOICE_STT_SHARED_TOKEN", "").strip()
     return ThreadingHTTPServer((host, port), VoiceSttHandler)
 
 
