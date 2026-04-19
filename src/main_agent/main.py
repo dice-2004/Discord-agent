@@ -2362,12 +2362,18 @@ def main() -> None:
                             break
                         await asyncio.sleep(0.1)
 
-                if voice_recv_enabled and voice_recv is not None:
-                    connected = await target.connect(self_deaf=False, reconnect=True, cls=voice_recv.VoiceRecvClient)
-                else:
-                    connected = await target.connect(self_deaf=False, reconnect=True)
+                try:
+                    if voice_recv_enabled and voice_recv is not None:
+                        connected = await target.connect(timeout=60.0, self_deaf=False, reconnect=True, cls=voice_recv.VoiceRecvClient)
+                    else:
+                        connected = await target.connect(timeout=60.0, self_deaf=False, reconnect=True)
+                except TimeoutError:
+                    logger.warning("Voice connection target.connect() timed out, will verify connection state")
+                    connected = discord.utils.get(client.voice_clients, guild=interaction.guild)
+                    if not connected:
+                        raise
 
-                for _ in range(20):
+                for _ in range(30):
                     if connected.is_connected():
                         break
                     await asyncio.sleep(0.1)
