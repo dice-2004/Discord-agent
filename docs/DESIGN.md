@@ -115,8 +115,8 @@
 品質・コスト・遅延の両立のため、研究系ワークフローは以下の役割分担を標準とする。
 
 * Main Agent（Gemini 3.1 Flash Lite）: 受付・即時応答・委譲判断
-* Research管理エージェント（Gemini API）: 調査計画、統合、最終品質チェック、返却可否判定
-* Research調査エージェント（Gemini API native）: ツール実行、探索、一次要約
+* Research管理エージェント（Gemini API / APIキー認証 / `gemini-3.1-flash-lite-preview`）: 調査計画、統合、最終品質チェック、返却可否判定。フォールバックは `gemma-4-31b-it`
+* Research調査エージェント（Gemini CLI OAuth認証 / `gemini-3.1-pro`）: ツール実行、探索、一次要約。フォールバックは `gemini-3.1-flash`。CLI認証が利用不可の場合は管理エージェント経由にフォールバック
 * 網羅調査エージェント（Gemma 4 + tools）: 長文網羅読解、候補抽出、再ランク
 
 運用ルール:
@@ -128,11 +128,21 @@
 * ただし、規約比較・学術調査・複数ソース矛盾解消など高精度必須タスクは時間指定なしでも例外起動を許容する。
 * 最終ユーザー回答の品質責任はResearch管理エージェント（Gemini API）に置き、Gemma出力は原文アーティファクト付きの根拠素材として扱う。
 
-#### 2.2.3. Gemini配置方針（2026-04-04更新）
+#### 2.2.3. Gemini配置方針（2026-04-19更新）
 
-* 既定推奨: **Research Agent は Gemini API を Python native で直接呼び出す**。
-* CLI 互換経路は残してもよいが、標準ルートは `google-generativeai` ベースの API 呼び出しとする。
-* 認証情報は Research Agent 専用の API キーとして `.env` から読む。
+Research Agent 内のモデル・認証は以下のように分離する:
+
+* **管理エージェント**（校閲・返却判定）:
+  * SDK: `google-generativeai` (旧SDK)
+  * 認証: APIキー (`RESEARCH_AGENT_GEMINI_API_KEY`)
+  * モデル: `RESEARCH_AGENT_GEMINI_MODEL` (既定: `gemini-3.1-flash-lite-preview`)
+  * フォールバック: `RESEARCH_AGENT_GEMINI_503_FALLBACK_MODEL` (既定: `gemma-4-31b-it`)
+* **調べるエージェント**（ツール実行・探索・一次要約）:
+  * SDK: `google-genai` (新SDK)
+  * 認証: Gemini CLI OAuth（`$HOME/.gemini/oauth_creds.json`）
+  * モデル: `RESEARCH_AGENT_CLI_MODEL` (既定: `gemini-3.1-pro`)
+  * フォールバック: `RESEARCH_AGENT_CLI_FALLBACK_MODEL` (既定: `gemini-3.1-flash`)
+  * CLI認証が利用不可の場合、管理エージェント APIキー経由に自動フォールバック
 
 #### 2.2.1. 配置方針（2026-04-01追記）
 
@@ -172,6 +182,19 @@ N100導入時は、Main Agentの即応性を守るために以下の分離を標
 * Main AgentからGemma処理を**同期で直列ブロックしない**（必要時のみ短時間呼び出し）
 * 重いGemma処理は `gemma-worker` で tool loop を回し、`research-agent` は原文保存と裁定だけ行う
 * 先行提案のうち、全メッセージ常時ゲート（提案3）は既定採用しない
+
+### 2.6. Voice STT Agent (Discord音声対話基盤)
+
+Discordからの音声入力を処理し、意図抽出（音楽再生コマンドなど）をローカル環境で完結させるための独立コンテナとして `voice-stt-agent` を定義する。
+
+* **インターフェース:** `main-agent` (Discord Audio Sink) からHTTPベースで1秒単位(または無音検知時)でWAVチャンクを受け取る。
+* **音声認識 (STT):** `faster-whisper` (CPU駆動) を使用し、ローカルで文字起こしを実行する。
+* **意図抽出 (Intent):** STT結果が空でない場合、ローカルのOllama (`gemma4`等) へプロンプトを投げ、`play_music`, `ignore` 等のアクションをJSONで抽出する。
+* **N100/ローカルCPU環境における安定化要件（本運用設計）:**
+   1. **Opus手動デコード:** `discord.ext.voice_recv` の内部デコードによる `OpusError` によるシステムフリーズを防ぐため、`main-agent` 側で `wants_opus=True` とし、手動で復号・安全にPCM抽出を行うこと。
+   2. **無音フラッシュ (Silence Flush):** 規定チャンク(1秒)に満たなくても、0.8秒の無音を検知した時点でキューをプッシュし、短いコマンド(「再生」等)のレスポンスを向上させること。
+   3. **VADの強制無効化:** ノイズやマイクから遠い音声など、微小な音声信号であっても確実に文字に起こす（または幻覚としてでも情報を落とさない）ため、STTの無音クリップ機能（VAD）をオフにして実行すること。
+   4. **LLMの事前展開 (Preload):** 意図抽出用LLM (`gemma4`) はファイルサイズが大きいため（初回ロード遅延の回避策として）、`main-agent` がDiscord Voiceに接続(`/vc_join`)した瞬間に非同期で初期化APIリクエストを投げ、メモリにプリロードしておくこと。
 
 ---
 

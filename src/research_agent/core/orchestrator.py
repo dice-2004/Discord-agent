@@ -1,4 +1,9 @@
-"""Research Agent orchestrator - minimal LLM-based research coordinator."""
+"""Research Agent orchestrator - minimal LLM-based research coordinator.
+
+Architecture:
+    - 管理エージェント: APIキー認証 (google-generativeai) で校閲・返却判定
+    - 調べるエージェント: Gemini CLI OAuth認証 (google-genai) でツール実行・探索
+"""
 
 from __future__ import annotations
 
@@ -8,12 +13,28 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import google.generativeai as genai
 from google.generativeai.types import RequestOptions
+
+try:
+    from google import genai as genai_cli
+    from google.genai import types as genai_cli_types
+
+    _HAS_GENAI_CLI = True
+except ImportError:
+    _HAS_GENAI_CLI = False
+
+try:
+    from google.oauth2.credentials import Credentials as OAuth2Credentials
+
+    _HAS_GOOGLE_AUTH = True
+except ImportError:
+    _HAS_GOOGLE_AUTH = False
 
 from tools import ToolRegistry, build_default_tool_registry
 from tools.ai_exchange_logger import log_ai_exchange
@@ -21,19 +42,36 @@ from tools.research_loop import run_model_research_loop
 
 logger = logging.getLogger(__name__)
 
+# Gemini CLI の OAuth client_id (公開値: CLI ソースコードに埋め込み)
+_GEMINI_CLI_OAUTH_CLIENT_ID = (
+    "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
+)
+_GEMINI_CLI_OAUTH_TOKEN_URI = "https://oauth2.googleapis.com/token"
+
 
 @dataclass(slots=True)
 class OrchestratorConfig:
+    """管理エージェントと調べるエージェントの設定を保持する."""
+
+    # --- 管理エージェント (APIキー認証) ---
     gemini_api_key: str = ""
     gemini_model: str = "gemini-3.1-flash-lite-preview"
     gemini_timeout_sec: int = 60
 
+    # --- 調べるエージェント (Gemini CLI OAuth認証) ---
+    cli_model: str = "gemini-3.1-pro"
+    cli_fallback_model: str = "gemini-3.1-flash"
+
 
 class ResearchOrchestrator:
+    """管理エージェント (APIキー) と調べるエージェント (CLI OAuth) を統括するオーケストレータ."""
+
     def __init__(self, config: OrchestratorConfig | None = None) -> None:
         self.config = config or OrchestratorConfig()
         if not self.config.gemini_api_key:
             raise RuntimeError("RESEARCH_AGENT_GEMINI_API_KEY is required")
+
+        # ── 管理エージェント (APIキー認証 / google-generativeai) ──
         genai.configure(api_key=self.config.gemini_api_key)
         self.model = genai.GenerativeModel(self.config.gemini_model)
         self.gemini_503_fallback_model = (
@@ -54,10 +92,94 @@ class ResearchOrchestrator:
                     "Failed to initialize research fallback model: %s",
                     self.gemini_503_fallback_model,
                 )
+
+        # ── 調べるエージェント (Gemini CLI OAuth認証 / google-genai) ──
+        self._cli_model_name = self.config.cli_model
+        self._cli_fallback_model_name = self.config.cli_fallback_model
+        self._cli_client: Any | None = None
+        self._init_cli_client()
+
         self.tool_registry = build_default_tool_registry()
         self.max_tool_turns = 2
         self.last_transcript = ""
         self._deadline_monotonic: float | None = None
+
+    # ── CLI クライアント初期化 ──
+
+    def _init_cli_client(self) -> None:
+        """Gemini CLI の OAuth 認証情報を読み込み、調べるエージェント用クライアントを初期化する."""
+        if not _HAS_GENAI_CLI:
+            logger.warning(
+                "google-genai パッケージが未インストール; 調べるエージェントは管理エージェント経由にフォールバック"
+            )
+            return
+        if not _HAS_GOOGLE_AUTH:
+            logger.warning(
+                "google-auth パッケージが未インストール; 調べるエージェントは管理エージェント経由にフォールバック"
+            )
+            return
+
+        creds = self._load_gemini_cli_credentials()
+        if creds is None:
+            logger.warning(
+                "Gemini CLI の認証情報が見つかりません; 調べるエージェントは管理エージェント経由にフォールバック"
+            )
+            return
+
+        try:
+            self._cli_client = genai_cli.Client(credentials=creds)
+            logger.info(
+                "調べるエージェント CLI クライアント初期化完了 (model=%s, fallback=%s)",
+                self._cli_model_name,
+                self._cli_fallback_model_name,
+            )
+        except Exception:
+            logger.exception("CLI クライアントの初期化に失敗; フォールバックします")
+            self._cli_client = None
+
+    @staticmethod
+    def _load_gemini_cli_credentials() -> Any | None:
+        """$HOME/.gemini/oauth_creds.json から OAuth トークンを読み込む.
+
+        Returns:
+            google.oauth2.credentials.Credentials or None
+        """
+        if not _HAS_GOOGLE_AUTH:
+            return None
+
+        home = os.environ.get("HOME", os.path.expanduser("~"))
+        creds_path = Path(home) / ".gemini" / "oauth_creds.json"
+        if not creds_path.exists():
+            logger.info("Gemini CLI 認証ファイルが見つかりません: %s", creds_path)
+            return None
+
+        try:
+            data = json.loads(creds_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Gemini CLI 認証ファイルの読み込みに失敗: %s", exc)
+            return None
+
+        refresh_token = data.get("refresh_token") or None
+        access_token = data.get("access_token") or None
+        if not refresh_token and not access_token:
+            logger.warning("Gemini CLI 認証ファイルにトークンがありません")
+            return None
+
+        client_id = data.get("client_id") or _GEMINI_CLI_OAUTH_CLIENT_ID
+        client_secret = data.get("client_secret") or ""
+
+        creds = OAuth2Credentials(
+            token=access_token,
+            refresh_token=refresh_token,
+            token_uri=_GEMINI_CLI_OAUTH_TOKEN_URI,
+            client_id=client_id,
+            client_secret=client_secret,
+        )
+        logger.info(
+            "Gemini CLI OAuth 認証情報をロードしました (refresh_token=%s)",
+            "あり" if refresh_token else "なし",
+        )
+        return creds
 
     @staticmethod
     def _is_503_error(error: Exception) -> bool:
@@ -85,8 +207,15 @@ class ResearchOrchestrator:
 
         question = f"topic: {topic}\nsource: {source}"
 
+        # 調べるエージェントは CLI OAuth 認証で実行
         def _call_model(prompt: str) -> str:
-            return self._call_gemini_api(prompt)
+            return self._call_gemini_cli(prompt)
+
+        # ログに出すモデル名は CLI モデル（フォールバック時は管理エージェントモデル）
+        effective_model = (
+            self._cli_model_name if self._cli_client is not None
+            else self.config.gemini_model
+        )
 
         try:
             loop_result = await asyncio.to_thread(
@@ -94,9 +223,9 @@ class ResearchOrchestrator:
                 topic=question,
                 source=source,
                 timeout_sec=timeout_sec,
-                model_name=self.config.gemini_model,
+                model_name=effective_model,
                 model_call=_call_model,
-                loop_label="research-manager",
+                loop_label="research-investigator",
                 tool_registry=self.tool_registry,
                 max_turns=self.max_tool_turns if self.max_tool_turns > 0 else None,
             )
@@ -105,7 +234,110 @@ class ResearchOrchestrator:
         finally:
             self._deadline_monotonic = None
 
+    # ── 調べるエージェント: Gemini CLI OAuth 認証呼び出し ──
+
+    def _call_gemini_cli(self, prompt: str) -> str:
+        """調べるエージェント: CLI OAuth 認証で Gemini API を呼び出す.
+
+        CLI クライアントが利用不可の場合は管理エージェント (_call_gemini_api) にフォールバックする.
+        """
+        if self._cli_client is None:
+            logger.debug("CLI client unavailable; falling back to API-key model")
+            return self._call_gemini_api(prompt)
+
+        timeout = int(self.config.gemini_timeout_sec)
+        if self._deadline_monotonic is not None:
+            remaining = int(self._deadline_monotonic - time.monotonic())
+            if remaining <= 1:
+                raise RuntimeError("research_timeout_reached_before_cli_call")
+            timeout = max(5, min(timeout, remaining))
+
+        model_name = self._cli_model_name
+        try:
+            return self._cli_generate(model_name, prompt, timeout, "cli_request", "cli_response")
+        except Exception as exc:
+            logger.warning(
+                "CLI model %s failed: %s; trying fallback %s",
+                model_name, exc, self._cli_fallback_model_name,
+            )
+            log_ai_exchange(
+                component="research-investigator",
+                model=model_name,
+                prompt=prompt,
+                response="",
+                metadata={"phase": "cli_response", "attempt": 1},
+                error=str(exc),
+            )
+            if self._cli_fallback_model_name and self._cli_fallback_model_name != model_name:
+                try:
+                    return self._cli_generate(
+                        self._cli_fallback_model_name, prompt, timeout,
+                        "cli_fallback_request", "cli_fallback_response",
+                    )
+                except Exception as fb_exc:
+                    log_ai_exchange(
+                        component="research-investigator",
+                        model=self._cli_fallback_model_name,
+                        prompt=prompt,
+                        response="",
+                        metadata={"phase": "cli_fallback_response", "attempt": 1},
+                        error=str(fb_exc),
+                    )
+                    logger.warning(
+                        "CLI fallback %s also failed: %s; final fallback to API-key model",
+                        self._cli_fallback_model_name, fb_exc,
+                    )
+            # 最終フォールバック: 管理エージェント API キー経由
+            logger.info("Falling back to management agent (API-key) for investigation")
+            return self._call_gemini_api(prompt)
+
+    def _cli_generate(
+        self,
+        model_name: str,
+        prompt: str,
+        timeout: int,
+        phase_request: str,
+        phase_response: str,
+    ) -> str:
+        """google-genai Client で Gemini API を呼び出す共通処理."""
+        logger.info(
+            "[route] research-investigator -> cli_model=%s timeout_sec=%s prompt_chars=%s",
+            model_name, timeout, len(prompt),
+        )
+        log_ai_exchange(
+            component="research-investigator",
+            model=model_name,
+            prompt=prompt,
+            response="",
+            metadata={"phase": phase_request, "timeout_sec": timeout},
+        )
+        config = genai_cli_types.GenerateContentConfig(
+            temperature=0.2,
+            top_p=0.95,
+            top_k=40,
+            max_output_tokens=2048,
+        )
+        response = self._cli_client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config=config,
+        )
+        output = (response.text or "").strip()
+        if not output:
+            raise RuntimeError("cli_empty_output")
+        log_ai_exchange(
+            component="research-investigator",
+            model=model_name,
+            prompt=prompt,
+            response=output,
+            metadata={"phase": phase_response, "attempt": 1},
+        )
+        return output
+
+    # ── 管理エージェント: APIキー認証呼び出し ──
+
     def _call_gemini_api(self, prompt: str) -> str:
+        """管理エージェント: APIキー認証で Gemini API を呼び出す."""
         cli_timeout = int(self.config.gemini_timeout_sec)
         if self._deadline_monotonic is not None:
             remaining = int(self._deadline_monotonic - time.monotonic())
@@ -551,28 +783,49 @@ class ResearchOrchestrator:
 
 
 def load_research_orchestrator_config() -> OrchestratorConfig:
-    """Load Research orchestrator config from environment."""
+    """Load Research orchestrator config from environment.
+
+    管理エージェント用の環境変数:
+        RESEARCH_AGENT_GEMINI_API_KEY / GEMINI_API_KEY
+        RESEARCH_AGENT_GEMINI_MODEL (default: gemini-3.1-flash-lite-preview)
+        RESEARCH_AGENT_GEMINI_TIMEOUT_SEC
+
+    調べるエージェント用の環境変数:
+        RESEARCH_AGENT_CLI_MODEL (default: gemini-3.1-pro)
+        RESEARCH_AGENT_CLI_FALLBACK_MODEL (default: gemini-3.1-flash)
+    """
     api_key = (
         os.getenv("RESEARCH_AGENT_GEMINI_API_KEY", "").strip()
         or os.getenv("GEMINI_API_KEY", "").strip()
     )
-    cli_model = (
+    mgmt_model = (
         os.getenv("RESEARCH_AGENT_GEMINI_MODEL", "").strip()
         or os.getenv("RESEARCH_GEMINI_MODEL", "gemini-3.1-flash-lite-preview").strip()
     )
-    cli_timeout_raw = (
+    timeout_raw = (
         os.getenv("RESEARCH_AGENT_GEMINI_TIMEOUT_SEC", "").strip()
         or os.getenv("RESEARCH_GEMINI_TIMEOUT_SEC", "60").strip()
     )
     try:
-        cli_timeout = int(cli_timeout_raw)
+        timeout_sec = int(timeout_raw)
     except ValueError:
-        cli_timeout = 60
+        timeout_sec = 60
+
+    cli_model = (
+        os.getenv("RESEARCH_AGENT_CLI_MODEL", "").strip()
+        or "gemini-3.1-pro"
+    )
+    cli_fallback_model = (
+        os.getenv("RESEARCH_AGENT_CLI_FALLBACK_MODEL", "").strip()
+        or "gemini-3.1-flash"
+    )
 
     return OrchestratorConfig(
         gemini_api_key=api_key,
-        gemini_model=cli_model,
-        gemini_timeout_sec=max(30, cli_timeout),
+        gemini_model=mgmt_model,
+        gemini_timeout_sec=max(30, timeout_sec),
+        cli_model=cli_model,
+        cli_fallback_model=cli_fallback_model,
     )
 
 

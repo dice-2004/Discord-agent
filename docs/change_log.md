@@ -2,6 +2,40 @@
 
 このファイルを本プロジェクトの正式な変更履歴として運用します。
 
+## 2026-04-19
+
+### バグ修正・安定性向上（音声パイプライン）
+
+- Discord Voiceからの音声ストリーム受信時に発生していた `OpusError: corrupted stream` を解消するため、`discord.ext.voice_recv` の自動デコードを避け、`wants_opus=True` と手動の Opus デコードへ実装を切り替えた
+- `DiscordAudioBridgeSink` に無音フラッシュ（Silence Flush）のバックグラウンドタスクを追加し、0.8秒の無音を検知した際にバッファが通常チャンクサイズに到達しなくても強制的に音声認識へ送信するようにした
+- `VoiceChunkForwarder` タスクが正しいイベントループに紐づかず停止してしまう問題を修正し、起動時にキューのコンシューマが走るように改善した
+- `voice-stt-agent` 側（Faster-Whisper）のVAD（無音除去フィルタ）が厳しすぎて、ノイズ混じりの微小な音声チャンクから必要な声を削り落として幻覚（「お疲れ様です」等）を引き起こす問題に対処し、コード上で強制的に `vad_filter = False` へハードコード固定し、確実にすべて音声を文字起こしに回すよう修正した
+
+### パフォーマンス向上
+
+- `main-agent` の `/vc_join` コマンド実行時に、バックグラウンド処理で `voice-stt-agent`（Ollama / Gemma）へAPIを投げ、意図抽出用LLMモデル（`gemma4`）をメモリに事前展開（Preload）する機能を実装した。これにより、初回音声入力時の意図抽出が遅延する問題（Cold Start問題）を劇的に改善した
+
+### アーキテクチャ改善（Research Agent モデル・認証分離）
+
+- Research Agent 内の「管理エージェント」と「調べるエージェント」のモデル・認証方式を完全に分離した
+  - **管理エージェント**: APIキー認証 (`google-generativeai`) + `gemini-3.1-flash-lite-preview` / フォールバック `gemma-4-31b-it`
+  - **調べるエージェント**: Gemini CLI OAuth認証 (`google-genai`) + `gemini-3.1-pro` / フォールバック `gemini-3.1-flash`
+- `google-genai` (新SDK) を依存に追加し、`google-generativeai` (旧SDK) と共存させる構成にした
+- Gemini CLI の `$HOME/.gemini/oauth_creds.json` から OAuth トークンを読み込み、`google.oauth2.credentials.Credentials` に変換するアダプタ `_load_gemini_cli_credentials()` を新規実装した
+- CLI クライアントが利用不可（認証ファイル未設定、パッケージ未インストール等）の場合、管理エージェントの APIキー経由に安全にフォールバックする設計とした
+- CLI モデルのメイン・フォールバック双方が失敗した場合の最終フォールバックとして管理エージェント APIキー経由の呼び出しを追加した
+- `_call_gemini_cli()` メソッドを新設し、`answer()` メソッドの `model_call` を CLI 認証経由に変更した
+- ログラベルを `research-manager` → `research-investigator` に変更し、管理エージェントとの区別を明確にした
+
+### 設定変更
+
+- `.env` / `.env.example` に以下の環境変数を追加:
+  - `RESEARCH_AGENT_CLI_MODEL`: 調べるエージェントのメインモデル（既定: `gemini-3.1-pro`）
+  - `RESEARCH_AGENT_CLI_FALLBACK_MODEL`: 調べるエージェントのフォールバックモデル（既定: `gemini-3.1-flash`）
+- `RESEARCH_AGENT_GEMINI_MODEL` を `gemini-3.1-pro` から `gemini-3.1-flash-lite-preview` に戻し、管理エージェント専用として明確化した
+- `.env` 31行目の重複していた `RESEARCH_AGENT_GEMINI_503_FALLBACK_MODEL` を削除した
+- `requirements.txt` に `google-genai>=1.0.0` と `google-auth>=2.0.0` を追加した
+
 ## 2026-04-16
 
 ### バグ修正
