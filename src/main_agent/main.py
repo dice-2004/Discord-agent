@@ -139,22 +139,44 @@ class DiscordAudioBridgeSink(AudioSinkBase):
         chunk_ms = max(500, int(os.getenv("VOICE_STT_CHUNK_MS", "4000").strip() or "4000"))
         self.max_chunk_bytes = int(self.sample_rate * self.channels * self.sample_width * (chunk_ms / 1000.0))
         self._buffers: dict[int, bytearray] = {}
+        self._decoders: dict[int, Any] = {}
         self._lock = threading.Lock()
 
     def wants_opus(self) -> bool:
-        return False
+        # Avoid library-side auto-decoding which causes "corrupted stream" OpusError.
+        # We handle decoding locally to catch exceptions and prevent crash.
+        return True
 
     def write(self, user: object, data: object) -> None:
         if user is None or data is None:
             return
         user_id = int(getattr(user, "id", 0) or 0)
-        if user_id <= 0:
-            return
-        if bool(getattr(user, "bot", False)):
+        if user_id <= 0 or bool(getattr(user, "bot", False)):
             return
 
-        pcm = getattr(data, "pcm", None)
-        if not isinstance(pcm, (bytes, bytearray)) or not pcm:
+        opus_data = getattr(data, "opus", None)
+        if not isinstance(opus_data, bytes) or not opus_data:
+            return
+
+        # Initialize or get decoder for this user
+        with self._lock:
+            decoder = self._decoders.get(user_id)
+            if decoder is None:
+                try:
+                    decoder = discord.opus.Decoder(self.sample_rate, self.channels)
+                    self._decoders[user_id] = decoder
+                except Exception as e:
+                    logger.warning("Failed to create opus decoder for user %s: %s", user_id, e)
+                    return
+
+        # Decoding with error handling
+        try:
+            # 20ms frame = 960 samples @ 48kHz
+            pcm = decoder.decode(opus_data, fec=False)
+        except discord.opus.OpusError as e:
+            # Skip corrupted packets instead of crashing the thread
+            return
+        except Exception as e:
             return
 
         flush_payload: bytes | None = None
@@ -175,6 +197,7 @@ class DiscordAudioBridgeSink(AudioSinkBase):
                 if buf:
                     pending.append((user_id, bytes(buf)))
             self._buffers.clear()
+            self._decoders.clear() # Clear decoders on cleanup
         for user_id, pcm in pending:
             self._emit_wav_chunk(user_id=user_id, pcm=pcm)
 
