@@ -265,9 +265,9 @@ def _transcribe_audio_bytes(payload: bytes, ext: str) -> tuple[str, str | None]:
     model = _get_stt_model()
     language = os.getenv("VOICE_STT_LANGUAGE", "ja").strip() or "ja"
     beam_size = max(1, _safe_int("VOICE_STT_BEAM_SIZE", 1))
-    # For debugging why VAD removes everything, let's disable VAD filter or make it optional.
-    # We will prefer False if no specific env is set to ensure we capture audio.
-    vad_filter = os.getenv("VOICE_STT_VAD_FILTER", "false").strip().lower() == "true"
+    
+    # 完全にVADフィルタを無効化します（環境変数に関わらず強制オフ）
+    vad_filter = False
 
     suffix = f".{(ext or 'wav').strip().lower()}"
     if not suffix.startswith("."):
