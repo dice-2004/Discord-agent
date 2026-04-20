@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import audioop
 import io
 import json
 import logging
@@ -252,14 +253,35 @@ class DiscordAudioBridgeSink(AudioSinkBase):
         for user_id, pcm in pending:
             self._emit_wav_chunk(user_id=user_id, pcm=pcm)
 
+    @staticmethod
+    def _downsample_to_16k_mono(pcm: bytes, src_rate: int, channels: int, sample_width: int) -> bytes:
+        """48kHz ステレオ PCM → 16kHz モノラル PCM に変換.
+
+        Whisper は内部的に 16kHz モノラルを期待するため、
+        送信前にダウンサンプリングすることで認識精度を大幅に向上させる。
+        """
+        mono = pcm
+        if channels == 2:
+            mono = audioop.tomono(pcm, sample_width, 1, 1)
+        if src_rate != 16000:
+            mono, _ = audioop.ratecv(mono, sample_width, 1, src_rate, 16000, None)
+        return mono
+
     def _emit_wav_chunk(self, *, user_id: int, pcm: bytes) -> None:
-        logging.getLogger(__name__).info("Emitting WAV chunk for user %s, size %s bytes", user_id, len(pcm))
+        # Whisper 向けに 16kHz モノラルへダウンサンプリング
+        pcm_16k = self._downsample_to_16k_mono(
+            pcm, self.sample_rate, self.channels, self.sample_width,
+        )
+        logging.getLogger(__name__).info(
+            "Emitting WAV chunk for user %s: %d bytes (raw) -> %d bytes (16kHz mono)",
+            user_id, len(pcm), len(pcm_16k),
+        )
         wave_buffer = io.BytesIO()
         with wave.open(wave_buffer, "wb") as wav:
-            wav.setnchannels(self.channels)
+            wav.setnchannels(1)        # mono
             wav.setsampwidth(self.sample_width)
-            wav.setframerate(self.sample_rate)
-            wav.writeframes(pcm)
+            wav.setframerate(16000)    # 16kHz
+            wav.writeframes(pcm_16k)
         self.forwarder.enqueue(
             guild_id=self.guild_id,
             channel_id=self.channel_id,

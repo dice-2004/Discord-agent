@@ -265,9 +265,14 @@ def _transcribe_audio_bytes(payload: bytes, ext: str) -> tuple[str, str | None]:
     model = _get_stt_model()
     language = os.getenv("VOICE_STT_LANGUAGE", "ja").strip() or "ja"
     beam_size = max(1, _safe_int("VOICE_STT_BEAM_SIZE", 1))
-    
-    # 完全にVADフィルタを無効化します（環境変数に関わらず強制オフ）
-    vad_filter = False
+
+    # VAD を再有効化（緩い設定）: 完全な無音チャンクを除去してハルシネーションを防ぐ
+    vad_filter = True
+    vad_parameters = {
+        "threshold": 0.3,          # 既定 0.5 より緩く設定し、小さな音声も拾う
+        "min_speech_duration_ms": 200,
+        "min_silence_duration_ms": 500,
+    }
 
     suffix = f".{(ext or 'wav').strip().lower()}"
     if not suffix.startswith("."):
@@ -277,26 +282,75 @@ def _transcribe_audio_bytes(payload: bytes, ext: str) -> tuple[str, str | None]:
         tmp.write(payload)
         tmp.flush()
         try:
-            # transcription options
-            # use task='transcribe' (default)
             segments, info = model.transcribe(
                 tmp.name,
                 language=language,
                 beam_size=beam_size,
                 vad_filter=vad_filter,
+                vad_parameters=vad_parameters,
                 word_timestamps=False,
+                # --- ハルシネーション対策パラメータ ---
+                condition_on_previous_text=False,    # 前セグメントの幻覚が後続に伝播するのを防止
+                no_speech_threshold=0.5,             # 無音判定を少し緩くする（既定 0.6）
+                log_prob_threshold=-0.8,             # 低品質セグメントを除去（既定 -1.0）
+                compression_ratio_threshold=2.0,     # 反復パターン除去（既定 2.4）
+                initial_prompt="大学の授業の音声です。講義内容を正確に文字起こししてください。",
             )
             segments = list(segments)
             text = " ".join(str(seg.text).strip() for seg in segments if str(seg.text).strip()).strip()
-            
-            logger.info("STT result for %d bytes: 「%s」 (segments=%d, vad=%s)", 
+
+            # --- ハルシネーション検知フィルタ ---
+            if text and _is_whisper_hallucination(text):
+                logger.info(
+                    "STT hallucination filtered for %d bytes: 「%s」",
+                    len(payload), text,
+                )
+                return "", "stt_hallucination_filtered"
+
+            logger.info("STT result for %d bytes: 「%s」 (segments=%d, vad=%s)",
                         len(payload), text, len(segments), vad_filter)
-            
+
             if not text:
                 return "", "stt_no_speech"
             return text, None
         except Exception as exc:
             return "", f"stt_failed:{exc}"
+
+
+# Whisper が日本語音声で頻出させる既知のハルシネーションパターン
+_HALLUCINATION_PATTERNS: list[str] = [
+    "ご視聴ありがとう",
+    "チャンネル登録",
+    "いいねをお願い",
+    "高評価",
+    "お疲れ様でした",
+    "お疲れ様です",
+    "ご覧いただき",
+    "見てくれてありがとう",
+    "字幕",
+    "subtitles",
+    "チョコレートドッグ",
+    "ご清聴", 
+    "ありがとうございました",  # 単独で出る場合
+]
+
+
+def _is_whisper_hallucination(text: str) -> bool:
+    """Whisper の既知ハルシネーションパターンに該当するか判定する.
+
+    短いテキスト（30文字以下）で既知パターンに一致する場合のみフィルタする。
+    長いテキストは実際の講義内容の可能性が高いため通す。
+    """
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return False
+
+    # 短いテキスト（30文字以下）の場合のみチェック
+    if len(cleaned) > 30:
+        return False
+
+    lowered = cleaned.lower()
+    return any(pattern in lowered for pattern in _HALLUCINATION_PATTERNS)
 
 
 def _forward_transcript(payload: dict[str, Any]) -> tuple[int | None, str | None]:
