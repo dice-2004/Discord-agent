@@ -206,8 +206,9 @@ def _process_transcript(payload: dict[str, Any]) -> dict[str, Any]:
         history_path.parent.mkdir(parents=True, exist_ok=True)
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with history_path.open("a", encoding="utf-8") as f:
-            f.write(f"[{now_str}] Input: 「{text}」\n")
-            f.write(f"[{now_str}] Result: intent={intent}, query=\"{query}\", action={result.get('action')}, detail={result.get('detail')}\n")
+            f.write(f"[{now_str}] Input (Whisper): 「{text}」\n")
+            f.write(f"[{now_str}] Fixed (Gemma)  : 「{query}」\n")
+            f.write(f"[{now_str}] Decision      : intent={intent}, action={result.get('action')}, confidence={confidence:.2f}, reason={reason}\n")
             f.write("-" * 80 + "\n")
     except Exception as e:
         logger.error("Failed to write to stt_history.log: %s", e)
