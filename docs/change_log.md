@@ -15,6 +15,10 @@
   - `docker-compose.yml` から `voice-stt-agent` サービスおよび `voice` プロファイルを削除
   - `.env` / `.env.example` から音声関連の設定項目を削除
   - `requirements.txt` から `discord-ext-voice-recv`, `PyNaCl` を削除
+- **不要なローカルサービスの完全撤去**:
+  - `docker-compose.yml` から `ollama` サービスを削除した
+  - コード精査により、Gemini 503 時のフォールバック動作は Gemini API (クラウド) 上の Gemma モデルを直接呼び出しており、ローカルの Ollama サーバーを必要としないことを確認した
+  - これにより、N100 サーバーの貴重なメモリおよび CPU リソースを大幅に解放し、システム全体の安定性を向上させた
 
 ### アーキテクチャ改善・バグ修正
 

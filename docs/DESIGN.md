@@ -175,13 +175,14 @@ N100導入時は、Main Agentの即応性を守るために以下の分離を標
 
 * `main-agent`: Discord I/O、Orchestrator、軽量ツール呼び出し、承認UI、監査ログ記録
 * `research-agent`: 非同期深掘りジョブの裁定/検査/原文保存、ジョブ状態管理
-* `gemma-worker`: ローカルGemma推論の補助API（ログ検索再ランク、長文要約、候補抽出、tool loop）
+* `main-agent`: Discord I/O、Orchestrator、軽量ツール呼び出し、承認UI、監査ログ記録
+* `research-agent`: 非同期深掘りジョブの裁定/検査/原文保存、ジョブ状態管理
 
 運用原則:
 
-* Main AgentからGemma処理を**同期で直列ブロックしない**（必要時のみ短時間呼び出し）
-* 重いGemma処理は `gemma-worker` で tool loop を回し、`research-agent` は原文保存と裁定だけ行う
-* 先行提案のうち、全メッセージ常時ゲート（提案3）は既定採用しない
+* Main Agent から Gemini/Gemma 処理を同期で直列ブロックしない（必要時のみ短時間呼び出し）
+* 重い処理は `research-agent` へ委譲し、Main Agent のレスポンスを維持する
+* 全メッセージ常時ゲート（提案3）は既定採用しない
 
 
 ---
