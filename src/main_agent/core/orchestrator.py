@@ -1404,10 +1404,22 @@ class DiscordOrchestrator:
             "それ",
             "その",
             "この件",
+            "これ",
+            "あれ",
             "同じ",
             "続き",
             "前の",
             "先ほど",
+            "さっき",
+            "さきほど",
+            "つまり",
+            "要するに",
+            "っていうと",
+            "ってこと",
+            "それって",
+            "そっち",
+            "あっち",
+            "こっち",
             "さっき",
             "前回",
         )
@@ -1525,8 +1537,15 @@ class DiscordOrchestrator:
             "解説",
             "仕組み",
             "方法",
+            "解説",
         )
-        return any(marker in lowered for marker in generic_markers)
+
+        # 質問が非常に短い場合（例: 「とは？」のみや「vmbr0とは？」など30文字以下）は、
+        # 一般知識っぽく見えても文脈依存の可能性が高いため、一般知識クエリとはみなさない（履歴検索を許可する）。
+        if len(lowered) < 30:
+            return False
+
+        return any(m in lowered for m in generic_markers)
 
     @staticmethod
     def _extract_followup_topic_from_recent_context(question: str) -> str:

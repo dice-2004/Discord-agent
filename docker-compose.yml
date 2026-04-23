@@ -31,7 +31,6 @@ services:
     container_name: ollama
     profiles:
       - gemma
-      - voice
     env_file:
       - ./.env
     volumes:
@@ -43,23 +42,4 @@ services:
       timeout: 5s
       retries: 20
       start_period: 20s
-    restart: unless-stopped
-
-  voice-stt-agent:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.voice_stt
-    container_name: voice-stt-agent
-    profiles:
-      - voice
-    ports:
-      - "8095:8095"
-    env_file:
-      - ./.env
-    volumes:
-      - ./data/runtime:/app/data/runtime
-      - ./data/audit:/app/data/audit
-      - ./src:/app/src
-    depends_on:
-      - ollama
     restart: unless-stopped

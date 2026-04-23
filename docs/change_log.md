@@ -2,6 +2,28 @@
 
 このファイルを本プロジェクトの正式な変更履歴として運用します。
 
+## 2026-04-23
+
+### 機能廃止（音声対話・音楽連携）
+
+- Bluetooth の HSP/HFP プロファイル使用時の音質劣化問題を考慮し、Voice STT 関連機能を完全に削除した
+  - `src/voice_stt_agent/` ディレクトリおよび関連コードの削除
+  - `docker/Dockerfile.voice_stt` の削除
+  - `src/tools/music_tools.py` （Spotify/音楽連携ツール）の削除
+  - `main-agent` から音声受信・転送・デコードロジック（`DiscordAudioBridgeSink`, `VoiceChunkForwarder`）を削除
+  - `/vc_join`, `/vc_leave`, `/vc_status` コマンドの削除
+  - `docker-compose.yml` から `voice-stt-agent` サービスおよび `voice` プロファイルを削除
+  - `.env` / `.env.example` から音声関連の設定項目を削除
+  - `requirements.txt` から `discord-ext-voice-recv`, `PyNaCl` を削除
+
+### アーキテクチャ改善・バグ修正
+
+- **会話文脈の保持（フォローアップ解決）の強化**:
+  - `つまり`, `これ`, `それって`, `要するに` などの接続詞・代名詞をフォローアップマーカーとして新規登録し、これらを含む質問で前後の文脈が無視される問題を改善した
+  - 一般知識クエリ判定（History Context スキップ）の条件を緩和し、30文字以下の短い質問（例: 「vmbr0とは？」）では一般知識っぽく見えても履歴検索を実行するように変更した
+- **Gemma プロンプトリーク検知の強化**:
+  - Gemma が内部思考過程（Role, Constraints 等の見出し）を誤って出力した際の検知パターンを拡充し、複数の見出しが並んでいる場合に自動的に安全なエラーメッセージへ差し替えるように改善した
+
 ## 2026-04-20
 
 ### バグ修正・安定性向上（音声文字起こしパイプライン）
