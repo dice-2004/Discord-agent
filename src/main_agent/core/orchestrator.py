@@ -1134,11 +1134,12 @@ class DiscordOrchestrator:
     def _last_model_is_gemma(self) -> bool:
         return (self._last_model_used_name or "").strip().lower().startswith("gemma")
 
-    @staticmethod
-    def _looks_like_internal_prompt_leak(text: str) -> bool:
+    def _looks_like_internal_prompt_leak(self, text: str) -> bool:
         body = (text or "").strip()
         if not body:
             return False
+            
+        # Gemma が内部プロンプトの見出しをそのまま出力し始めた場合のキーワード
         markers = [
             "Discord Personal AI Assistant",
             "[Final Response Policy]",
@@ -1148,8 +1149,26 @@ class DiscordOrchestrator:
             "Draft 1",
             "Draft 2",
             "Don't be assertive about unknowns",
+            "Role:",
+            "User Question:",
+            "Tool Result:",
+            "Constraints:",
+            "Action:",
+            "Response Draft:",
+            "Conclusion first?",
+            "Concise/Practical?",
+            "No redundant introductions",
         ]
-        return any(marker in body for marker in markers)
+        
+        # 1つでもあれば怪しいが、誤検知を防ぐため「複数ヒット(2つ以上)」または「特定決定的フレーズ」で判定
+        hits = [m for m in markers if m in body]
+        
+        # 「Role:」と「Response Draft:」が同時にあればほぼ確実にリーク
+        if "Role:" in hits and ("Response Draft:" in hits or "Action:" in hits):
+            return True
+            
+        # それ以外でも3つ以上マーカーがあればアウト
+        return len(hits) >= 3
 
     @staticmethod
     def _sanitize_user_facing_error_phrases(text: str) -> str:
