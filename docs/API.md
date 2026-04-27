@@ -43,10 +43,10 @@ Content-Type: application/json
 
 **オプション:**
 - `source` (string, default: "auto") - 調査対象ソース
-- `mode` (string, default: "auto")
-  - `auto` - CLI が使える場合優先、不可なら fallback
-  - `gemini_cli` - Gemini CLI のみ使用
-  - `fallback` - Gemini CLI を使わず管理AI（Gemini API）を優先。失敗時のみ deep_dive
+- `mode` (string, default: "auto") - 互換用のリクエスト指定。現行実装では保存・検証には使いますが、実際の探索経路は ResearchOrchestrator 側の認証可否で決まります。
+  - `auto` - 既定。CLI OAuth が使えるならそれを使い、使えない場合は API 側へフォールバック
+  - `gemini_cli` - CLI 利用を意図した指定。失敗時は API 側へフォールバック
+  - `fallback` - API 優先を意図した指定。現行実装では互換ラベルとして受け取り、同じ研究ループを通る
 
 **レスポンス (202 Accepted):**
 ```json
@@ -75,8 +75,8 @@ X-Research-Token: <token>
   "source": "auto",
   "mode": "auto",
   "status": "done|running|queued|failed",
-  "engine": "gemini_cli|orchestrator|deep_dive|gemini_cli+orchestrator|timeout|error",
-  "report": "[Research Engine] gemini_cli\nレポート本文...",
+  "engine": "gemini_api|timeout|error",
+  "report": "[Research Engine] gemini_api\nレポート本文...",
   "decision_log": [
     {
       "turn": 1,
@@ -98,12 +98,14 @@ X-Research-Token: <token>
 - `failed` - エラー終了
 
 **Engine 値:**
-- `gemini_cli` - Gemini CLI のみで完了
-- `orchestrator` - 管理AI（Gemini API）主導で完了
-- `deep_dive` - Web 検索/Deep Dive で完了
-- `gemini_cli+orchestrator` - CLI 初期探索 + 管理AI（Gemini API）ツール活用で完了
-- `timeout` - タイムアウト
+- `gemini_api` - 現行の Research Agent で完了した通常ジョブ
+- `timeout` - ジョブ全体の制限超過
 - `error` - 実行エラー
+
+注記:
+
+- 現行実装では、Research Agent の詳細な探索分岐は `decision_log` と `ai_exchange` ログで追跡します。
+- `mode` は将来の厳密なルーティング用に残されていますが、現状はエンジン切替の強いスイッチではありません。
 
 ## タイムアウト
 
@@ -115,36 +117,19 @@ X-Research-Token: <token>
 
 ## 詳細フロー
 
-### Mode: auto（推奨）
+### Mode の実装上の扱い
 
-```
-1. Gemini CLI が有効か？
-   ├─ YES: CLI を実行
-   │   ├─ 成功 → レポート返却
-   │   └─ 失敗 → 次へ
-   └─ NO: 2へ
+現行実装では、`mode` は入力として受け取り、ジョブに記録しますが、実際の探索経路を直接分岐させる厳密なスイッチではありません。Research Agent は `ResearchOrchestrator` の中で CLI OAuth の可否を見て探索を進め、使えない場合は API キー側へフォールバックします。
 
-2. "need_orchestrator" マーカーがあるか？
-   ├─ YES: 管理AI（Gemini API）+ ツール起動
-   │   └─ レポート返却
-   └─ NO: Deep Dive で補完
-       └─ レポート返却
-```
+- `auto` - 既定の互換指定
+- `gemini_cli` - CLI 利用意図の互換指定
+- `fallback` - API 優先意図の互換指定
 
-### Mode: gemini_cli
-
-- Gemini CLI のみ使用
-- CLI が利用不可/失敗の場合は error を返す
-
-### Mode: fallback
-
-- CLI を使わず、管理AI（Gemini API）を優先
-- 管理AIが利用不可/失敗時のみ Deep Dive へフォールバック
+必要なら将来、`mode` を厳密なルーティング条件に昇格できます。現状の `engine` は `gemini_api` / `timeout` / `error` のみです。
 
 ## Decision Log
 
-`decision_log` は **管理AI（Gemini API）が起動された場合のみ**含まれます。
-CLI のみで完了した場合は空配列 `[]` です。
+`decision_log` は ResearchOrchestrator の判断ログです。CLI 可用時の探索や API フォールバックの経路がここに入ります。`engine` はジョブ全体の結果ラベルで、探索の内部経路そのものではありません。
 
 ```json
 {

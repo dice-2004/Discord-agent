@@ -1,16 +1,16 @@
 # Discord AI Agent Bot
 
-Discordをインターフェースにした、低リソース向けのAIエージェントです。
-現在の標準構成では以下を提供します。
+Discord をインターフェースにした、低リソース向けの AI エージェントです。
 
-- `/ask` での質問応答
-- Gemini 3.1 Flash Lite を使った回答生成
-- DuckDuckGo検索ツール（必要時のみ利用）
-- ChromaDBによるチャンネル分離メモリ
-- 重い処理の同時実行制限（キュー制御）
-- SQLiteによる長時間タスクのチェックポイント基盤
-- Dockerコンテナでの実運用前提
-- Research Agent別コンテナへのジョブ委譲（段階実装）
+主な機能は次のとおりです。
+
+- `/ask` による質問応答
+- Gemini 3.1 Flash Lite を使った即答
+- DuckDuckGo 検索ツール
+- ChromaDB によるチャンネル分離メモリ
+- 重い処理の同時実行制限とチェックポイント保存
+- Research Agent へのジョブ委譲
+- 内部 action のコード内実行
 
 ## ディレクトリ構成
 
@@ -27,357 +27,125 @@ AI-agent-bot/
 │   └── profiles/
 │       └── initial_profile.md
 ├── docs/
-│   └── DESIGN.md
+│   ├── API.md
+│   ├── DESIGN.md
+│   └── change_log.md
 └── src/
     ├── main_agent/
     │   ├── main.py
-  │   └── core/
-  ├── tools/
-  │   ├── tool_registry.py
-  │   └── *.py
-    └── research_agent/
-        └── research_agent_server.py
+    │   └── core/
+    ├── research_agent/
+    │   └── research_agent_server.py
+    └── tools/
 ```
 
-## クイックスタート（Docker）
+## クイックスタート
 
-1. `.env` を作成
+1. `.env` を作成します。
 
 ```bash
 cp .env.example .env
 ```
 
-2. `.env` を編集し、最低限次を設定
+2. `.env` を編集し、最低限次を設定します。
 
 - `DISCORD_TOKEN`
-- `GEMINI_API_KEY`
 - `BOT_GUILD_ID`
 - `ALLOWED_GUILD_IDS`
+- `MAIN_AGENT_GEMINI_API_KEY`
+- `RESEARCH_AGENT_GEMINI_API_KEY`
 
-3. コンテナをビルド・起動
+`GEMINI_API_KEY` は互換用の代替キーとして残っていますが、推奨は Main Agent と Research Agent でキーを分ける構成です。
+
+3. コンテナを起動します。
 
 ```bash
-docker compose build
-docker compose up -d
+docker compose up -d --build
 ```
 
-4. ログ確認
+4. ログを確認します。
 
 ```bash
 docker compose logs -f main-agent
-```
-
-Research Agent の状態確認:
-
-```bash
 docker compose logs -f research-agent
 ```
 
-## Voice Jam 拡張（main-agent非経由パス）
+## 主要な環境変数
 
-新規サービスを `voice` プロファイルで追加しています。
-
-- `voice-stt-agent` : transcript受信・意図判定・Spotify API操作を統合
-
-起動:
-
-```bash
-docker compose --profile voice up -d --build
-```
-
-疎通確認:
-
-```bash
-docker compose --profile voice logs -f voice-stt-agent
-```
-
-モックtranscript投入（main-agentを介さない）:
-
-```bash
-curl -X POST http://localhost:8095/v1/transcripts/mock \
-  -H "Content-Type: application/json" \
-  -H "X-Voice-Token: change_me" \
-  -d '{
-    "guild_id": 1228693698632618117,
-    "channel_id": 1488500275294502942,
-    "user_id": 123456789012345678,
-    "text": "次は chill な曲を流して"
-  }'
-```
-
-VC検証（main-agentのDiscordコマンド）:
-
-- `/vc_join` : 実行者がいるVCへ参加
-- `/vc_status` : 参加状態の確認
-- `/vc_transcript_mock text:<...>` : transcript転送の即時確認
-- `/vc_leave` : VCから退出
-
-## 権限/設定の変更が必要な項目
-
-Discord Developer Portal (既存main-agent Bot):
-
-- Privileged Gateway Intents:
-  - `MESSAGE CONTENT INTENT` (任意: slash運用のみなら不要)
-- OAuth2 Scopes:
-  - `bot`
-  - `applications.commands`
-- Bot Permissions (最低限):
-  - `View Channels`
-  - `Connect`
-  - `Speak` (音を流さないなら必須ではないが、環境差対策で推奨)
-  - `Use Application Commands`
-  - `Send Messages`
-
-注記:
-
-- `VOICE_STT_ENABLE_DISCORD=false` が既定です。voice-stt-agent はHTTP受け口のみを担当し、Discord接続はmain-agentのみが行います。
-- voice機能は `voice-stt-agent` に統合されています（意図判定とSpotify操作を同コンテナで実行）。
-
-Spotify API:
-
-- 必須スコープ:
-  - `user-modify-playback-state`
-  - `user-read-playback-state` (デバッグ用推奨)
-- 推奨（本番想定）: `.env` に以下を設定し、refresh token で自動更新
-  - `SPOTIFY_CLIENT_ID`
-  - `SPOTIFY_CLIENT_SECRET`
-  - `SPOTIFY_REFRESH_TOKEN`
-
-OpenWeatherMap:
-
-- 現段階では未使用（Phase 2で `weather_recommend` 実装時にAPIキー追加）
-
-注記:
-
-- `SPOTIFY_REFRESH_TOKEN` 方式を設定した場合、`voice-stt-agent` は内部でアクセストークンを自動取得・更新します。
-- `MUSIC_INTENT_USE_OLLAMA=false` (既定) の場合、意図判定はルールベースで即時実行されます。Ollama判定を有効化する場合は `true` に変更してください。
-- 実装済みエンドポイントは最小構成です（`/healthz`, `/v1/transcripts`, `/v1/transcripts/mock`, `/v1/audio/chunks`）。
-
-## 外部アクション実行（コード内）
-
-このプロジェクトは n8n 中継を使わず、Botコード内で action を直接実行します。
-
-### 1. 主要な環境変数
-
-- `INTERNAL_ALLOWED_ACTIONS`
-- `INTERNAL_ACTION_REQUIRED_FIELDS`
-- `INTERNAL_ACTION_TIMEOUT_SEC`
-- `CALENDAR_PROVIDER` / `GOOGLE_CALENDAR_ID` / `GOOGLE_CALENDAR_CLIENT_ID` / `GOOGLE_CALENDAR_CLIENT_SECRET` / `GOOGLE_CALENDAR_REFRESH_TOKEN`
-- `GITHUB_TOKEN` / `GITHUB_AUTH_URL`
-- `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` / `SMTP_FROM` / `SMTP_AUTH_URL`（メール送信を使う場合のみ）
-- `BACKUP_OUTPUT_DIR` / `BACKUP_ALLOWED_ROOTS`
-- `SHEET_STORAGE_DIR`
-- `NOTION_MEMO_STORAGE_PATH`
-- `CALENDAR_EVENTS_STORAGE_PATH` / `CALENDAR_EVENTS_LIST_LIMIT`
+- `MAIN_AGENT_GEMINI_API_KEY` / `RESEARCH_AGENT_GEMINI_API_KEY`
+- `DISCORD_TOKEN`
+- `BOT_GUILD_ID` / `ALLOWED_GUILD_IDS`
+- `CHROMADB_PATH`
+- `CHECKPOINT_DB_PATH`
+- `MAX_CONCURRENT_HEAVY_TASKS`
 - `RESEARCH_AGENT_URL` / `RESEARCH_AGENT_SHARED_TOKEN`
-- `RESEARCH_AGENT_DB_PATH` / `RESEARCH_AGENT_POLL_INTERVAL_SEC` / `RESEARCH_AGENT_WAIT_TIMEOUT_SEC`
-- `RESEARCH_AGENT_USE_GEMINI_CLI` / `RESEARCH_AGENT_GEMINI_COMMAND` / `RESEARCH_AGENT_GEMINI_MODEL`
-- `DEEPDIVE_USE_RESEARCH_AGENT`
-- `RESEARCH_NOTIFY_ON_COMPLETE` / `RESEARCH_NOTIFY_TIMEOUT_SEC` / `RESEARCH_NOTIFY_POLL_SEC`
+- `RESEARCH_AGENT_DB_PATH`
+- `RESEARCH_AGENT_GEMINI_MODEL`
+- `RESEARCH_AGENT_CLI_MODEL` / `RESEARCH_AGENT_CLI_FALLBACK_MODEL`
+- `INTERNAL_ALLOWED_ACTIONS` / `INTERNAL_ACTION_REQUIRED_FIELDS`
+- `GITHUB_TOKEN` / `SMTP_HOST` / `SMTP_USER` / `SMTP_PASSWORD`
 
-### 2. Discord からの実行
+詳細は [.env.example](.env.example) を参照してください。
 
-- 通常運用は `/ask` を使います（AIが必要なツールを自律的に選択して実行）
-- 認証状態確認: `/auth_status`
-- デバッグ用手動実行: `/debug_action action:<name> payload_json:<json>`
+## Research Agent
 
-### 3. 認証未設定時の運用
+Research Agent は Main Agent からのジョブを受け取り、ジョブベースで非同期に処理します。
 
-認証未設定で実行すると、`auth_required` と `auth_url` を返します。Discordに返ったURLを開き、資格情報を準備してから再実行してください。
+現行実装では、`mode` は互換用の入力として受け取り、実際の探索経路は ResearchOrchestrator 側の認証可否で決まります。
+
+- `mode=auto` : 既定。CLI OAuth が使えるならそれを使い、使えない場合は API 側へフォールバックします。
+- `mode=gemini_cli` : CLI 利用意図を示すラベルです。失敗時は API 側へフォールバックします。
+- `mode=fallback` : API 側優先意図を示すラベルです。現行実装では同じ研究ループを通ります。
+
+CLI 認証は、コンテナ内の `$HOME/.gemini/oauth_creds.json` から読み取ります。Research Agent はこれを `google-genai` で利用し、使えない場合は同じ問い合わせを Gemini API 側へフォールバックします。
+
+## よく使うコマンド
+
+- `/ask` : 通常の質問応答
+- `/deepdive` : 調査ジョブ投入
+- `/logsearch` : Discord 過去ログ検索
+- `/runcli` : 承認付き CLI 実行
+- `/runcli_audit` : CLI 監査ログ確認
+- `/profile_show` / `/profile_set` / `/profile_forget` : ペルソナ記憶の管理
+- `/auth_status` : 外部連携の認証状況確認
+- `/debug_action` : 内部 action のデバッグ実行
+
+## 認証未設定時の挙動
+
+認証未設定の action は、`auth_required` と `auth_url` を返します。Discord に返った URL を開き、資格情報を準備してから再実行してください。
 
 例:
 
-- GitHub: `GITHUB_AUTH_URL`（既定: `https://github.com/settings/tokens`）
-- Google Calendar: `GOOGLE_CALENDAR_AUTH_URL`（OAuth クライアント + refresh token の作成先）
-- SMTP: `SMTP_AUTH_URL`（運用サービスの設定ページURLを指定）
-
-### 4. 注意点
-
-- 実装済み action: `create_github_issue`, `backup_server_data`, `append_sheet_row`, `add_notion_memo`, `add_calendar_event`, `get_calendar_events`（`send_email` は任意）
-- `add_calendar_event` / `get_calendar_events` は payload に `calendar_id` を指定すると参照先カレンダーを上書きできます（未指定時は `GOOGLE_CALENDAR_ID`）。
-- `stub-success` のような疑似成功は返しません。
-
-## Research Agent（別コンテナ）
-
-
-Gemini CLI の利用方針:
-
-
-Gemini CLI を実際に使う手順（Research Agent）:
-
-1. Research Agent を再ビルド
-
-```bash
-docker compose build research-agent
-docker compose up -d research-agent
-```
-
-2. CLI 導入確認
-
-```bash
-docker compose exec research-agent gemini --version
-```
-
-3. コンテナ内でログイン（初回のみ）
-
-```bash
-docker compose exec -it research-agent gemini login
-```
-
-4. `.env` で有効化
-
-
-5. 反映
-
-```bash
-docker compose up -d --build research-agent main-agent
-```
-
-6. Bot から呼び出し
-
-
-調査モード/時間の指定方法:
-
-
-認証情報の保存先:
-
-
-### 概要
-
-Research Agent は 2層構成で動作します：
-
-1. **Gemini CLI層** - 高速な初期探索
-2. **管理AI層** - ツール使用による深掘り（必要な場合のみ）
-
-Main Agent から `dispatch_research_job` ツールでジョブを投入すると、Research Agent が自律的に判断して処理します。
-
-### アーキテクチャ
-
-```
-Main Agent (dispatch_research_job)
-    ↓
-  Research Agent HTTP
-    ↓
-  Gemini CLI（初期探索）
-    ↓
-  結果分析 "need_orchestrator" 判定
-    ├─ false → CLI再探索 / deep_dive
-    └─ true → 管理AI（Gemini API） + ツール
-       ├─ web_search
-       ├─ read_url_markdown
-       └─ source_deep_dive
-```
-
-### タイムアウト層
-
-| 環境変数 | 役割 | デフォルト | 説明 |
-|---------|------|----------|------|
-| `RESEARCH_AGENT_GEMINI_TIMEOUT_SEC` | Gemini CLI プロセス | 240秒 | CLI 実行のプロセスタイムアウト |
-| `RESEARCH_AGENT_JOB_TIMEOUT_SEC` | ジョブ全体 | 600秒 | 投入から完了までの全体タイムアウト |
-
-### 環境設定
-
-Gemini CLI の有効化:
-
-```bash
-# 1. コンテナでログイン
-docker compose exec -it research-agent gemini login
-
-# 2. .env で有効化
-RESEARCH_AGENT_USE_GEMINI_CLI=true
-RESEARCH_AGENT_GEMINI_MODEL=gemini-2.5-flash
-
-# 3. 再起動
-docker compose up -d --build research-agent
-```
-
-管理AI（Gemini API）の有効化:
-
-```bash
-# .env で以下を設定
-GEMINI_API_KEY=your_gemini_api_key
-RESEARCH_AGENT_GEMINI_MODEL=gemini-3.1-flash-lite-preview
-RESEARCH_AGENT_GEMINI_TIMEOUT_SEC=240
-```
-
-### Bot からの利用方法
-
-調査時間/モードの指定:
-
-- `/ask` と `@メンション`: 本文に `gemini` / `fallback` と `30秒` / `5分` を含める
-- `/deepdive`: 引数で `mode` と `timeout_sec` を直接指定（例: `mode=gemini_cli timeout_sec=180`）
-
-完了通知:
-
-- `engine: gemini_cli` - Gemini CLI が対応
-- `engine: deep_dive` - Web 検索 / deep dive で対応
-- `engine: gemini_cli+orchestrator` - CLI + 管理AI の複合実行
-
-詳細は [docs/API.md](docs/API.md) を参照してください。
-
-### 認証情報の保存先
-
-- Gemini CLI 認証: `data/runtime/gemini_home/.gemini/`（コンテナ再作成後も保持）
-- Gemini API キー: `.env` の `GEMINI_API_KEY`（環境変数経由）
-
-## Discord Botセットアップ手順（初学者向け）
-
-1. Discord Developer Portalにアクセス
-
-- https://discord.com/developers/applications
-
-2. New Applicationを作成
-
-- 任意の名前でアプリを作成
-
-3. Botを作成
-
-- 左メニュー `Bot` -> `Add Bot`
-- `Reset Token` または `Copy` でトークンを取得
-- この値を `.env` の `DISCORD_TOKEN` に設定
-
-4. Privileged Gateway Intents
-
-- 現行構成はスラッシュコマンド中心なので、基本はデフォルトで可
-- メンション応答などを拡張する際は必要に応じて有効化
-
-5. Botをサーバーへ招待
-
-- 左メニュー `OAuth2` -> `URL Generator`
-- `SCOPES` で `bot` と `applications.commands` を選択
-- `BOT PERMISSIONS` は最低限以下を付与
-  - `Send Messages`
-  - `Attach Files`
-  - `Read Message History`
-- 生成URLを開き、対象サーバーへ追加
-
-6. サーバーIDを取得
-
-- Discordの開発者モードをON
-- 対象サーバーを右クリックしてIDをコピー
-- `.env` の `BOT_GUILD_ID` / `ALLOWED_GUILD_IDS` に設定
-
-7. `/ask` コマンド確認
-
-- Bot起動後、サーバーで `/ask` を実行
-- 応答が返ればセットアップ完了
-
-8. `@メンション` での質問（任意）
-
-- `.env` で `DISCORD_ENABLE_MESSAGE_CONTENT_INTENT=true` と `MENTION_ASK_ENABLED=true` を有効化
-- `@agent-bot 今日の予定を教えて` のようにメンション先頭で送ると、`/ask` 相当として処理されます
-- `MENTION_REQUIRE_PREFIX=true` の場合、文中メンションでは発火せず先頭メンションのみ反応します
-- `MENTION_QUICK_CALENDAR_ENABLED=true` の場合、カレンダー系の定型依頼はLLMを経由せず直接 action 実行します（高速・安定化）
-- Gemma 4 の運用確認には、`いまの返答は Gemma 4 経由ですか？使っているならモデル名、使っていないなら通っていない経路を一行で教えてください。` がそのまま使えます
-
-## 運用メモ
-
-- 永続データは `data/chromadb/` に保存されます
-- `data/chromadb/` と `.env` は `.gitignore` 対象です
-- 仕様変更時は `docs/DESIGN.md` を最優先で更新してください
-- 変更履歴は `docs/change_log.md` に追記して管理してください
-
-## 開発時のローカル実行（任意）
+- GitHub: `GITHUB_AUTH_URL`
+- Google Calendar: `GOOGLE_CALENDAR_AUTH_URL`
+- SMTP: `SMTP_AUTH_URL`
+
+## 内部 action
+
+実装済み action は次のとおりです。
+
+- `create_github_issue`
+- `backup_server_data`
+- `append_sheet_row`
+- `add_notion_memo`
+- `add_calendar_event`
+- `get_calendar_events`
+- `add_task`
+- `update_task`
+- `delete_task`
+- `bulk_update_task_due_date`
+- `bulk_delete_by_dates`
+- `send_email`
+
+`add_calendar_event` と `get_calendar_events` は、必要なら `calendar_id` で参照先を上書きできます。未指定時は `GOOGLE_CALENDAR_ID` を使います。
+
+## 実行メモ
+
+- 永続データは `data/chromadb/` と `data/runtime/` に保存されます。
+- `docs/DESIGN.md` が仕様の正本です。
+- 変更履歴は [docs/change_log.md](docs/change_log.md) に追記します。
+
+## ローカル実行
 
 ```bash
 python -m venv .venv

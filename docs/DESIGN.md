@@ -96,9 +96,11 @@
 ### 2.2. Research Agent (非同期・裁定/検査担当)
 
 * **インターフェース:** Main Agentからサブプロセス（バックグラウンドジョブ）として起動される。
-* **LLMエンジン:** Google公式 Gemini API を使う Python native 実装。Gemma 4 側は `gemma-worker` 経由で呼び出す。
-* **認証基盤:** Gemini 側は Research Agent 専用の API キー、Gemma 側はローカル Ollama を使用する。
-* **役割:** どちらの経路へ投げるかを判断し、返ってきた結果を校閲・要約・返却可否判定する。深掘りの tool loop 自体は Gemini / Gemma の各ランナーが担当する。
+* **LLMエンジン:** Google公式 Gemini API を使う Python native 実装を基本とする。Gemma 4 側の連携は将来の拡張候補として扱う。
+* **認証基盤:** Gemini 側は Research Agent 専用の API キー、CLI 探索側は `$HOME/.gemini/oauth_creds.json` の OAuth 情報を使用する。
+* **役割:** ResearchOrchestrator がジョブの探索と要約を進め、CLI OAuth が使える場合は探索をそちらに寄せ、使えない場合は Gemini API 側へフォールバックする。
+
+現行コードでは、Research Agent は ResearchOrchestrator によるジョブ処理と CLI/API フォールバックを担う。以下の 2.2.2 と 2.2.3 は現行実装、2.2.4 と 2.3 は将来構想である。
 
 #### 2.2.2. 現行の最小実装（2026-04-02追記）
 
@@ -106,13 +108,16 @@
 * Main Agentは `dispatch_research_job` ツールで `POST /v1/jobs` にジョブ投入し、`GET /v1/jobs/{job_id}` で状態取得する。
 * 通信は `X-Research-Token` ヘッダで共有トークン認証する。
 * 研究ジョブ状態は `RESEARCH_AGENT_DB_PATH`（SQLite）に `queued/running/done/failed` で保存する。
-* `mode=auto` では、`time_specified` と Gemma 4 発火条件を満たす場合は `gemma-worker` を優先し、それ以外は Gemini API ランナーを優先する。
-* `mode=fallback` では Gemini ルートを使わず、`gemma-worker` を優先実行する。
-* Research Agent は実行結果の要約・校閲・原文アーティファクト保存のみを行い、深掘りの tool loop は担当しない。
+* 現行実装では `mode=auto|gemini_cli|fallback` は互換用の入力として受け取り、探索の実際の経路は ResearchOrchestrator 側の認証可否で決まる。
+* ResearchOrchestrator は `$HOME/.gemini/oauth_creds.json` から CLI OAuth 認証を取り出し、利用可能なら `google-genai` で探索を行う。
+* CLI 認証が使えない場合は、同じプロンプトを Gemini API 側へフォールバックして継続する。
+* Research Agent はジョブの永続化・完了監視・結果添付を担当し、探索の細部は ResearchOrchestrator の研究ループが扱う。
 
-#### 2.2.4. 多段委譲ポリシー（2026-04-03追記）
+#### 2.2.4. 将来構想（多段委譲ポリシー / 2026-04-03追記）
 
 品質・コスト・遅延の両立のため、研究系ワークフローは以下の役割分担を標準とする。
+
+※ この節は現行実装ではなく、将来的に導入する委譲ポリシーである。
 
 * Main Agent（Gemini 3.1 Flash Lite）: 受付・即時応答・委譲判断
 * Research管理エージェント（Gemini API / APIキー認証 / `gemini-3.1-flash-lite-preview`）: 調査計画、統合、最終品質チェック、返却可否判定。フォールバックは `gemma-4-31b-it`
@@ -128,7 +133,7 @@
 * ただし、規約比較・学術調査・複数ソース矛盾解消など高精度必須タスクは時間指定なしでも例外起動を許容する。
 * 最終ユーザー回答の品質責任はResearch管理エージェント（Gemini API）に置き、Gemma出力は原文アーティファクト付きの根拠素材として扱う。
 
-#### 2.2.3. Gemini配置方針（2026-04-19更新）
+#### 2.2.3. 現行のGemini配置方針（2026-04-19更新）
 
 Research Agent 内のモデル・認証は以下のように分離する:
 
@@ -143,6 +148,8 @@ Research Agent 内のモデル・認証は以下のように分離する:
   * モデル: `RESEARCH_AGENT_CLI_MODEL` (既定: `gemini-3.1-pro`)
   * フォールバック: `RESEARCH_AGENT_CLI_FALLBACK_MODEL` (既定: `gemini-3.1-flash`)
   * CLI認証が利用不可の場合、管理エージェント APIキー経由に自動フォールバック
+
+現行コードはこの役割分担を「探索は CLI OAuth ベース、API キーはフォールバック兼将来拡張」として実装しており、管理エージェントの厳密な別レーンはまだ薄い。
 
 #### 2.2.1. 配置方針（2026-04-01追記）
 
@@ -173,8 +180,6 @@ Research Agent 内のモデル・認証は以下のように分離する:
 
 N100導入時は、Main Agentの即応性を守るために以下の分離を標準とする。
 
-* `main-agent`: Discord I/O、Orchestrator、軽量ツール呼び出し、承認UI、監査ログ記録
-* `research-agent`: 非同期深掘りジョブの裁定/検査/原文保存、ジョブ状態管理
 * `main-agent`: Discord I/O、Orchestrator、軽量ツール呼び出し、承認UI、監査ログ記録
 * `research-agent`: 非同期深掘りジョブの裁定/検査/原文保存、ジョブ状態管理
 

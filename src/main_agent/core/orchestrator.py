@@ -418,8 +418,12 @@ class DiscordOrchestrator:
                 answer_text = "回答を生成できませんでした。質問を少し変えて再試行してください。"
             answer_text = self._sanitize_user_facing_error_phrases(answer_text)
             if self._last_model_is_gemma() and self._looks_like_internal_prompt_leak(answer_text):
-                logger.warning("Detected internal prompt-leak style output; replacing with safe error message")
-                answer_text = "内部整形で問題が発生したため、この依頼は実行結果を確定できませんでした。もう一度依頼してください。"
+                logger.warning("Detected internal prompt-leak style output; attempting to rescue actual response")
+                rescued = self._extract_safe_response_from_leak(answer_text)
+                if rescued:
+                    answer_text = rescued
+                else:
+                    answer_text = "内部整形で問題が発生したため、この依頼は実行結果を確定できませんでした。もう一度依頼してください。"
             if self.memory_response_include_evidence:
                 answer_text = self._append_memory_evidence(answer_text, history_records)
         except RuntimeError as exc:
@@ -808,10 +812,14 @@ class DiscordOrchestrator:
                 if self._is_nonfinal_response(pending_response) or (
                     self._last_model_is_gemma() and self._looks_like_internal_prompt_leak(pending_response)
                 ):
-                    had_tool_context = bool(scratchpad)
-                    scratchpad.append(f"[Agent] 非最終応答を検知: {pending_response[:120]}")
-                    if had_tool_context:
-                        continue
+                    rescued = self._extract_safe_response_from_leak(pending_response) if self._looks_like_internal_prompt_leak(pending_response) else ""
+                    if rescued and not self._is_nonfinal_response(rescued):
+                        pending_response = rescued
+                    else:
+                        had_tool_context = bool(scratchpad)
+                        scratchpad.append(f"[Agent] 非最終応答を検知: {pending_response[:120]}")
+                        if had_tool_context:
+                            continue
                     fallback_response = await self._compose_final_response(
                         system_prompt=system_prompt,
                         question=runtime_question,
@@ -839,10 +847,14 @@ class DiscordOrchestrator:
                 if self._is_nonfinal_response(response) or (
                     self._last_model_is_gemma() and self._looks_like_internal_prompt_leak(response)
                 ):
-                    had_tool_context = bool(scratchpad)
-                    scratchpad.append(f"[Agent] 非最終応答を検知: {response[:120]}")
-                    if had_tool_context:
-                        continue
+                    rescued = self._extract_safe_response_from_leak(response) if self._looks_like_internal_prompt_leak(response) else ""
+                    if rescued and not self._is_nonfinal_response(rescued):
+                        response = rescued
+                    else:
+                        had_tool_context = bool(scratchpad)
+                        scratchpad.append(f"[Agent] 非最終応答を検知: {response[:120]}")
+                        if had_tool_context:
+                            continue
                     fallback_response = await self._compose_final_response(
                         system_prompt=system_prompt,
                         question=runtime_question,
@@ -1169,6 +1181,31 @@ class DiscordOrchestrator:
             
         # それ以外でも3つ以上マーカーがあればアウト
         return len(hits) >= 3
+
+    def _extract_safe_response_from_leak(self, text: str) -> str:
+        """リークされた出力からユーザー向けの本来の回答（Response Draft など）を抽出して救済する"""
+        body = (text or "").strip()
+        if not body:
+            return ""
+        
+        # 典型的なマーカーの後ろにある文章を抽出する
+        markers = [
+            "Response Draft:",
+            "Draft 2:",
+            "Draft 1:",
+            "Draft:",
+            "回答:"
+        ]
+        
+        for marker in markers:
+            idx = body.rfind(marker)
+            if idx != -1:
+                extracted = body[idx + len(marker):].strip()
+                # 抽出した部分が短すぎなければ採用
+                if len(extracted) > 5:
+                    return extracted
+        
+        return ""
 
     @staticmethod
     def _sanitize_user_facing_error_phrases(text: str) -> str:

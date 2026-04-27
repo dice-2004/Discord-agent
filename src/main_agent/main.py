@@ -21,6 +21,12 @@ from discord import app_commands
 from discord.ui import Button, View
 from dotenv import load_dotenv
 
+from main_agent.agents import (
+    TwitterScoutAgent,
+    UserProfileAnalyzerAgent,
+    load_twitter_scout_config_from_env,
+    load_user_profile_analyzer_config_from_env,
+)
 from main_agent.core.orchestrator import DiscordOrchestrator, load_orchestrator_config_from_env
 
 MAX_TOTAL_INLINE = 15000
@@ -89,6 +95,71 @@ def chunk_text(text: str, max_len: int) -> list[str]:
     return [chunk for chunk in chunks if chunk]
 
 
+def _format_twitter_scout_notification(snapshot: dict[str, Any]) -> str:
+    updated_at = str(snapshot.get("updated_at", "") or "")
+    selected_topics = snapshot.get("selected_topics", [])
+    recommendations = snapshot.get("recommendations", [])
+    summary = str(snapshot.get("summary", "") or "").strip()
+
+    lines: list[str] = ["[Twitter Scout] おすすめ更新"]
+    if updated_at:
+        lines.append(f"updated_at: {updated_at}")
+    if isinstance(selected_topics, list) and selected_topics:
+        lines.append("topics: " + ", ".join(str(topic) for topic in selected_topics[:6]))
+    if summary:
+        lines.append("summary: " + summary[:360])
+    lines.append("")
+
+    if not isinstance(recommendations, list) or not recommendations:
+        lines.append("おすすめ候補はまだありません。")
+        return "\n".join(lines)
+
+    for idx, rec in enumerate(recommendations[:5], start=1):
+        if not isinstance(rec, dict):
+            continue
+        title = str(rec.get("title", "") or "").strip() or "(untitled)"
+        why = str(rec.get("why", "") or "").strip()
+        lines.append(f"{idx}. {title[:140]}")
+        if why:
+            lines.append(f"   reason: {why[:220]}")
+        urls = rec.get("source_urls", [])
+        if isinstance(urls, list):
+            for url in [str(u).strip() for u in urls if str(u).strip()][:2]:
+                lines.append(f"   - {url[:220]}")
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+def _format_profile_summary_notification(summary: dict[str, Any]) -> str:
+    status = str(summary.get("status", "") or "").strip() or "unknown"
+    updated_at = str(summary.get("updated_at", "") or "")
+    lines: list[str] = ["[Profile Analyzer] 更新", f"status: {status}"]
+    if updated_at:
+        lines.append(f"updated_at: {updated_at}")
+
+    if status != "ok":
+        return "\n".join(lines)
+
+    request_style = str(summary.get("request_style", "") or "").strip()
+    time_habit = str(summary.get("time_habit", "") or "").strip()
+    top_categories = summary.get("top_categories", [])
+    high_value_topics = summary.get("high_value_topics", [])
+    proxy_candidates = summary.get("proxy_request_candidates", [])
+
+    if request_style:
+        lines.append("request_style: " + request_style[:220])
+    if time_habit:
+        lines.append("time_habit: " + time_habit[:220])
+    if isinstance(top_categories, list) and top_categories:
+        lines.append("top_categories: " + ", ".join(str(x) for x in top_categories[:6]))
+    if isinstance(high_value_topics, list) and high_value_topics:
+        lines.append("high_value_topics: " + ", ".join(str(x) for x in high_value_topics[:6]))
+    if isinstance(proxy_candidates, list) and proxy_candidates:
+        lines.append("proxy_candidates: " + " | ".join(str(x) for x in proxy_candidates[:3]))
+    return "\n".join(lines)
+
+
 def _extract_research_controls(text: str) -> tuple[str | None, int | None]:
     raw = (text or "").strip()
     if not raw:
@@ -141,51 +212,6 @@ def _inject_research_controls_hint_with_values(
         lines.append("- timeout_sec は指定秒数を厳守（加算・減算・丸め禁止）")
     lines.append("- dispatch_research_job を使わない場合は、この指定を無視してよい")
     return (question or "").rstrip() + "\n" + "\n".join(lines)
-
-
-def _forward_music_intent_transcript(payload: dict[str, object]) -> tuple[dict[str, object], str | None, int | None]:
-    default_base = "http://voice-stt-agent:8095"
-    base_url = (
-        os.getenv("VOICE_STT_AGENT_URL", "").strip()
-        or os.getenv("MUSIC_INTENT_AGENT_URL", "").strip()
-        or default_base
-    ).rstrip("/")
-    token = os.getenv("VOICE_STT_SHARED_TOKEN", "").strip()
-    timeout_sec = max(3, _safe_int_env("VOICE_STT_HTTP_TIMEOUT_SEC", _safe_int_env("MUSIC_INTENT_HTTP_TIMEOUT_SEC", 10)))
-
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "User-Agent": "main-agent/voice-bridge",
-    }
-    if token:
-        headers["X-Voice-Token"] = token
-
-    req = Request(
-        f"{base_url}/v1/transcripts",
-        method="POST",
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers=headers,
-    )
-
-    try:
-        with urlopen(req, timeout=timeout_sec) as res:
-            status = int(getattr(res, "status", 200))
-            raw = res.read().decode("utf-8", errors="replace")
-        payload_out = json.loads(raw) if raw else {}
-        if not isinstance(payload_out, dict):
-            payload_out = {"status": "error", "detail": str(payload_out)[:600]}
-        return payload_out, None, status
-    except HTTPError as exc:
-        try:
-            detail = exc.read().decode("utf-8", errors="replace")
-        except Exception:
-            detail = str(exc)
-        return {}, detail[:1200], int(getattr(exc, "code", 500))
-    except URLError as exc:
-        return {}, str(exc)[:1200], None
-    except Exception as exc:
-        return {}, str(exc)[:1200], None
 
 
 def _extract_urls_from_text(text: str) -> list[str]:
@@ -1268,6 +1294,12 @@ def main() -> None:
     research_notify_on_complete = os.getenv("RESEARCH_NOTIFY_ON_COMPLETE", "true").strip().lower() == "true"
     research_notify_timeout_sec = int(os.getenv("RESEARCH_NOTIFY_TIMEOUT_SEC", "600"))
     research_notify_poll_sec = int(os.getenv("RESEARCH_NOTIFY_POLL_SEC", "3"))
+    twitter_notify_channel_id = _safe_int_env("TWITTER_SCOUT_NOTIFY_CHANNEL_ID", 0)
+    twitter_notify_interval_sec = max(60, _safe_int_env("TWITTER_SCOUT_NOTIFY_INTERVAL_SEC", 1800))
+    twitter_notify_force_refresh = os.getenv("TWITTER_SCOUT_NOTIFY_FORCE_REFRESH", "false").strip().lower() == "true"
+    profile_notify_channel_id = _safe_int_env("PROFILE_ANALYZER_NOTIFY_CHANNEL_ID", 0)
+    profile_notify_enabled = os.getenv("PROFILE_ANALYZER_NOTIFY_ENABLED", "true").strip().lower() == "true"
+    profile_proxy_min_interval_sec = max(600, _safe_int_env("PROFILE_AGENT_PROXY_MIN_INTERVAL_SEC", 21600))
     if research_notify_timeout_sec < 30:
         research_notify_timeout_sec = 30
     if research_notify_poll_sec < 1:
@@ -1317,6 +1349,10 @@ def main() -> None:
         ]
     )
     orchestrator = DiscordOrchestrator(orchestrator_config)
+    twitter_scout_config = load_twitter_scout_config_from_env()
+    profile_analyzer_config = load_user_profile_analyzer_config_from_env()
+    twitter_scout_agent = TwitterScoutAgent(twitter_scout_config)
+    profile_analyzer_agent = UserProfileAnalyzerAgent(profile_analyzer_config, orchestrator.memory)
     orchestrator.configure_directional_memory_policy(
         enabled=directional_memory_enabled,
         personal_guild_id=personal_guild_id if personal_guild_id > 0 else None,
@@ -1330,6 +1366,10 @@ def main() -> None:
     client = discord.Client(intents=intents)
     tree = app_commands.CommandTree(client)
     research_notify_tasks: set[asyncio.Task[None]] = set()
+    twitter_notify_task: asyncio.Task[None] | None = None
+    profile_analyzer_task: asyncio.Task[None] | None = None
+    twitter_last_delivered_at = ""
+    last_proxy_request_monotonic = 0.0
 
     async def _resolve_channel(channel_id: int) -> discord.abc.Messageable | None:
         channel = client.get_channel(channel_id)
@@ -1570,6 +1610,97 @@ def main() -> None:
         task = asyncio.create_task(_runner(), name=f"research-notify-{job_id}")
         research_notify_tasks.add(task)
         task.add_done_callback(lambda t: research_notify_tasks.discard(t))
+
+    async def _run_twitter_notify_loop() -> None:
+        nonlocal twitter_last_delivered_at
+        while True:
+            try:
+                if not twitter_scout_config.enabled:
+                    await asyncio.sleep(twitter_notify_interval_sec)
+                    continue
+                if twitter_notify_channel_id <= 0:
+                    await asyncio.sleep(twitter_notify_interval_sec)
+                    continue
+
+                if twitter_notify_force_refresh:
+                    snapshot = await twitter_scout_agent.refresh_now()
+                else:
+                    snapshot = await twitter_scout_agent.get_snapshot()
+
+                updated_at = str(snapshot.get("updated_at", "") or "")
+                if not updated_at:
+                    await asyncio.sleep(twitter_notify_interval_sec)
+                    continue
+                if updated_at == twitter_last_delivered_at:
+                    await asyncio.sleep(twitter_notify_interval_sec)
+                    continue
+
+                channel = await _resolve_channel(twitter_notify_channel_id)
+                if channel is not None:
+                    body = _format_twitter_scout_notification(snapshot)
+                    for chunk in chunk_text(body, max_message_len):
+                        await channel.send(chunk)
+                    twitter_last_delivered_at = updated_at
+            except Exception:
+                logger.exception("Twitter scout notify loop failed")
+
+            await asyncio.sleep(twitter_notify_interval_sec)
+
+    async def _run_profile_analyzer_loop() -> None:
+        nonlocal last_proxy_request_monotonic
+        while True:
+            try:
+                if not profile_analyzer_config.enabled:
+                    await asyncio.sleep(profile_analyzer_config.analyze_interval_sec)
+                    continue
+
+                summary = await profile_analyzer_agent.analyze_once()
+                status = str(summary.get("status", "") or "")
+
+                if profile_notify_enabled and profile_notify_channel_id > 0:
+                    channel = await _resolve_channel(profile_notify_channel_id)
+                    if channel is not None:
+                        body = _format_profile_summary_notification(summary)
+                        for chunk in chunk_text(body, max_message_len):
+                            await channel.send(chunk)
+
+                if (
+                    status == "ok"
+                    and profile_analyzer_config.proxy_request_enabled
+                    and isinstance(summary.get("proxy_request_candidates"), list)
+                ):
+                    now_mono = time.monotonic()
+                    if now_mono - last_proxy_request_monotonic >= float(profile_proxy_min_interval_sec):
+                        candidates = [
+                            str(x).strip()
+                            for x in summary.get("proxy_request_candidates", [])
+                            if str(x).strip()
+                        ]
+                        if candidates:
+                            topic = candidates[0]
+                            result = await orchestrator.execute_tool_job(
+                                tool_name="dispatch_research_job",
+                                args={
+                                    "topic": topic,
+                                    "source": "x",
+                                    "wait": "false",
+                                    "mode": "auto",
+                                },
+                                task_label="profile-agent:proxy-dispatch",
+                            )
+                            last_proxy_request_monotonic = now_mono
+                            if profile_notify_channel_id > 0:
+                                channel = await _resolve_channel(profile_notify_channel_id)
+                                if channel is not None:
+                                    await channel.send(
+                                        "[Profile Analyzer] 代理リクエストを投入しました。\n"
+                                        f"topic: {topic}\n"
+                                        f"result: {str(result)[:800]}"
+                                    )
+            except Exception:
+                logger.exception("Profile analyzer loop failed")
+
+            await asyncio.sleep(profile_analyzer_config.analyze_interval_sec)
 
     class CliApprovalView(View):
         def __init__(
@@ -2139,109 +2270,6 @@ def main() -> None:
             await interaction.followup.send("deep diveの実行に失敗しました。")
 
 
-    @tree.command(name="vc_leave", description="このBotをVCから退出させます")
-    async def vc_leave(interaction: discord.Interaction) -> None:
-        if interaction.guild_id is None or interaction.guild_id not in allowed_guild_ids:
-            await interaction.response.send_message(
-                "このサーバーではこのBotを利用できません。",
-                ephemeral=True,
-            )
-            return
-        if interaction.guild is None:
-            await interaction.response.send_message("Guild内で実行してください。", ephemeral=True)
-            return
-
-        existing = discord.utils.get(client.voice_clients, guild=interaction.guild)
-        if existing is None:
-            await interaction.response.send_message("VCに参加していません。", ephemeral=True)
-            return
-
-        guild_id = int(interaction.guild.id)
-        async with _voice_lock(guild_id):
-            try:
-                if hasattr(existing, "stop_listening"):
-                    try:
-                        existing.stop_listening()
-                    except Exception:
-                        pass
-                active_voice_sinks.pop(guild_id, None)
-                await existing.disconnect(force=True)
-                await interaction.response.send_message("VCから退出しました。", ephemeral=True)
-            except Exception:
-                logger.exception("Failed to handle /vc_leave")
-                try:
-                    await interaction.response.send_message("VC退出に失敗しました。", ephemeral=True)
-                except discord.NotFound:
-                    logger.warning("vc_leave response failed: interaction expired")
-
-    @tree.command(name="vc_status", description="このBotのVC参加状態を表示します")
-    async def vc_status(interaction: discord.Interaction) -> None:
-        if interaction.guild_id is None or interaction.guild_id not in allowed_guild_ids:
-            await interaction.response.send_message(
-                "このサーバーではこのBotを利用できません。",
-                ephemeral=True,
-            )
-            return
-        if interaction.guild is None:
-            await interaction.response.send_message("Guild内で実行してください。", ephemeral=True)
-            return
-
-        existing = discord.utils.get(client.voice_clients, guild=interaction.guild)
-        if existing is None or existing.channel is None:
-            await interaction.response.send_message("VC未参加です。", ephemeral=True)
-            return
-
-        recv_state = "on" if int(interaction.guild.id) in active_voice_sinks else "off"
-
-        await interaction.response.send_message(
-            f"参加中: `{existing.channel.name}` (guild={interaction.guild.id}, voice_recv={recv_state})",
-            ephemeral=True,
-        )
-
-    @tree.command(name="vc_transcript_mock", description="検証用: 音声文字起こしテキストを voice-stt-agent へ送信")
-    @app_commands.describe(text="文字起こし結果として扱うテキスト")
-    async def vc_transcript_mock(interaction: discord.Interaction, text: str) -> None:
-        if interaction.guild_id is None or interaction.guild_id not in allowed_guild_ids:
-            await interaction.response.send_message(
-                "このサーバーではこのBotを利用できません。",
-                ephemeral=True,
-            )
-            return
-        if interaction.guild is None or interaction.channel is None or interaction.user is None:
-            await interaction.response.send_message("Guild内で実行してください。", ephemeral=True)
-            return
-
-        clean_text = (text or "").strip()
-        if not clean_text:
-            await interaction.response.send_message("text が空です。", ephemeral=True)
-            return
-
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        now_iso = datetime.now(timezone.utc).isoformat()
-        payload = {
-            "guild_id": int(interaction.guild.id),
-            "channel_id": int(interaction.channel.id),
-            "user_id": int(interaction.user.id),
-            "text": clean_text,
-            "started_at": now_iso,
-            "ended_at": now_iso,
-            "source": "main_agent_slash_mock",
-            "created_at": now_iso,
-        }
-
-        result, err, status_code = await asyncio.to_thread(_forward_music_intent_transcript, payload)
-        if err is not None:
-            await interaction.followup.send(
-                f"転送失敗: status={status_code} detail={err[:300]}",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.followup.send(
-            f"転送成功: status={status_code} action={result.get('action', 'unknown')} intent={result.get('intent', 'unknown')} detail={result.get('detail', 'none')}",
-            ephemeral=True,
-        )
-
     @tree.command(name="logsearch", description="Discord過去ログをキーワード検索します")
     @app_commands.describe(keyword="検索キーワード", scope="検索範囲", limit="表示件数(1-12)")
     @app_commands.choices(
@@ -2628,11 +2656,8 @@ def main() -> None:
 
     @client.event
     async def on_ready() -> None:
+        nonlocal twitter_notify_task, profile_analyzer_task
         logger.info("Logged in as %s (%s)", client.user, client.user.id if client.user else "unknown")
-        voice_chunk_forwarder.start()
-        if voice_recv_enabled and voice_recv is None:
-            logger.warning("VOICE_RECV_ENABLED=true but discord-ext-voice-recv is unavailable; VC audio capture is disabled")
-
         removed_global_defs: list[str] = []
         for command in list(tree.get_commands(guild=None)):
             if command.name in command_allowlist:
@@ -2709,6 +2734,25 @@ def main() -> None:
                     logger.info("Resumed research notify tasks from checkpoints: %s", resumed)
             except Exception:
                 logger.exception("Failed to resume research notify tasks")
+
+        if twitter_scout_config.enabled:
+            try:
+                await twitter_scout_agent.start()
+                logger.info("Twitter scout agent started")
+            except Exception:
+                logger.exception("Failed to start twitter scout agent")
+
+        if twitter_notify_task is None or twitter_notify_task.done():
+            twitter_notify_task = asyncio.create_task(
+                _run_twitter_notify_loop(),
+                name="twitter-scout-notify-loop",
+            )
+
+        if profile_analyzer_task is None or profile_analyzer_task.done():
+            profile_analyzer_task = asyncio.create_task(
+                _run_profile_analyzer_loop(),
+                name="profile-analyzer-loop",
+            )
 
         if bootstrap_on_ready:
             if not enable_message_content_intent:

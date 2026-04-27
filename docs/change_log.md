@@ -2,6 +2,15 @@
 
 このファイルを本プロジェクトの正式な変更履歴として運用します。
 
+## 2026-04-25
+
+### 音声関連機能の削除と仕様同期
+
+- `main-agent` から VC 系コマンド（`/vc_leave`, `/vc_status`, `/vc_transcript_mock`）を削除した
+- 音声文字起こし転送のための `voice-stt-agent` 連携コードと起動時の音声初期化を削除した
+- README の音声拡張章を削除し、Research Agent の mode 説明を現行実装準拠へ整理した
+- `docs/API.md` と `docs/DESIGN.md` の Research Agent モード説明を、実装どおりの認証可否フォールバック仕様へ更新した
+
 ## 2026-04-23
 
 ### 機能廃止（音声対話・音楽連携）
