@@ -8,36 +8,36 @@
 │  ├─ User Messages (@mention, /command)                          │
 │  └─ Rich Embed Responses                                         │
 └────────────────────────┬────────────────────────────────────────┘
-                         │
-                    HTTP API
-                         │
-        ┌────────────────┴────────────────┐
-        │                                 │
+       │
+        HTTP API
+       │
+  ┌────────────────┴────────────────┐
+  │                                 │
 ┌──────▼──────────────────┐    ┌────────▼────────────────┐
 │ Main Agent               │    │ Research Agent          │
-│ (FastAPI + discord.py)   │    │ (FastAPI + subprocess)  │
+│ (discord.py client)      │    │ (ThreadingHTTPServer +  │
+│                          │    │  subprocess)            │
 │                          │    │                        │
-│ ├─ /research endpoint    │    │ ├─ /v1/jobs POST       │
-│ ├─ Tool selection logic  │    │ ├─ /v1/jobs GET        │
-│ ├─ chroma DB (memory)    │    │ ├─ /healthz            │
-│ ├─ Discord Gateway       │    │ └─ Multi-turn handling  │
-│ └─ Command handlers      │    │                        │
-│    /deepdive             │    │ Subprocess (Gemini CLI)│
-│    /web_search           │    │ + Gemini API           │
-│    /ask_research         │    │ (Orchestrator)         │
+│ ├─ Tool selection logic  │    │ ├─ /v1/jobs POST       │
+│ ├─ chroma DB (memory)    │    │ ├─ /v1/jobs GET        │
+│ ├─ Discord Gateway       │    │ ├─ /healthz            │
+│ └─ Command handlers      │    │ └─ Multi-turn handling  │
+│    /deepdive             │    │                        │
+│    /web_search           │    │ Subprocess (Gemini CLI)│
+│    /ask_research         │    │ + Gemini API           │
 └──────────────────────────┘    └────────────────────────┘
-        │                                │
-        └────────────────┬───────────────┘
-                         │
-            ┌────────────┴─────────────┐
-            │                          │
-        ┌───▼────┐            ┌───────▼──┐
-        │ Gemini │            │ Web APIs │
-        │  API   │            │          │
-        │        │            ├─ Reddit  │
-        │ ├─ CLI │            ├─ GitHub  │
-        │ └─ REST│            ├─ YouTube │
-        └────────┘            └──────────┘
+  │                                │
+  └────────────────┬───────────────┘
+       │
+      ┌────────────┴─────────────┐
+      │                          │
+  ┌───▼────┐            ┌───────▼──┐
+  │ Gemini │            │ Web APIs │
+  │  API   │            │          │
+  │        │            ├─ Reddit  │
+  │ ├─ CLI │            ├─ GitHub  │
+  │ └─ REST│            ├─ YouTube │
+  └────────┘            └──────────┘
 ```
 
 ## コンポーネント詳細
@@ -52,8 +52,10 @@
 - 結果を Discord に返却
 
 **主要ファイル:**
-- `main_agent_server.py` - FastAPI サーバー + discord.py client
+- `main.py` - Discord クライアント起点（`src/main_agent/main.py`）、`discord.py` を用いたコマンド/ハンドラ実装
 - `discord_handlers.py` - メッセージハンドラ / コマンドハンドラ
+
+> 注: ドキュメント上で FastAPI の利用例が記載されている箇所がありますが、現行実装では Research Agent は組み込みの `ThreadingHTTPServer`（`src/research_agent/research_agent_server.py`）で HTTP API を提供し、Main Agent のエントリポイントは `src/main_agent/main.py` の `discord.py` クライアント実装になります。
 - `memory/` - ChromaDB インテグレーション
 
 **フロー:**

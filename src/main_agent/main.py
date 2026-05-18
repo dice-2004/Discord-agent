@@ -1294,9 +1294,11 @@ def main() -> None:
     research_notify_on_complete = os.getenv("RESEARCH_NOTIFY_ON_COMPLETE", "true").strip().lower() == "true"
     research_notify_timeout_sec = int(os.getenv("RESEARCH_NOTIFY_TIMEOUT_SEC", "600"))
     research_notify_poll_sec = int(os.getenv("RESEARCH_NOTIFY_POLL_SEC", "3"))
+    twitter_scout_worker_enabled = os.getenv("TWITTER_SCOUT_WORKER_ENABLED", "true").strip().lower() == "true"
     twitter_notify_channel_id = _safe_int_env("TWITTER_SCOUT_NOTIFY_CHANNEL_ID", 0)
     twitter_notify_interval_sec = max(60, _safe_int_env("TWITTER_SCOUT_NOTIFY_INTERVAL_SEC", 1800))
     twitter_notify_force_refresh = os.getenv("TWITTER_SCOUT_NOTIFY_FORCE_REFRESH", "false").strip().lower() == "true"
+    profile_analyzer_worker_enabled = os.getenv("PROFILE_ANALYZER_WORKER_ENABLED", "true").strip().lower() == "true"
     profile_notify_channel_id = _safe_int_env("PROFILE_ANALYZER_NOTIFY_CHANNEL_ID", 0)
     profile_notify_enabled = os.getenv("PROFILE_ANALYZER_NOTIFY_ENABLED", "true").strip().lower() == "true"
     profile_proxy_min_interval_sec = max(600, _safe_int_env("PROFILE_AGENT_PROXY_MIN_INTERVAL_SEC", 21600))
@@ -1622,25 +1624,44 @@ def main() -> None:
                     await asyncio.sleep(twitter_notify_interval_sec)
                     continue
 
-                if twitter_notify_force_refresh:
+                if twitter_notify_force_refresh and twitter_scout_worker_enabled:
                     snapshot = await twitter_scout_agent.refresh_now()
                 else:
                     snapshot = await twitter_scout_agent.get_snapshot()
 
                 updated_at = str(snapshot.get("updated_at", "") or "")
                 if not updated_at:
+                    logger.info("Twitter scout notify skipped: snapshot has no updated_at")
                     await asyncio.sleep(twitter_notify_interval_sec)
                     continue
                 if updated_at == twitter_last_delivered_at:
+                    logger.info("Twitter scout notify skipped: already delivered updated_at=%s", updated_at)
                     await asyncio.sleep(twitter_notify_interval_sec)
                     continue
 
                 channel = await _resolve_channel(twitter_notify_channel_id)
                 if channel is not None:
                     body = _format_twitter_scout_notification(snapshot)
+                    logger.info(
+                        "Twitter scout notify send start: channel_id=%s updated_at=%s chars=%s chunks=%s",
+                        twitter_notify_channel_id,
+                        updated_at,
+                        len(body),
+                        len(chunk_text(body, max_message_len)),
+                    )
                     for chunk in chunk_text(body, max_message_len):
                         await channel.send(chunk)
                     twitter_last_delivered_at = updated_at
+                    logger.info(
+                        "Twitter scout notify send completed: channel_id=%s updated_at=%s",
+                        twitter_notify_channel_id,
+                        updated_at,
+                    )
+                else:
+                    logger.warning(
+                        "Twitter scout notify skipped: channel not resolved channel_id=%s",
+                        twitter_notify_channel_id,
+                    )
             except Exception:
                 logger.exception("Twitter scout notify loop failed")
 
@@ -2735,12 +2756,14 @@ def main() -> None:
             except Exception:
                 logger.exception("Failed to resume research notify tasks")
 
-        if twitter_scout_config.enabled:
+        if twitter_scout_config.enabled and twitter_scout_worker_enabled:
             try:
                 await twitter_scout_agent.start()
                 logger.info("Twitter scout agent started")
             except Exception:
                 logger.exception("Failed to start twitter scout agent")
+        elif twitter_scout_config.enabled:
+            logger.info("Twitter scout worker disabled in main-agent; using snapshot-only notify mode")
 
         if twitter_notify_task is None or twitter_notify_task.done():
             twitter_notify_task = asyncio.create_task(
@@ -2748,11 +2771,14 @@ def main() -> None:
                 name="twitter-scout-notify-loop",
             )
 
-        if profile_analyzer_task is None or profile_analyzer_task.done():
-            profile_analyzer_task = asyncio.create_task(
-                _run_profile_analyzer_loop(),
-                name="profile-analyzer-loop",
-            )
+        if profile_analyzer_config.enabled and profile_analyzer_worker_enabled:
+            if profile_analyzer_task is None or profile_analyzer_task.done():
+                profile_analyzer_task = asyncio.create_task(
+                    _run_profile_analyzer_loop(),
+                    name="profile-analyzer-loop",
+                )
+        elif profile_analyzer_config.enabled:
+            logger.info("Profile analyzer worker disabled in main-agent; skipping profile task")
 
         if bootstrap_on_ready:
             if not enable_message_content_intent:

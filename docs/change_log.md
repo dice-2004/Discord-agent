@@ -2,6 +2,15 @@
 
 このファイルを本プロジェクトの正式な変更履歴として運用します。
 
+## 2026-05-18
+
+### ドキュメント同期: 仕様書を実装に合わせて更新
+
+- `docs/ARCHITECTURE.md` を実装に合わせて修正しました（Main Agent の起点を `src/main_agent/main.py` に、Research Agent が `ThreadingHTTPServer` を用いることを明示）。
+- `docs/DESIGN.md` に実装状況の注記を追加しました（2026-05-18）。
+- `.env` と `docs/DESIGN.md` のメモリ境界設定を、3サーバー前提の権限関係に合わせて整理しました（`MEMORY_RETRIEVAL_SCOPE=guild`、`DIRECTIONAL_MEMORY_ENABLED=true`）。
+- 本修正はドキュメント整合性のための更新であり、コードの機能差し替えは行っていません。将来的にフレームワークを切り替える場合は、再度仕様書および change_log を更新してください。
+
 ## 2026-04-25
 
 ### 音声関連機能の削除と仕様同期

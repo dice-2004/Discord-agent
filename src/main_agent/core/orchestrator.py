@@ -1188,7 +1188,7 @@ class DiscordOrchestrator:
         if not body:
             return ""
         
-        # 典型的なマーカーの後ろにある文章を抽出する
+        # 1. 典型的なマーカーの後ろにある文章を抽出する
         markers = [
             "Response Draft:",
             "Draft 2:",
@@ -1201,9 +1201,28 @@ class DiscordOrchestrator:
             idx = body.rfind(marker)
             if idx != -1:
                 extracted = body[idx + len(marker):].strip()
-                # 抽出した部分が短すぎなければ採用
                 if len(extracted) > 5:
                     return extracted
+        
+        # 2. マーカーがない場合、先頭から連続する思考行（* で始まる行）をスキップした残りを抽出する
+        lines = body.splitlines()
+        final_lines = []
+        in_thought_block = True
+        
+        for line in lines:
+            if in_thought_block:
+                # 箇条書き（* または -）で始まる行、または空行は思考ブロックの一部とみなしてスキップ
+                if re.match(r"^\s*[\*\-]\s+", line) or not line.strip():
+                    continue
+                else:
+                    in_thought_block = False
+            
+            if not in_thought_block:
+                final_lines.append(line)
+        
+        extracted = "\n".join(final_lines).strip()
+        if len(extracted) > 5:
+            return extracted
         
         return ""
 

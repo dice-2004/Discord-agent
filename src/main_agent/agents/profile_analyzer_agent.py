@@ -33,6 +33,7 @@ class UserProfileAnalyzerConfig:
     analyze_interval_sec: int = 1800
     sample_limit: int = 200
     summary_path: str = "./data/runtime/user_profile_summary.json"
+    profile_output_path: str = "./data/profiles/generated_profile.md"
     gemini_api_key: str = ""
     gemini_model: str = "gemma-4-31b-it"
     proxy_request_enabled: bool = False
@@ -62,6 +63,11 @@ def load_user_profile_analyzer_config_from_env() -> UserProfileAnalyzerConfig:
         sample_limit=max(20, min(400, _safe_int_env("PROFILE_ANALYZER_SAMPLE_LIMIT", 200))),
         summary_path=os.getenv("PROFILE_ANALYZER_SUMMARY_PATH", "./data/runtime/user_profile_summary.json").strip()
         or "./data/runtime/user_profile_summary.json",
+        profile_output_path=os.getenv(
+            "PROFILE_ANALYZER_PROFILE_OUTPUT_PATH",
+            "./data/profiles/generated_profile.md",
+        ).strip()
+        or "./data/profiles/generated_profile.md",
         gemini_api_key=fallback_key,
         gemini_model=os.getenv("PROFILE_ANALYZER_GEMINI_MODEL", "gemma-4-31b-it").strip() or "gemma-4-31b-it",
         proxy_request_enabled=os.getenv("PROFILE_AGENT_PROXY_REQUEST_ENABLED", "false").strip().lower() == "true",
@@ -113,6 +119,7 @@ class UserProfileAnalyzerAgent:
         merged = self._merge_summary(heuristics, llm_summary)
 
         await self._persist_profile_facts(merged)
+        await self._save_profile_markdown(merged)
         await self._save_summary(merged)
         return merged
 
@@ -274,6 +281,74 @@ class UserProfileAnalyzerAgent:
             else []
         )
         return merged
+
+    def _build_profile_markdown(self, summary: dict[str, Any]) -> str:
+        lines = [
+            "# Generated Profile",
+            "",
+            "## Snapshot",
+            f"- updated_at: {summary.get('updated_at', '')}",
+            f"- sample_message_count: {summary.get('sample_message_count', 0)}",
+            "",
+            "## Request Style",
+            str(summary.get("request_style", "") or "(unknown)"),
+            "",
+            "## Time Habit",
+            str(summary.get("time_habit", "") or "(unknown)"),
+            "",
+            "## High Value Topics",
+        ]
+
+        high_value_topics = summary.get("high_value_topics", []) or summary.get("top_tokens", [])
+        if isinstance(high_value_topics, list) and high_value_topics:
+            for topic in high_value_topics[:12]:
+                lines.append(f"- {topic}")
+        else:
+            lines.append("- (unknown)")
+
+        lines.extend([
+            "",
+            "## Personalization Guidelines",
+        ])
+        guidelines = summary.get("personalization_guidelines", [])
+        if isinstance(guidelines, list) and guidelines:
+            for item in guidelines[:8]:
+                lines.append(f"- {item}")
+        else:
+            lines.append("- (unknown)")
+
+        lines.extend([
+            "",
+            "## Proxy Request Candidates",
+        ])
+        proxies = summary.get("proxy_request_candidates", [])
+        if isinstance(proxies, list) and proxies:
+            for item in proxies[:5]:
+                lines.append(f"- {item}")
+        else:
+            lines.append("- (none)")
+
+        lines.extend([
+            "",
+            "## Top Categories",
+        ])
+        categories = summary.get("top_categories", [])
+        if isinstance(categories, list) and categories:
+            for item in categories[:8]:
+                lines.append(f"- {item}")
+        else:
+            lines.append("- (unknown)")
+
+        return "\n".join(lines).strip() + "\n"
+
+    async def _save_profile_markdown(self, payload: dict[str, Any]) -> None:
+        profile_path = Path(self.config.profile_output_path)
+        markdown = self._build_profile_markdown(payload)
+        try:
+            profile_path.parent.mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(profile_path.write_text, markdown, "utf-8")
+        except Exception:
+            logger.exception("Failed to persist generated profile markdown: %s", profile_path)
 
     async def _persist_profile_facts(self, summary: dict[str, Any]) -> None:
         uid = self.config.target_user_id

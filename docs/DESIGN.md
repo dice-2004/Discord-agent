@@ -14,6 +14,16 @@
 
 ---
 
+## 実装状況の注記（2026-05-18）
+
+現在のリポジトリ実装に合わせ、本仕様書の表現を一部調整しました。主要な実装状況は以下の通りです。
+
+- `Main Agent` のエントリポイントは `src/main_agent/main.py` で、`discord.py` クライアントを直接起動する実装になっています（ドキュメント内に FastAPI の記載が残っている箇所は実装説明を優先して読み替えてください）。
+- `Research Agent` は軽量な HTTP サーバ実装（`src/research_agent/research_agent_server.py`）として `ThreadingHTTPServer` を用いており、`POST /v1/jobs` / `GET /v1/jobs/{job_id}` を提供します。現行実装では組み込み HTTP サーバを採用しているため、FastAPI 等の Web フレームワークを必須とはしていません。
+- ドキュメント内の「FastAPI を使う」といった表現は設計上の選択肢・参照例として残す場合がありますが、実際のコード構成と齟齬がないよう本書を第一に変更しています。
+
+上記は実装に合わせた注記であり、将来的にフレームワークを切り替える（例: FastAPI 化）場合は、本仕様書の該当箇所を再度更新してください。
+
 ## 0. 最重要実装方針（最初に必ず守ること）
 
 以下は本仕様書全体に優先する**最上位ルール**です。
@@ -795,11 +805,14 @@ MEMORY_BOOTSTRAP_BATCH_SIZE=200
 MEMORY_BOOTSTRAP_FORCE_REINDEX=false
 MEMORY_BOOTSTRAP_INCLUDE_ARCHIVED_THREADS=true
 MEMORY_BOOTSTRAP_ARCHIVED_LIMIT_PER_PARENT=0
-MEMORY_RETRIEVAL_SCOPE=channel
+# channel: 同一チャンネル内の会話のみ検索 (ノイズ低減)
+# guild: ギルド全体から検索 (個人サーバーは全チャンネル参照、他サーバーは自分のサーバー内だけ参照)
+MEMORY_RETRIEVAL_SCOPE=guild
 MEMORY_TOP_K=4
 MEMORY_RESPONSE_INCLUDE_EVIDENCE=false
 MEMORY_RESPONSE_EVIDENCE_ITEMS=3
-DIRECTIONAL_MEMORY_ENABLED=false
+# PERSONAL_GUILD_ID は自分専用サーバー、FAMILY_GUILD_IDS は身内サーバー + 研究室サーバーのIDを設定する
+DIRECTIONAL_MEMORY_ENABLED=true
 PERSONAL_GUILD_ID=
 FAMILY_GUILD_IDS=
 INITIAL_PROFILE_PATH=./data/profiles/initial_profile.md

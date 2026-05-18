@@ -74,7 +74,10 @@ def load_twitter_scout_config_from_env() -> TwitterScoutConfig:
         max_requests_per_day=max(1, _safe_int_env("TWITTER_SCOUT_MAX_REQUESTS_PER_DAY", 1500)),
         snapshot_path=os.getenv("TWITTER_SCOUT_SNAPSHOT_PATH", "./data/runtime/twitter_scout_snapshot.json").strip()
         or "./data/runtime/twitter_scout_snapshot.json",
-        profile_path=os.getenv("INITIAL_PROFILE_PATH", "./data/profiles/initial_profile.md").strip()
+        profile_path=os.getenv(
+            "TWITTER_SCOUT_PROFILE_PATH",
+            os.getenv("INITIAL_PROFILE_PATH", "./data/profiles/initial_profile.md"),
+        ).strip()
         or "./data/profiles/initial_profile.md",
     )
 
@@ -151,7 +154,13 @@ class TwitterScoutAgent:
 
     async def _crawl_once(self) -> None:
         selected_topics = self._select_topics_for_cycle()
+        logger.info(
+            "TwitterScout crawl start: topics=%s budget=%s",
+            ", ".join(selected_topics) if selected_topics else "(none)",
+            self._budget_payload(),
+        )
         if not selected_topics:
+            logger.info("TwitterScout crawl skipped: no topics available")
             await self._update_snapshot(
                 {
                     "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -173,6 +182,11 @@ class TwitterScoutAgent:
                     "result": str(raw or ""),
                 }
             )
+            logger.info(
+                "TwitterScout crawl topic fetched: topic=%s chars=%s",
+                topic,
+                len(str(raw or "")),
+            )
 
         summarized = await asyncio.to_thread(self._summarize_results, selected_topics, raw_blocks)
         updated_at = datetime.now(timezone.utc).isoformat()
@@ -188,6 +202,13 @@ class TwitterScoutAgent:
             "budget": self._budget_payload(),
         }
         await self._update_snapshot(payload)
+        logger.info(
+            "TwitterScout crawl completed: status=%s topics=%s recommendations=%s summary_chars=%s",
+            payload.get("status", ""),
+            len(selected_topics),
+            len(payload.get("recommendations", []) or []),
+            len(str(payload.get("summary", "") or "")),
+        )
 
     async def _update_snapshot(self, payload: dict[str, Any]) -> None:
         async with self._lock:
