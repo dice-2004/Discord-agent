@@ -315,10 +315,10 @@ N100導入時は、Main Agentの即応性を守るために以下の分離を標
 2. **会話履歴の蓄積 (ChromaDB)**
 
    * **概要:** Discordの会話は 1 メッセージ単位で ChromaDB にベクトル保存し、必要に応じてRAGで引き出します。
-   * **埋め込み方式:** 現行実装では `sentence-transformers` の `BAAI/bge-m3` を標準のローカル埋め込み backend とし、未導入時は簡易ハッシュ埋め込みへフォールバックします。
+   * **埋め込み方式:** 標準実装は外部 `Ollama` API 経由で `bge-m3` を利用（`MEMORY_EMBEDDING_PROVIDER=ollama_remote`）。未構成時はローカル `sentence-transformers` へフォールバック可能（`local_bge_m3`）。最後の手段として簡易ハッシュ埋め込み（`hash`）に降格します。
    * **【権限分離】:** Discordの「チャンネルID」または「サーバーID」をコレクション名のキーとし、身内用サーバーから自分専用の記憶に絶対にアクセスできないよう厳格に分離してください。
    * **【方向付き境界（任意）】:** `DIRECTIONAL_MEMORY_ENABLED=true` 時は `PERSONAL_GUILD_ID` と `FAMILY_GUILD_IDS` を参照し、「個人サーバー -> 身内サーバー参照のみ許可、逆方向と身内間参照は禁止」を適用する。
-   * **【設定】:** 埋め込み backend は `MEMORY_EMBEDDING_PROVIDER` / `MEMORY_EMBEDDING_MODEL_NAME` / `MEMORY_EMBEDDING_DEVICE` / `MEMORY_EMBEDDING_BATCH_SIZE` で切り替える。
+   * **【設定】:** 埋め込み backend は `MEMORY_EMBEDDING_PROVIDER` / `MEMORY_EMBEDDING_MODEL_NAME` / `MEMORY_EMBEDDING_DEVICE` / `MEMORY_EMBEDDING_BATCH_SIZE` / `MEMORY_EMBEDDING_OLLAMA_URL` / `MEMORY_EMBEDDING_OLLAMA_TIMEOUT_SEC` で切り替える。
 3. **カスタムドキュメントのRAG (大学資料など / 将来拡張)**
 
    * **概要:** Discordの会話だけでなく、特定のディレクトリに配置されたPDFやテキストファイル（大学のシラバス、研究室のマニュアル等）を読み込み、専用コレクションとしてChromaDBにベクトル保存する拡張枠を想定する。

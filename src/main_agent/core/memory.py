@@ -9,6 +9,8 @@ import os
 import re
 import sqlite3
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -124,6 +126,65 @@ class _SentenceTransformerEmbeddingBackend(_EmbeddingBackend):
             self.collection_namespace = ""
             self.name = "hash"
             return self._fallback_backend.embed_texts(texts)
+
+
+class _RemoteOllamaEmbeddingBackend(_EmbeddingBackend):
+    def __init__(
+        self,
+        base_url: str,
+        model_name: str,
+        timeout_sec: int,
+        fallback_backend: _HashEmbeddingBackend,
+    ) -> None:
+        self.name = "ollama_bge_m3"
+        self.collection_namespace = "ollama_bge_m3"
+        self.dimension = 1024
+        self._base_url = (base_url or "http://127.0.0.1:11434").strip().rstrip("/")
+        self._model_name = (model_name or "bge-m3").strip() or "bge-m3"
+        self._timeout_sec = max(3, int(timeout_sec))
+        self._fallback_backend = fallback_backend
+
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        try:
+            result = self._embed_batch(texts)
+            if result:
+                return result
+        except Exception:
+            logger.exception("Remote Ollama batch embedding failed; falling back to per-text endpoint")
+
+        try:
+            return [self._embed_single(text) for text in texts]
+        except Exception:
+            logger.exception("Falling back to hash embeddings because remote Ollama embedding failed")
+            self.collection_namespace = ""
+            self.name = "hash"
+            return self._fallback_backend.embed_texts(texts)
+
+    def _embed_batch(self, texts: list[str]) -> list[list[float]]:
+        url = f"{self._base_url}/api/embed"
+        payload = json.dumps({"model": self._model_name, "input": texts}).encode("utf-8")
+        req = urllib.request.Request(url=url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=self._timeout_sec) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+        data = json.loads(body)
+        embeddings = data.get("embeddings")
+        if not isinstance(embeddings, list) or not embeddings:
+            raise RuntimeError("Invalid /api/embed response from Ollama")
+        return [[float(v) for v in row] for row in embeddings]
+
+    def _embed_single(self, text: str) -> list[float]:
+        url = f"{self._base_url}/api/embeddings"
+        payload = json.dumps({"model": self._model_name, "prompt": text or ""}).encode("utf-8")
+        req = urllib.request.Request(url=url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=self._timeout_sec) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+        data = json.loads(body)
+        embedding = data.get("embedding")
+        if not isinstance(embedding, list) or not embedding:
+            raise RuntimeError("Invalid /api/embeddings response from Ollama")
+        return [float(v) for v in embedding]
 
 
 class TaskCheckpointStore:
@@ -314,8 +375,17 @@ class ChannelMemoryStore:
         model_name = os.getenv("MEMORY_EMBEDDING_MODEL_NAME", "BAAI/bge-m3").strip() or "BAAI/bge-m3"
         device = os.getenv("MEMORY_EMBEDDING_DEVICE", "cpu").strip() or "cpu"
         batch_size = max(1, int(os.getenv("MEMORY_EMBEDDING_BATCH_SIZE", "16")))
+        ollama_base_url = os.getenv("MEMORY_EMBEDDING_OLLAMA_URL", "http://127.0.0.1:11434").strip() or "http://127.0.0.1:11434"
+        ollama_timeout_sec = max(3, int(os.getenv("MEMORY_EMBEDDING_OLLAMA_TIMEOUT_SEC", "20")))
         if provider_name in {"hash", "legacy", "builtin"}:
             self._embedding_backend: _EmbeddingBackend = self._embedding_fallback
+        elif provider_name in {"ollama", "ollama_remote", "remote_ollama", "bge_m3_ollama"}:
+            self._embedding_backend = _RemoteOllamaEmbeddingBackend(
+                base_url=ollama_base_url,
+                model_name=model_name,
+                timeout_sec=ollama_timeout_sec,
+                fallback_backend=self._embedding_fallback,
+            )
         else:
             self._embedding_backend = _SentenceTransformerEmbeddingBackend(
                 model_name=model_name,

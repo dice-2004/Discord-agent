@@ -2,6 +2,16 @@
 
 このファイルを本プロジェクトの正式な変更履歴として運用します。
 
+## 2026-05-20
+
+### メモリ埋め込みを外部 Ollama bge-m3 へ統合
+
+- `src/main_agent/core/memory.py` に `_RemoteOllamaEmbeddingBackend` を追加し、外部 Ollama API（`/api/embed` または `/api/embeddings` エンドポイント）を利用できるようにしました。
+- `.env` の `MEMORY_EMBEDDING_PROVIDER` を `ollama_remote` に設定し、`MEMORY_EMBEDDING_OLLAMA_URL=http://10.10.10.51:11434` で外部 Ollama インスタンスを指定します。
+- 埋め込みプロバイダは 3 パターンに対応: `local_bge_m3`（ローカル sentence-transformers）、`ollama_remote`（外部 Ollama）、`hash`（旧来のハッシュ埋め込み）。
+- 既存の旧ベクトル保存データは互換性を失うため、初回起動時に別名前空間（`mem_ollama_bge_m3_...`）の新コレクションへ新規作成されます。旧名前空間（`mem_g...`）のデータは参照されず、必要に応じて手動削除またはアーカイブが可能です（`CHROMADB_PATH` 下の旧コレクションを `sqlite3` で削除）。
+- `requirements.txt` の `sentence-transformers` と `torch` は任意（ローカル方式使用時のみ必須）です。
+
 ## 2026-05-19
 
 ### メモリ埋め込みを bge-m3 に移行
