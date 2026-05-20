@@ -314,9 +314,11 @@ N100導入時は、Main Agentの即応性を守るために以下の分離を標
    * **概要:** ユーザーの性格や前提知識はVector DBに入れず、`gemini-skills` (`https://github.com/google-gemini/gemini-skills`) の思想に則り、Markdownファイル (`data/profiles/initial_profile.md`) からプロンプトとして直接静的に注入します。
 2. **会話履歴の蓄積 (ChromaDB)**
 
-   * **概要:** 日々のDiscord会話履歴のみをChromaDBにベクトル保存し、必要に応じてRAGで引き出します。
+   * **概要:** Discordの会話は 1 メッセージ単位で ChromaDB にベクトル保存し、必要に応じてRAGで引き出します。
+   * **埋め込み方式:** 現行実装では `sentence-transformers` の `BAAI/bge-m3` を標準のローカル埋め込み backend とし、未導入時は簡易ハッシュ埋め込みへフォールバックします。
    * **【権限分離】:** Discordの「チャンネルID」または「サーバーID」をコレクション名のキーとし、身内用サーバーから自分専用の記憶に絶対にアクセスできないよう厳格に分離してください。
    * **【方向付き境界（任意）】:** `DIRECTIONAL_MEMORY_ENABLED=true` 時は `PERSONAL_GUILD_ID` と `FAMILY_GUILD_IDS` を参照し、「個人サーバー -> 身内サーバー参照のみ許可、逆方向と身内間参照は禁止」を適用する。
+   * **【設定】:** 埋め込み backend は `MEMORY_EMBEDDING_PROVIDER` / `MEMORY_EMBEDDING_MODEL_NAME` / `MEMORY_EMBEDDING_DEVICE` / `MEMORY_EMBEDDING_BATCH_SIZE` で切り替える。
 3. **カスタムドキュメントのRAG (大学資料など / 将来拡張)**
 
    * **概要:** Discordの会話だけでなく、特定のディレクトリに配置されたPDFやテキストファイル（大学のシラバス、研究室のマニュアル等）を読み込み、専用コレクションとしてChromaDBにベクトル保存する拡張枠を想定する。
@@ -325,6 +327,7 @@ N100導入時は、Main Agentの即応性を守るために以下の分離を標
    * **概要:** 現行はメモリ参照権限を `DIRECTIONAL_MEMORY_ENABLED` / `PERSONAL_GUILD_ID` / `FAMILY_GUILD_IDS` で制御する。
    * **現行ポリシー:** 個人サーバーからは身内サーバー参照を許可、逆方向（身内→個人）と身内間の相互参照は禁止。
    * **将来拡張:** チャンネルごとの詳細ACLやHitL承認待ち状態の永続管理は、必要に応じてSQLiteテーブルを追加して拡張する。
+   * **後日修正が必要な項目:** 個人に関する action（カレンダー操作・タスク操作など）の実行元を「個人サーバーのみ」に厳格制限する権限設計は、現行実装では未完了のため、別途追加実装が必要。
 5. **ユーザー・ペルソナ長期記憶 (第二の自分化 / 継続拡張)**
 
    * **概要:** ユーザーの性格・価値観・好み・長期目標・運用ルールを、会話RAGとは別に長期記憶として保持し、回答の一貫性を高める。

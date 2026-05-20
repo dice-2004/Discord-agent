@@ -2,6 +2,17 @@
 
 このファイルを本プロジェクトの正式な変更履歴として運用します。
 
+## 2026-05-19
+
+### メモリ埋め込みを bge-m3 に移行
+
+- `src/main_agent/core/memory.py` の会話保存・検索を、ローカル埋め込み backend 経由に切り替えました。
+- 標準埋め込みは `sentence-transformers` の `BAAI/bge-m3` とし、未導入時は旧来のハッシュ埋め込みにフォールバックする実装へ変更しました。
+- 会話データのベクトル化単位は 1 メッセージとし、ChromaDB のコレクション名にも埋め込み backend の名前空間を含めるようにしました。
+- `requirements.txt` に `sentence-transformers` と `torch` を追加しました。
+- `docs/DESIGN.md` と `.env.example` に埋め込み設定項目を追記しました。
+- 本修正はモデルを介した実行検証は行わず、構文・静的整合性ベースで進めています。
+
 ## 2026-05-18
 
 ### ドキュメント同期: 仕様書を実装に合わせて更新
@@ -9,6 +20,8 @@
 - `docs/ARCHITECTURE.md` を実装に合わせて修正しました（Main Agent の起点を `src/main_agent/main.py` に、Research Agent が `ThreadingHTTPServer` を用いることを明示）。
 - `docs/DESIGN.md` に実装状況の注記を追加しました（2026-05-18）。
 - `.env` と `docs/DESIGN.md` のメモリ境界設定を、3サーバー前提の権限関係に合わせて整理しました（`MEMORY_RETRIEVAL_SCOPE=guild`、`DIRECTIONAL_MEMORY_ENABLED=true`）。
+- `.env.example` に `TWITTER_SCOUT_WORKER_ENABLED` / `PROFILE_ANALYZER_WORKER_ENABLED` / プロファイル出力パスなどの実運用向け設定を追記しました。
+- `docs/DESIGN.md` に、個人向け action の実行元制限を後日修正が必要な項目として明記しました。
 - 本修正はドキュメント整合性のための更新であり、コードの機能差し替えは行っていません。将来的にフレームワークを切り替える場合は、再度仕様書および change_log を更新してください。
 
 ## 2026-04-25

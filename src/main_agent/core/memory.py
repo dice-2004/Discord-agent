@@ -17,6 +17,14 @@ from uuid import uuid4
 
 import chromadb
 
+try:
+    from sentence_transformers import SentenceTransformer
+
+    _HAS_SENTENCE_TRANSFORMERS = True
+except ImportError:
+    SentenceTransformer = None  # type: ignore[assignment]
+    _HAS_SENTENCE_TRANSFORMERS = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -28,6 +36,94 @@ class MemoryRecord:
     user_id: str
     message_id: str | None = None
     metadata: dict[str, Any] | None = None
+
+
+class _EmbeddingBackend:
+    name: str
+    collection_namespace: str
+    dimension: int
+
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        raise NotImplementedError
+
+
+class _HashEmbeddingBackend(_EmbeddingBackend):
+    def __init__(self, dimension: int = 32) -> None:
+        self.name = "hash"
+        self.collection_namespace = ""
+        self.dimension = max(8, int(dimension))
+
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        return [self._embed_single(text) for text in texts]
+
+    def _embed_single(self, text: str) -> list[float]:
+        if not text:
+            return [0.0] * self.dimension
+
+        values: list[float] = []
+        seed = text.encode("utf-8")
+        while len(values) < self.dimension:
+            seed = hashlib.sha256(seed).digest()
+            for i in range(0, len(seed), 2):
+                pair = seed[i : i + 2]
+                if len(pair) < 2:
+                    continue
+                number = int.from_bytes(pair, "big")
+                values.append((number / 65535.0) * 2.0 - 1.0)
+                if len(values) >= self.dimension:
+                    break
+
+        norm = math.sqrt(sum(v * v for v in values))
+        if norm == 0.0:
+            return values
+        return [v / norm for v in values]
+
+
+class _SentenceTransformerEmbeddingBackend(_EmbeddingBackend):
+    def __init__(
+        self,
+        model_name: str,
+        device: str,
+        batch_size: int,
+        fallback_backend: _HashEmbeddingBackend,
+    ) -> None:
+        self.name = "bge_m3"
+        self.collection_namespace = "bge_m3"
+        self.dimension = 1024
+        self._model_name = model_name
+        self._device = device
+        self._batch_size = max(1, int(batch_size))
+        self._fallback_backend = fallback_backend
+        self._model: Any | None = None
+
+    def _load_model(self) -> Any:
+        if self._model is not None:
+            return self._model
+        if not _HAS_SENTENCE_TRANSFORMERS or SentenceTransformer is None:
+            raise RuntimeError("sentence-transformers is not installed")
+        self._model = SentenceTransformer(self._model_name, device=self._device)
+        return self._model
+
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        try:
+            model = self._load_model()
+            encoded = model.encode(
+                texts,
+                batch_size=self._batch_size,
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+            )
+            if hasattr(encoded, "tolist"):
+                data = encoded.tolist()
+            else:
+                data = encoded
+            return [[float(value) for value in row] for row in data]
+        except Exception:
+            logger.exception("Falling back to hash embeddings because bge-m3 could not be loaded")
+            self.collection_namespace = ""
+            self.name = "hash"
+            return self._fallback_backend.embed_texts(texts)
 
 
 class TaskCheckpointStore:
@@ -213,19 +309,32 @@ class ChannelMemoryStore:
     def __init__(self, persist_dir: str, top_k: int = 4, embedding_dim: int = 32) -> None:
         self._client = chromadb.PersistentClient(path=persist_dir)
         self._top_k = top_k
-        self._embedding_dim = embedding_dim
+        self._embedding_fallback = _HashEmbeddingBackend(dimension=embedding_dim)
+        provider_name = os.getenv("MEMORY_EMBEDDING_PROVIDER", "local_bge_m3").strip().lower() or "local_bge_m3"
+        model_name = os.getenv("MEMORY_EMBEDDING_MODEL_NAME", "BAAI/bge-m3").strip() or "BAAI/bge-m3"
+        device = os.getenv("MEMORY_EMBEDDING_DEVICE", "cpu").strip() or "cpu"
+        batch_size = max(1, int(os.getenv("MEMORY_EMBEDDING_BATCH_SIZE", "16")))
+        if provider_name in {"hash", "legacy", "builtin"}:
+            self._embedding_backend: _EmbeddingBackend = self._embedding_fallback
+        else:
+            self._embedding_backend = _SentenceTransformerEmbeddingBackend(
+                model_name=model_name,
+                device=device,
+                batch_size=batch_size,
+                fallback_backend=self._embedding_fallback,
+            )
         self._persona_collection_name = os.getenv("PERSONA_MEMORY_COLLECTION", "persona_profiles").strip() or "persona_profiles"
 
-    @staticmethod
-    def _normalize_collection_name(guild_id: int | None, channel_id: int) -> str:
+    def _normalize_collection_name(self, guild_id: int | None, channel_id: int) -> str:
         guild_part = str(guild_id) if guild_id is not None else "dm"
-        raw = f"mem_g{guild_part}_c{channel_id}"
+        namespace = self._embedding_backend.collection_namespace.strip()
+        raw = f"mem_{namespace}_g{guild_part}_c{channel_id}" if namespace else f"mem_g{guild_part}_c{channel_id}"
         return re.sub(r"[^a-zA-Z0-9_-]", "_", raw)
 
-    @staticmethod
-    def _normalize_guild_collection_name(guild_id: int | None) -> str:
+    def _normalize_guild_collection_name(self, guild_id: int | None) -> str:
         guild_part = str(guild_id) if guild_id is not None else "dm"
-        raw = f"mem_g{guild_part}_all"
+        namespace = self._embedding_backend.collection_namespace.strip()
+        raw = f"mem_{namespace}_g{guild_part}_all" if namespace else f"mem_g{guild_part}_all"
         return re.sub(r"[^a-zA-Z0-9_-]", "_", raw)
 
     @staticmethod
@@ -282,7 +391,7 @@ class ChannelMemoryStore:
             ids=[fact_id],
             documents=[doc],
             metadatas=[metadata],
-            embeddings=[self._embed(doc)],
+            embeddings=self._embed_texts([doc]),
         )
 
     async def get_user_profile_facts(self, user_id: int, limit: int = 50) -> list[dict[str, Any]]:
@@ -363,26 +472,13 @@ class ChannelMemoryStore:
         return deleted
 
     def _embed(self, text: str) -> list[float]:
-        if not text:
-            return [0.0] * self._embedding_dim
+        return self._embed_texts([text])[0]
 
-        values: list[float] = []
-        seed = text.encode("utf-8")
-        while len(values) < self._embedding_dim:
-            seed = hashlib.sha256(seed).digest()
-            for i in range(0, len(seed), 2):
-                pair = seed[i : i + 2]
-                if len(pair) < 2:
-                    continue
-                number = int.from_bytes(pair, "big")
-                values.append((number / 65535.0) * 2.0 - 1.0)
-                if len(values) >= self._embedding_dim:
-                    break
+    def _embed_texts(self, texts: list[str]) -> list[list[float]]:
+        return self._embedding_backend.embed_texts(texts)
 
-        norm = math.sqrt(sum(v * v for v in values))
-        if norm == 0.0:
-            return values
-        return [v / norm for v in values]
+    def _collection_namespace(self) -> str:
+        return self._embedding_backend.collection_namespace.strip()
 
     async def add_message(
         self,
@@ -449,7 +545,7 @@ class ChannelMemoryStore:
             "ids": [record_id],
             "documents": [content],
             "metadatas": [merged_metadata],
-            "embeddings": [self._embed(content)],
+            "embeddings": self._embed_texts([content]),
         }
 
         channel_collection.upsert(**payload)
@@ -524,7 +620,8 @@ class ChannelMemoryStore:
 
     def _get_guild_memory_stats_sync(self, guild_id: int | None) -> dict[str, Any]:
         guild_part = str(guild_id) if guild_id is not None else "dm"
-        prefix = f"mem_g{guild_part}_"
+        namespace = self._collection_namespace()
+        prefix = f"mem_{namespace}_g{guild_part}_" if namespace else f"mem_g{guild_part}_"
         collections = self._client.list_collections()
         names: list[str] = []
         for col in collections:
@@ -633,7 +730,7 @@ class ChannelMemoryStore:
         try:
             result = collection.get(
                 where={"user_id": str(user_id)},
-                include=["documents", "metadatas"],
+                            "embeddings": self._embed_texts([content]),
                 limit=max(fetch_limit * 4, 80),
             )
         except Exception:
@@ -698,7 +795,7 @@ class ChannelMemoryStore:
         candidate_limit = max(limit * 25, 200)
         try:
             result = collection.query(
-                query_embeddings=[self._embed(query_text)],
+                query_embeddings=self._embed_texts([query_text]),
                 n_results=candidate_limit,
                 include=["documents", "metadatas", "distances"],
             )
