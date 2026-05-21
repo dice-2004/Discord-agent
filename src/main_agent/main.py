@@ -321,6 +321,104 @@ async def _build_recent_conversation_context(
     return "[Recent Conversation]\n" + "\n".join(lines)
 
 
+def _normalize_user_lookup_text(text: str) -> str:
+    normalized = (text or "").casefold()
+    return re.sub(r"[\s<>()\[\]{}「」『』【】,，。．.!?！？@#:/\\|~`'\"“”‘’\-]+", "", normalized)
+
+
+def _is_user_memory_query(question: str) -> bool:
+    text = (question or "").strip().lower()
+    if not text:
+        return False
+    patterns = (
+        "知っている",
+        "知識",
+        "発言",
+        "要約",
+        "まとめ",
+        "まとめて",
+        "履歴",
+        "記憶",
+        "最近",
+        "最新",
+        "プロフィール",
+        "どんな人",
+        "何者",
+    )
+    return any(pattern in text for pattern in patterns)
+
+
+def _resolve_target_member_from_question(
+    guild: discord.Guild | None,
+    question: str,
+) -> tuple[discord.Member | None, str]:
+    if guild is None:
+        return None, ""
+
+    mention_ids = [int(match) for match in re.findall(r"<@!?(\d+)>", question or "")]
+    for user_id in mention_ids:
+        member = guild.get_member(user_id)
+        if member is not None and not member.bot:
+            return member, "mention"
+
+    normalized_question = _normalize_user_lookup_text(question)
+    if not normalized_question:
+        return None, ""
+
+    scored: list[tuple[int, int, discord.Member, str]] = []
+    for member in getattr(guild, "members", []):
+        if bool(getattr(member, "bot", False)):
+            continue
+
+        display_name = str(getattr(member, "display_name", "") or "")
+        username = str(getattr(member, "name", "") or "")
+        global_name = str(getattr(member, "global_name", "") or "")
+        nick = str(getattr(member, "nick", "") or "")
+        candidates = (
+            (display_name, "display_name"),
+            (nick, "nick"),
+            (global_name, "global_name"),
+            (username, "username"),
+        )
+        for candidate_text, match_source in candidates:
+            if not candidate_text:
+                continue
+            normalized_candidate = _normalize_user_lookup_text(candidate_text)
+            if not normalized_candidate:
+                continue
+            if normalized_candidate == normalized_question:
+                scored.append((1000 + len(normalized_candidate), len(normalized_candidate), member, match_source))
+                continue
+            if normalized_candidate in normalized_question:
+                scored.append((800 + len(normalized_candidate), len(normalized_candidate), member, match_source))
+                continue
+            if normalized_question in normalized_candidate:
+                scored.append((600 + len(normalized_question), len(normalized_candidate), member, match_source))
+
+    if not scored:
+        return None, ""
+
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    best = scored[0]
+    return best[2], best[3]
+
+
+def _inject_target_user_hint(question: str, member: discord.Member, match_source: str) -> str:
+    if not _is_user_memory_query(question):
+        return question
+
+    lines = [
+        "",
+        "[Resolved Target User]",
+        f"- user_id: {member.id}",
+        f"- display_name: {getattr(member, 'display_name', '')}",
+        f"- username: {getattr(member, 'name', '')}",
+        f"- match_source: {match_source or 'unknown'}",
+        "- instruction: この対象についての知識・発言・要約・最新発言は get_user_memory(user_id=...) を優先して使うこと",
+    ]
+    return (question or "").rstrip() + "\n" + "\n".join(lines)
+
+
 def _inject_recent_conversation_hint(question: str, recent_context: str) -> str:
     if not recent_context:
         return question
@@ -424,6 +522,17 @@ def _is_recall_question(question: str) -> bool:
         r"会話履歴",
         r"会話ログ",
         r"履歴ログ",
+        r"要約",
+        r"知っている",
+        r"知識",
+        r"発言",
+        r"まとめ",
+        r"まとめて",
+        r"履歴",
+        r"記憶",
+        r"最近",
+        r"最新",
+        r"プロフィール",
     ]
     return any(re.search(p, text) for p in patterns)
 
@@ -1191,7 +1300,8 @@ async def bootstrap_channel_history(
     limit = None if max_per_channel <= 0 else max_per_channel
     payload: list[dict[str, int | str | bool]] = []
     ingested = 0
-    latest_seen = after_id or 0
+    latest_committed = after_id or 0
+    halted = False
 
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
@@ -1213,19 +1323,44 @@ async def bootstrap_channel_history(
                 latest_seen = max(latest_seen, int(msg.id))
 
                 if len(payload) >= batch_size:
-                    ingested += await orchestrator.ingest_channel_history(
+                    ingest_result = await orchestrator.ingest_channel_history(
                         guild_id=guild_id,
                         channel_id=channel_id,
                         messages=payload,
                     )
+                    ingested += int(ingest_result.get("stored", 0) or 0)
+                    last_success = ingest_result.get("last_success_message_id")
+                    if isinstance(last_success, int):
+                        latest_committed = max(latest_committed, last_success)
+                    halted = bool(ingest_result.get("halted", False))
                     payload = []
+                    if halted:
+                        logging.getLogger(__name__).warning(
+                            "Bootstrap halted due to ingest failure: guild=%s channel=%s committed_until=%s",
+                            guild_id,
+                            channel_id,
+                            latest_committed,
+                        )
+                        break
 
-            if payload:
-                ingested += await orchestrator.ingest_channel_history(
+            if not halted and payload:
+                ingest_result = await orchestrator.ingest_channel_history(
                     guild_id=guild_id,
                     channel_id=channel_id,
                     messages=payload,
                 )
+                ingested += int(ingest_result.get("stored", 0) or 0)
+                last_success = ingest_result.get("last_success_message_id")
+                if isinstance(last_success, int):
+                    latest_committed = max(latest_committed, last_success)
+                halted = bool(ingest_result.get("halted", False))
+                if halted:
+                    logging.getLogger(__name__).warning(
+                        "Bootstrap halted due to ingest failure at tail: guild=%s channel=%s committed_until=%s",
+                        guild_id,
+                        channel_id,
+                        latest_committed,
+                    )
             break
         except discord.DiscordServerError:
             if attempt >= max_attempts:
@@ -1252,8 +1387,8 @@ async def bootstrap_channel_history(
             )
             return ingested
 
-    if latest_seen > (after_id or 0):
-        cursor_map[key] = latest_seen
+    if latest_committed > (after_id or 0):
+        cursor_map[key] = latest_committed
         save_ingest_cursor(chromadb_path, cursor_map)
 
     return ingested
@@ -1866,8 +2001,11 @@ def main() -> None:
         try:
             mode, timeout_sec = _extract_research_controls(question)
             question_with_controls = _inject_research_controls_hint_with_values(question, mode, timeout_sec)
+            resolved_member, match_source = _resolve_target_member_from_question(interaction.guild, question)
+            if resolved_member is not None:
+                question_with_controls = _inject_target_user_hint(question_with_controls, resolved_member, match_source)
             recent_context = ""
-            if interaction.channel is not None and _should_attach_recent_context(question):
+            if interaction.channel is not None and (_should_attach_recent_context(question) or _is_user_memory_query(question)):
                 recent_limit = 40 if _is_recall_question(question) else 8
                 recent_context = await _build_recent_conversation_context(interaction.channel, limit=recent_limit)
             question_for_orchestrator = _inject_recent_conversation_hint(question_with_controls, recent_context)
@@ -2426,8 +2564,11 @@ def main() -> None:
 
         mode, timeout_sec = _extract_research_controls(question)
         question_with_controls = _inject_research_controls_hint_with_values(question, mode, timeout_sec)
+        resolved_member, match_source = _resolve_target_member_from_question(source_message.guild, question)
+        if resolved_member is not None:
+            question_with_controls = _inject_target_user_hint(question_with_controls, resolved_member, match_source)
         recent_context = ""
-        if _should_attach_recent_context(question):
+        if _should_attach_recent_context(question) or _is_user_memory_query(question):
             recent_limit = 40 if _is_recall_question(question) else 10
             recent_context = await _build_recent_conversation_context(
                 source_message.channel,
@@ -2837,8 +2978,6 @@ def main() -> None:
 
     @client.event
     async def on_message(message: discord.Message) -> None:
-        if message.author.bot:
-            return
         if not enable_message_content_intent:
             return
         if message.guild is None:
@@ -2850,7 +2989,12 @@ def main() -> None:
         if not content:
             return
 
-        role = "assistant" if bool(getattr(message.author, "bot", False)) else "user"
+        is_own_bot_message = bool(client.user is not None and message.author.id == client.user.id)
+        is_human_message = not bool(getattr(message.author, "bot", False))
+        if not is_own_bot_message and not is_human_message:
+            return
+
+        role = "assistant" if is_own_bot_message else "user"
         try:
             await orchestrator.memory.add_message(
                 guild_id=message.guild.id,
@@ -2861,7 +3005,7 @@ def main() -> None:
                 message_id=message.id,
                 metadata={
                     "source": "discord_stream",
-                    "kind": "stream",
+                    "kind": "stream_bot" if is_own_bot_message else "stream",
                     "timestamp": message.created_at.astimezone(timezone.utc).isoformat(),
                     "channel_name": str(getattr(message.channel, "name", "") or ""),
                 },

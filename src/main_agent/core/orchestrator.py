@@ -490,12 +490,19 @@ class DiscordOrchestrator:
         guild_id: int | None,
         channel_id: int,
         messages: list[dict[str, Any]],
-    ) -> int:
+    ) -> dict[str, Any]:
         """Store historical channel messages to improve memory recall for old conversations."""
         if not messages:
-            return 0
+            return {"stored": 0, "last_success_message_id": None, "halted": False}
+
+        retry_max = max(1, int(os.getenv("MEMORY_INGEST_RETRY_MAX", "5")))
+        retry_backoff_sec = max(0.1, float(os.getenv("MEMORY_INGEST_RETRY_BACKOFF_SEC", "0.5")))
+        min_interval_sec = max(0.0, float(os.getenv("MEMORY_INGEST_MIN_INTERVAL_SEC", "0.0")))
+        halt_on_failure = os.getenv("MEMORY_INGEST_HALT_ON_FAILURE", "true").strip().lower() == "true"
 
         stored = 0
+        last_success_message_id: int | None = None
+        halted = False
         ordered = sorted(messages, key=lambda m: int(m.get("message_id", 0)))
         for item in ordered:
             content = str(item.get("content", "")).strip()
@@ -505,28 +512,53 @@ class DiscordOrchestrator:
             role = "assistant" if bool(item.get("is_bot", False)) else "user"
             user_id = int(item.get("author_id", 0) or 0)
             message_id = item.get("message_id")
+            message_id_int = int(message_id) if message_id is not None else None
             created_at = str(item.get("created_at", "")).strip()
             channel_name = str(item.get("channel_name", "")).strip()
-            try:
-                await self.memory.add_message(
-                    guild_id=guild_id,
-                    channel_id=channel_id,
-                    role=role,
-                    content=content,
-                    user_id=user_id,
-                    message_id=int(message_id) if message_id is not None else None,
-                    metadata={
-                        "source": "discord_history",
-                        "kind": "backfill",
-                        "timestamp": created_at,
-                        "channel_name": channel_name,
-                    },
-                )
-                stored += 1
-            except Exception:
-                logger.exception("Failed to ingest historical message: channel=%s", channel_id)
+            success = False
+            for attempt in range(1, retry_max + 1):
+                try:
+                    await self.memory.add_message(
+                        guild_id=guild_id,
+                        channel_id=channel_id,
+                        role=role,
+                        content=content,
+                        user_id=user_id,
+                        message_id=message_id_int,
+                        metadata={
+                            "source": "discord_history",
+                            "kind": "backfill",
+                            "timestamp": created_at,
+                            "channel_name": channel_name,
+                        },
+                    )
+                    stored += 1
+                    last_success_message_id = message_id_int
+                    success = True
+                    break
+                except Exception:
+                    if attempt >= retry_max:
+                        logger.exception(
+                            "Failed to ingest historical message after retries: channel=%s message_id=%s attempts=%s",
+                            channel_id,
+                            message_id_int,
+                            attempt,
+                        )
+                    else:
+                        await asyncio.sleep(retry_backoff_sec * attempt)
 
-        return stored
+            if not success and halt_on_failure:
+                halted = True
+                break
+
+            if min_interval_sec > 0:
+                await asyncio.sleep(min_interval_sec)
+
+        return {
+            "stored": stored,
+            "last_success_message_id": last_success_message_id,
+            "halted": halted,
+        }
 
     async def _generate_with_tools(self, system_prompt: str, question: str) -> str:
         now_jst = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -1150,7 +1182,7 @@ class DiscordOrchestrator:
         body = (text or "").strip()
         if not body:
             return False
-            
+
         # Gemma が内部プロンプトの見出しをそのまま出力し始めた場合のキーワード
         markers = [
             "Discord Personal AI Assistant",
@@ -1171,14 +1203,14 @@ class DiscordOrchestrator:
             "Concise/Practical?",
             "No redundant introductions",
         ]
-        
+
         # 1つでもあれば怪しいが、誤検知を防ぐため「複数ヒット(2つ以上)」または「特定決定的フレーズ」で判定
         hits = [m for m in markers if m in body]
-        
+
         # 「Role:」と「Response Draft:」が同時にあればほぼ確実にリーク
         if "Role:" in hits and ("Response Draft:" in hits or "Action:" in hits):
             return True
-            
+
         # それ以外でも3つ以上マーカーがあればアウト
         return len(hits) >= 3
 
@@ -1187,7 +1219,7 @@ class DiscordOrchestrator:
         body = (text or "").strip()
         if not body:
             return ""
-        
+
         # 1. 典型的なマーカーの後ろにある文章を抽出する
         markers = [
             "Response Draft:",
@@ -1196,19 +1228,19 @@ class DiscordOrchestrator:
             "Draft:",
             "回答:"
         ]
-        
+
         for marker in markers:
             idx = body.rfind(marker)
             if idx != -1:
                 extracted = body[idx + len(marker):].strip()
                 if len(extracted) > 5:
                     return extracted
-        
+
         # 2. マーカーがない場合、先頭から連続する思考行（* で始まる行）をスキップした残りを抽出する
         lines = body.splitlines()
         final_lines = []
         in_thought_block = True
-        
+
         for line in lines:
             if in_thought_block:
                 # 箇条書き（* または -）で始まる行、または空行は思考ブロックの一部とみなしてスキップ
@@ -1216,14 +1248,14 @@ class DiscordOrchestrator:
                     continue
                 else:
                     in_thought_block = False
-            
+
             if not in_thought_block:
                 final_lines.append(line)
-        
+
         extracted = "\n".join(final_lines).strip()
         if len(extracted) > 5:
             return extracted
-        
+
         return ""
 
     @staticmethod
@@ -1313,6 +1345,19 @@ class DiscordOrchestrator:
             r"先ほど",
             r"前回",
             r"前に",
+            r"知っている",
+            r"知識",
+            r"発言",
+            r"要約",
+            r"まとめ",
+            r"まとめて",
+            r"履歴",
+            r"記憶",
+            r"最近",
+            r"最新",
+            r"プロフィール",
+            r"どんな人",
+            r"何者",
             r"何について",
             r"何と言",
             r"何て言",
