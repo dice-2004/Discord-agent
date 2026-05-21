@@ -800,7 +800,6 @@ class ChannelMemoryStore:
         try:
             result = collection.get(
                 where={"user_id": str(user_id)},
-                            "embeddings": self._embed_texts([content]),
                 limit=max(fetch_limit * 4, 80),
             )
         except Exception:
