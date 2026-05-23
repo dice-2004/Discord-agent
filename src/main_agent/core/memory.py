@@ -52,8 +52,8 @@ class _EmbeddingBackend:
 class _HashEmbeddingBackend(_EmbeddingBackend):
     def __init__(self, dimension: int = 32) -> None:
         self.name = "hash"
-        self.collection_namespace = ""
         self.dimension = max(8, int(dimension))
+        self.collection_namespace = f"hash_{self.dimension}"
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
         return [self._embed_single(text) for text in texts]
@@ -90,8 +90,8 @@ class _SentenceTransformerEmbeddingBackend(_EmbeddingBackend):
         fallback_backend: _HashEmbeddingBackend,
     ) -> None:
         self.name = "bge_m3"
-        self.collection_namespace = "bge_m3"
         self.dimension = 1024
+        self.collection_namespace = f"bge_m3_{self.dimension}"
         self._model_name = model_name
         self._device = device
         self._batch_size = max(1, int(batch_size))
@@ -123,8 +123,8 @@ class _SentenceTransformerEmbeddingBackend(_EmbeddingBackend):
             return [[float(value) for value in row] for row in data]
         except Exception:
             logger.exception("Falling back to hash embeddings because bge-m3 could not be loaded")
-            self.collection_namespace = ""
             self.name = "hash"
+            self.collection_namespace = f"hash_{self._fallback_backend.dimension}"
             return self._fallback_backend.embed_texts(texts)
 
 
@@ -137,8 +137,8 @@ class _RemoteOllamaEmbeddingBackend(_EmbeddingBackend):
         fallback_backend: _HashEmbeddingBackend,
     ) -> None:
         self.name = "ollama_bge_m3"
-        self.collection_namespace = "ollama_bge_m3"
         self.dimension = 1024
+        self.collection_namespace = f"ollama_bge_m3_{self.dimension}"
         self._base_url = (base_url or "http://127.0.0.1:11434").strip().rstrip("/")
         self._model_name = (model_name or "bge-m3").strip() or "bge-m3"
         self._timeout_sec = max(3, int(timeout_sec))
@@ -158,8 +158,8 @@ class _RemoteOllamaEmbeddingBackend(_EmbeddingBackend):
             return [self._embed_single(text) for text in texts]
         except Exception:
             logger.exception("Falling back to hash embeddings because remote Ollama embedding failed")
-            self.collection_namespace = ""
             self.name = "hash"
+            self.collection_namespace = f"hash_{self._fallback_backend.dimension}"
             return self._fallback_backend.embed_texts(texts)
 
     def _embed_batch(self, texts: list[str]) -> list[list[float]]:

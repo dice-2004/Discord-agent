@@ -28,6 +28,7 @@ class TwitterScoutConfig:
     enabled: bool = False
     gemini_api_key: str = ""
     gemini_model: str = "gemma-4-31b-it"
+    gemini_fallback_model: str = "gemini-2.5-flash"
     crawl_interval_sec: int = 180
     topics: list[str] | None = None
     max_topics_per_cycle: int = 2
@@ -68,6 +69,8 @@ def load_twitter_scout_config_from_env() -> TwitterScoutConfig:
         enabled=os.getenv("TWITTER_SCOUT_ENABLED", "false").strip().lower() == "true",
         gemini_api_key=os.getenv("TWITTER_SCOUT_GEMINI_API_KEY", "").strip(),
         gemini_model=os.getenv("TWITTER_SCOUT_GEMINI_MODEL", "gemma-4-31b-it").strip() or "gemma-4-31b-it",
+        gemini_fallback_model=os.getenv("TWITTER_SCOUT_GEMINI_FALLBACK_MODEL", "gemini-2.5-flash").strip()
+        or "gemini-2.5-flash",
         crawl_interval_sec=max(30, _safe_int_env("TWITTER_SCOUT_CRAWL_INTERVAL_SEC", 180)),
         topics=topics,
         max_topics_per_cycle=max(1, _safe_int_env("TWITTER_SCOUT_MAX_TOPICS_PER_CYCLE", 2)),
@@ -319,47 +322,69 @@ class TwitterScoutAgent:
         if not self._consume_budget_token():
             return None
 
-        try:
-            response = self._model_client.models.generate_content(
-                model=self.config.gemini_model,
-                contents=prompt,
-                config=google_genai_types.GenerateContentConfig(
-                    temperature=0.2,
-                    top_p=0.95,
-                    top_k=40,
-                    max_output_tokens=2048,
-                ),
-            )
-            text = (getattr(response, "text", "") or "").strip()
-            parsed = self._extract_json_object(text)
-            if not isinstance(parsed, dict):
-                return None
-            recs = parsed.get("recommendations", [])
-            if not isinstance(recs, list):
-                recs = []
-            normalized_recs: list[dict[str, Any]] = []
-            for rec in recs[:5]:
-                if not isinstance(rec, dict):
-                    continue
-                urls = rec.get("source_urls", [])
-                if not isinstance(urls, list):
-                    urls = []
-                normalized_recs.append(
-                    {
-                        "title": str(rec.get("title", "")).strip()[:160],
-                        "why": str(rec.get("why", "")).strip()[:360],
-                        "source_urls": [str(u).strip() for u in urls if str(u).strip()][:5],
-                    }
+        model_names: list[str] = [self.config.gemini_model]
+        fallback_model = self.config.gemini_fallback_model.strip()
+        if fallback_model and fallback_model not in model_names:
+            model_names.append(fallback_model)
+
+        last_error: Exception | None = None
+        for model_name in model_names:
+            try:
+                response = self._model_client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=google_genai_types.GenerateContentConfig(
+                        temperature=0.2,
+                        top_p=0.95,
+                        top_k=40,
+                        max_output_tokens=2048,
+                    ),
                 )
-            return {
-                "summary": str(parsed.get("summary", "")).strip()[:1200],
-                "profile_keywords": [str(x).strip() for x in parsed.get("profile_keywords", []) if str(x).strip()][:12]
-                if isinstance(parsed.get("profile_keywords", []), list)
-                else [],
-                "recommendations": normalized_recs,
-            }
-        except Exception:
-            logger.exception("TwitterScout model call failed")
+                text = (getattr(response, "text", "") or "").strip()
+                parsed = self._extract_json_object(text)
+                if not isinstance(parsed, dict):
+                    return None
+                recs = parsed.get("recommendations", [])
+                if not isinstance(recs, list):
+                    recs = []
+                normalized_recs: list[dict[str, Any]] = []
+                for rec in recs[:5]:
+                    if not isinstance(rec, dict):
+                        continue
+                    urls = rec.get("source_urls", [])
+                    if not isinstance(urls, list):
+                        urls = []
+                    normalized_recs.append(
+                        {
+                            "title": str(rec.get("title", "")).strip()[:160],
+                            "why": str(rec.get("why", "")).strip()[:360],
+                            "source_urls": [str(u).strip() for u in urls if str(u).strip()][:5],
+                        }
+                    )
+                return {
+                    "summary": str(parsed.get("summary", "")).strip()[:1200],
+                    "profile_keywords": [str(x).strip() for x in parsed.get("profile_keywords", []) if str(x).strip()][:12]
+                    if isinstance(parsed.get("profile_keywords", []), list)
+                    else [],
+                    "recommendations": normalized_recs,
+                }
+            except Exception as exc:
+                last_error = exc
+                if model_name != model_names[-1]:
+                    logger.warning(
+                        "TwitterScout model call failed, retrying with fallback model: primary=%s fallback=%s",
+                        self.config.gemini_model,
+                        fallback_model or "(none)",
+                    )
+                    continue
+
+        if last_error is not None:
+            logger.warning(
+                "TwitterScout model call failed; using fallback summary: model=%s fallback=%s error=%s",
+                self.config.gemini_model,
+                fallback_model or "(none)",
+                last_error.__class__.__name__,
+            )
             return None
 
     def _build_fallback_summary(self, selected_topics: list[str], raw_blocks: list[dict[str, str]]) -> dict[str, Any]:
