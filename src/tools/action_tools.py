@@ -399,6 +399,63 @@ def _google_tasks_access_token() -> tuple[str | None, str | None]:
     return _google_access_token_from_creds(_google_tasks_creds(), "google_tasks_oauth2")
 
 
+def _google_tasks_list_id() -> tuple[str | None, str | None]:
+    explicit_list_id = os.getenv("GOOGLE_TASKS_LIST_ID", "").strip()
+    if explicit_list_id:
+        return explicit_list_id, None
+
+    token, err = _google_tasks_access_token()
+    if not token:
+        return None, err or "auth_required"
+
+    req = Request(
+        "https://www.googleapis.com/tasks/v1/users/@me/lists",
+        method="GET",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "discord-ai-agent/1.0",
+        },
+    )
+
+    timeout_sec = _safe_int("INTERNAL_ACTION_TIMEOUT_SEC", 15)
+    try:
+        with urlopen(req, timeout=timeout_sec) as res:
+            status = int(getattr(res, "status", 200))
+            raw = res.read().decode("utf-8", errors="replace")
+        payload = json.loads(raw) if raw else {}
+        if status != 200:
+            return None, _truncate_text(str(payload))
+
+        items = payload.get("items", []) if isinstance(payload, dict) else []
+        if not isinstance(items, list) or not items:
+            return None, "Google Tasks のタスクリストが見つかりません。"
+
+        preferred_titles = {"tasks", "task", "to do", "todo", "my tasks", "マイ タスク", "タスク"}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            list_id = str(item.get("id", "")).strip()
+            title = str(item.get("title", "")).strip().lower()
+            if list_id and title in preferred_titles:
+                return list_id, None
+
+        first_item = items[0] if isinstance(items[0], dict) else None
+        if isinstance(first_item, dict):
+            list_id = str(first_item.get("id", "")).strip()
+            if list_id:
+                return list_id, None
+        return None, "Google Tasks のタスクリストIDを解決できませんでした。"
+    except HTTPError as exc:
+        try:
+            raw = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            raw = str(exc)
+        return None, _truncate_text(raw)
+    except Exception as exc:
+        return None, _truncate_text(str(exc))
+
+
 def _google_calendar_insert_event(
     title: str,
     description: str,
@@ -537,6 +594,17 @@ def _google_tasks_insert_task(title: str, due_date: str | None = None, notes: st
             }
         )
 
+    task_list_id, list_err = _google_tasks_list_id()
+    if not task_list_id:
+        return _as_json_line(
+            {
+                "status": "error",
+                "code": "task_list_not_found",
+                "action": "add_task",
+                "detail": f"Google Tasks のタスクリストを取得できませんでした: {list_err or 'unknown'}",
+            }
+        )
+
     body: dict[str, object] = {"title": title}
     if due_date:
         body["due"] = f"{due_date}T00:00:00.000Z"
@@ -544,7 +612,7 @@ def _google_tasks_insert_task(title: str, due_date: str | None = None, notes: st
         body["notes"] = notes
 
     req = Request(
-        "https://www.googleapis.com/tasks/v1/lists/@default/tasks",
+        f"https://www.googleapis.com/tasks/v1/lists/{quote(task_list_id, safe='')}/tasks",
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
         method="POST",
         headers={
@@ -569,6 +637,7 @@ def _google_tasks_insert_task(title: str, due_date: str | None = None, notes: st
                     "action": "add_task",
                     "status_code": status,
                     "detail": _truncate_text(str(payload)),
+                    "task_list_id": task_list_id,
                 }
             )
         return _as_json_line(
@@ -602,6 +671,7 @@ def _google_tasks_insert_task(title: str, due_date: str | None = None, notes: st
                 "status_code": code,
                 "detail": detail,
                 "auth_url": _google_tasks_auth_url(),
+                "task_list_id": task_list_id,
             }
         )
     except Exception as exc:
@@ -708,6 +778,10 @@ def _google_tasks_list_all_tasks() -> tuple[list[dict[str, object]], str | None,
     if not token:
         return [], err or "auth_required", None
 
+    task_list_id, list_err = _google_tasks_list_id()
+    if not task_list_id:
+        return [], list_err or "task_list_not_found", None
+
     tasks: list[dict[str, object]] = []
     page_token: str | None = None
     timeout_sec = _safe_int("INTERNAL_ACTION_TIMEOUT_SEC", 15)
@@ -723,7 +797,7 @@ def _google_tasks_list_all_tasks() -> tuple[list[dict[str, object]], str | None,
                 query_params["pageToken"] = page_token
 
             req = Request(
-                f"https://www.googleapis.com/tasks/v1/lists/@default/tasks?{urlencode(query_params)}",
+                f"https://www.googleapis.com/tasks/v1/lists/{quote(task_list_id, safe='')}/tasks?{urlencode(query_params)}",
                 method="GET",
                 headers={
                     "Authorization": f"Bearer {token}",
@@ -779,6 +853,17 @@ def _google_tasks_update_task(
             }
         )
 
+    task_list_id, list_err = _google_tasks_list_id()
+    if not task_list_id:
+        return _as_json_line(
+            {
+                "status": "error",
+                "code": "task_list_not_found",
+                "action": "update_task",
+                "detail": f"Google Tasks のタスクリストを取得できませんでした: {list_err or 'unknown'}",
+            }
+        )
+
     body: dict[str, object] = {}
     if title is not None:
         body["title"] = title
@@ -800,7 +885,7 @@ def _google_tasks_update_task(
         )
 
     req = Request(
-        f"https://www.googleapis.com/tasks/v1/lists/@default/tasks/{quote(task_id, safe='')}",
+        f"https://www.googleapis.com/tasks/v1/lists/{quote(task_list_id, safe='')}/tasks/{quote(task_id, safe='')}",
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
         method="PATCH",
         headers={
@@ -874,8 +959,19 @@ def _google_tasks_delete_task(task_id: str) -> str:
             }
         )
 
+    task_list_id, list_err = _google_tasks_list_id()
+    if not task_list_id:
+        return _as_json_line(
+            {
+                "status": "error",
+                "code": "task_list_not_found",
+                "action": "delete_task",
+                "detail": f"Google Tasks のタスクリストを取得できませんでした: {list_err or 'unknown'}",
+            }
+        )
+
     req = Request(
-        f"https://www.googleapis.com/tasks/v1/lists/@default/tasks/{quote(task_id, safe='')}",
+        f"https://www.googleapis.com/tasks/v1/lists/{quote(task_list_id, safe='')}/tasks/{quote(task_id, safe='')}",
         method="DELETE",
         headers={
             "Authorization": f"Bearer {token}",
