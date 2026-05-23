@@ -53,6 +53,10 @@ def get_discord_conversation_status(
     max_items = _safe_int(limit, default=12, min_value=1, max_value=50)
 
     store = _store()
+    if (gid is None or gid <= 0) and cid > 0:
+        resolved_gid = asyncio.run(store.resolve_guild_id_for_channel(cid))
+        if resolved_gid is not None:
+            gid = resolved_gid
     stats = asyncio.run(store.get_guild_memory_stats(gid))
     recent = asyncio.run(
         store.get_recent_messages(
@@ -84,6 +88,7 @@ def get_discord_conversation_status(
             "tool": "get_discord_conversation_status",
             "scope": scoped,
             "guild_id": gid,
+            "resolved_guild": gid,
             "channel_id": cid if cid > 0 else None,
             "memory_stats": stats,
             "recent_messages": items,
@@ -209,4 +214,3 @@ def search_memory(
         },
         ensure_ascii=False,
     )
-

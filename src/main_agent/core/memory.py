@@ -407,6 +407,35 @@ class ChannelMemoryStore:
         raw = f"mem_{namespace}_g{guild_part}_all" if namespace else f"mem_g{guild_part}_all"
         return re.sub(r"[^a-zA-Z0-9_-]", "_", raw)
 
+    async def resolve_guild_id_for_channel(self, channel_id: int) -> int | None:
+        return await asyncio.to_thread(self._resolve_guild_id_for_channel_sync, channel_id)
+
+    def _resolve_guild_id_for_channel_sync(self, channel_id: int) -> int | None:
+        if channel_id <= 0:
+            return None
+
+        channel_part = str(channel_id)
+        pattern = re.compile(rf"^mem_(?:.*_)?g(\d+)_c{re.escape(channel_part)}$")
+        fallback_gid: int | None = None
+
+        try:
+            for col in self._client.list_collections():
+                name = getattr(col, "name", "")
+                if not isinstance(name, str):
+                    continue
+                match = pattern.match(name)
+                if not match:
+                    continue
+                guild_id = int(match.group(1))
+                if guild_id > 0 and name.startswith(f"mem_{self._embedding_backend.collection_namespace.strip()}"):
+                    return guild_id
+                if fallback_gid is None and guild_id > 0:
+                    fallback_gid = guild_id
+        except Exception:
+            logger.exception("Failed to resolve guild id for channel: channel_id=%s", channel_id)
+
+        return fallback_gid
+
     @staticmethod
     def _normalize_persona_collection_name(name: str) -> str:
         return re.sub(r"[^a-zA-Z0-9_-]", "_", name)
