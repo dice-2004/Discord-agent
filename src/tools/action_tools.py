@@ -399,12 +399,74 @@ def _google_tasks_access_token() -> tuple[str | None, str | None]:
     return _google_access_token_from_creds(_google_tasks_creds(), "google_tasks_oauth2")
 
 
+_GOOGLE_TASKS_LIST_ID_CACHE: str | None = None
+
+
+def _google_tasks_resolve_default_list_id() -> tuple[str | None, str | None]:
+    global _GOOGLE_TASKS_LIST_ID_CACHE
+
+    if _GOOGLE_TASKS_LIST_ID_CACHE:
+        return _GOOGLE_TASKS_LIST_ID_CACHE, None
+
+    token, err = _google_tasks_access_token()
+    if not token:
+        return None, err or "auth_required"
+
+    req = Request(
+        "https://tasks.googleapis.com/tasks/v1/users/@me/lists",
+        method="GET",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "discord-ai-agent/1.0",
+        },
+    )
+
+    timeout_sec = _safe_int("INTERNAL_ACTION_TIMEOUT_SEC", 15)
+    try:
+        with urlopen(req, timeout=timeout_sec) as res:
+            raw = res.read().decode("utf-8", errors="replace")
+        payload = json.loads(raw) if raw else {}
+    except HTTPError as exc:
+        try:
+            raw = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            raw = str(exc)
+        return None, _truncate_text(raw)
+    except Exception as exc:
+        return None, _truncate_text(str(exc))
+
+    items = payload.get("items", []) if isinstance(payload, dict) else []
+    if not isinstance(items, list) or not items:
+        return None, "Google Tasks のタスクリストが見つかりませんでした。"
+
+    chosen: dict[str, object] | None = None
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title", "")).strip().lower()
+        if item.get("default") is True or title == "my tasks":
+            chosen = item
+            break
+
+    if chosen is None:
+        first = items[0]
+        chosen = first if isinstance(first, dict) else None
+
+    list_id = str((chosen or {}).get("id", "")).strip()
+    if not list_id:
+        return None, "Google Tasks のデフォルトタスクリストIDを解決できませんでした。"
+
+    _GOOGLE_TASKS_LIST_ID_CACHE = list_id
+    return list_id, None
+
+
 def _google_tasks_list_id() -> tuple[str | None, str | None]:
     explicit_list_id = os.getenv("GOOGLE_TASKS_LIST_ID", "").strip()
     if explicit_list_id:
         return explicit_list_id, None
 
-    return None, "GOOGLE_TASKS_LIST_ID が未設定です。Google Tasks の実際のタスクリストIDを環境変数に設定してください。"
+    return _google_tasks_resolve_default_list_id()
 
 
 def _google_calendar_insert_event(
@@ -706,8 +768,10 @@ def _handle_bulk_add_task(payload: dict[str, object]) -> str:
     queued_count = 0
     for item in items:
         title = str(item.get("title", "")).strip()
-        due_date = str(item.get("due_date", "")).strip() or None
-        notes = str(item.get("notes", "")).strip()
+        due_date_value = item.get("due_date")
+        due_date = str(due_date_value).strip() or None if due_date_value is not None else None
+        notes_value = item.get("notes")
+        notes = str(notes_value).strip() if notes_value is not None else ""
         result = json.loads(_google_tasks_insert_task(title=title, due_date=due_date, notes=notes))
         if result.get("status") == "ok":
             ok_count += 1
