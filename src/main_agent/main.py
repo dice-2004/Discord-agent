@@ -2628,6 +2628,8 @@ def main() -> None:
         ).strip()
 
         github_token_set = bool(os.getenv("GITHUB_TOKEN", "").strip())
+        google_tasks_list_id = os.getenv("GOOGLE_TASKS_LIST_ID", "").strip()
+        google_tasks_configured = bool(google_tasks_list_id)
         smtp_ready = all(
             bool(os.getenv(key, "").strip())
             for key in ["SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD", "SMTP_FROM"]
@@ -2647,12 +2649,17 @@ def main() -> None:
             f"- Google Calendar credentials: {'configured' if calendar_creds_ready else 'missing'}\n"
             f"- Google Calendar auth URL: {calendar_auth_url}\n"
         )
+        tasks_line = (
+            f"- Google Tasks list ID: {'configured' if google_tasks_configured else 'missing'}\n"
+            f"- Google Tasks list ID value: {google_tasks_list_id or '(未設定)'}\n"
+        )
 
         body = (
             "認証設定ステータス\n"
             f"- GitHub token: {'configured' if github_token_set else 'missing'}\n"
             f"- GitHub auth URL: {github_auth_url}\n"
             f"{calendar_line}"
+            f"{tasks_line}"
             f"{smtp_line}"
             "\n"
             "通常運用は /ask を使ってください。"

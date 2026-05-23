@@ -404,56 +404,7 @@ def _google_tasks_list_id() -> tuple[str | None, str | None]:
     if explicit_list_id:
         return explicit_list_id, None
 
-    token, err = _google_tasks_access_token()
-    if not token:
-        return None, err or "auth_required"
-
-    req = Request(
-        "https://www.googleapis.com/tasks/v1/users/@me/lists",
-        method="GET",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-            "User-Agent": "discord-ai-agent/1.0",
-        },
-    )
-
-    timeout_sec = _safe_int("INTERNAL_ACTION_TIMEOUT_SEC", 15)
-    try:
-        with urlopen(req, timeout=timeout_sec) as res:
-            status = int(getattr(res, "status", 200))
-            raw = res.read().decode("utf-8", errors="replace")
-        payload = json.loads(raw) if raw else {}
-        if status != 200:
-            return None, _truncate_text(str(payload))
-
-        items = payload.get("items", []) if isinstance(payload, dict) else []
-        if not isinstance(items, list) or not items:
-            return None, "Google Tasks のタスクリストが見つかりません。"
-
-        preferred_titles = {"tasks", "task", "to do", "todo", "my tasks", "マイ タスク", "タスク"}
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            list_id = str(item.get("id", "")).strip()
-            title = str(item.get("title", "")).strip().lower()
-            if list_id and title in preferred_titles:
-                return list_id, None
-
-        first_item = items[0] if isinstance(items[0], dict) else None
-        if isinstance(first_item, dict):
-            list_id = str(first_item.get("id", "")).strip()
-            if list_id:
-                return list_id, None
-        return None, "Google Tasks のタスクリストIDを解決できませんでした。"
-    except HTTPError as exc:
-        try:
-            raw = exc.read().decode("utf-8", errors="replace")
-        except Exception:
-            raw = str(exc)
-        return None, _truncate_text(raw)
-    except Exception as exc:
-        return None, _truncate_text(str(exc))
+    return None, "GOOGLE_TASKS_LIST_ID が未設定です。Google Tasks の実際のタスクリストIDを環境変数に設定してください。"
 
 
 def _google_calendar_insert_event(
@@ -599,9 +550,9 @@ def _google_tasks_insert_task(title: str, due_date: str | None = None, notes: st
         return _as_json_line(
             {
                 "status": "error",
-                "code": "task_list_not_found",
+                "code": "missing_configuration",
                 "action": "add_task",
-                "detail": f"Google Tasks のタスクリストを取得できませんでした: {list_err or 'unknown'}",
+                "detail": list_err or "GOOGLE_TASKS_LIST_ID が未設定です。",
             }
         )
 
@@ -612,7 +563,7 @@ def _google_tasks_insert_task(title: str, due_date: str | None = None, notes: st
         body["notes"] = notes
 
     req = Request(
-        f"https://www.googleapis.com/tasks/v1/lists/{quote(task_list_id, safe='')}/tasks",
+        f"https://tasks.googleapis.com/tasks/v1/lists/{quote(task_list_id, safe='')}/tasks",
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
         method="POST",
         headers={
@@ -752,6 +703,7 @@ def _handle_bulk_add_task(payload: dict[str, object]) -> str:
 
     results: list[dict[str, object]] = []
     ok_count = 0
+    queued_count = 0
     for item in items:
         title = str(item.get("title", "")).strip()
         due_date = str(item.get("due_date", "")).strip() or None
@@ -759,14 +711,24 @@ def _handle_bulk_add_task(payload: dict[str, object]) -> str:
         result = json.loads(_google_tasks_insert_task(title=title, due_date=due_date, notes=notes))
         if result.get("status") == "ok":
             ok_count += 1
+        elif result.get("status") == "queued":
+            queued_count += 1
         results.append(result)
 
-    status = "ok" if ok_count == len(results) else ("partial" if ok_count > 0 else "error")
+    if ok_count == len(results):
+        status = "ok"
+    elif ok_count > 0 or queued_count > 0:
+        status = "partial"
+    elif queued_count == len(results):
+        status = "queued"
+    else:
+        status = "error"
     return _as_json_line(
         {
             "status": status,
             "action": "bulk_add_task",
             "created": ok_count,
+            "queued": queued_count,
             "requested": len(results),
             "results": results,
         }
@@ -780,7 +742,7 @@ def _google_tasks_list_all_tasks() -> tuple[list[dict[str, object]], str | None,
 
     task_list_id, list_err = _google_tasks_list_id()
     if not task_list_id:
-        return [], list_err or "task_list_not_found", None
+        return [], list_err or "missing_configuration", None
 
     tasks: list[dict[str, object]] = []
     page_token: str | None = None
@@ -797,7 +759,7 @@ def _google_tasks_list_all_tasks() -> tuple[list[dict[str, object]], str | None,
                 query_params["pageToken"] = page_token
 
             req = Request(
-                f"https://www.googleapis.com/tasks/v1/lists/{quote(task_list_id, safe='')}/tasks?{urlencode(query_params)}",
+                f"https://tasks.googleapis.com/tasks/v1/lists/{quote(task_list_id, safe='')}/tasks?{urlencode(query_params)}",
                 method="GET",
                 headers={
                     "Authorization": f"Bearer {token}",
@@ -858,9 +820,9 @@ def _google_tasks_update_task(
         return _as_json_line(
             {
                 "status": "error",
-                "code": "task_list_not_found",
+                "code": "missing_configuration",
                 "action": "update_task",
-                "detail": f"Google Tasks のタスクリストを取得できませんでした: {list_err or 'unknown'}",
+                "detail": list_err or "GOOGLE_TASKS_LIST_ID が未設定です。",
             }
         )
 
@@ -885,7 +847,7 @@ def _google_tasks_update_task(
         )
 
     req = Request(
-        f"https://www.googleapis.com/tasks/v1/lists/{quote(task_list_id, safe='')}/tasks/{quote(task_id, safe='')}",
+        f"https://tasks.googleapis.com/tasks/v1/lists/{quote(task_list_id, safe='')}/tasks/{quote(task_id, safe='')}",
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
         method="PATCH",
         headers={
@@ -964,14 +926,14 @@ def _google_tasks_delete_task(task_id: str) -> str:
         return _as_json_line(
             {
                 "status": "error",
-                "code": "task_list_not_found",
+                "code": "missing_configuration",
                 "action": "delete_task",
-                "detail": f"Google Tasks のタスクリストを取得できませんでした: {list_err or 'unknown'}",
+                "detail": list_err or "GOOGLE_TASKS_LIST_ID が未設定です。",
             }
         )
 
     req = Request(
-        f"https://www.googleapis.com/tasks/v1/lists/{quote(task_list_id, safe='')}/tasks/{quote(task_id, safe='')}",
+        f"https://tasks.googleapis.com/tasks/v1/lists/{quote(task_list_id, safe='')}/tasks/{quote(task_id, safe='')}",
         method="DELETE",
         headers={
             "Authorization": f"Bearer {token}",
