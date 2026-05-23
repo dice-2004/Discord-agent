@@ -615,6 +615,94 @@ def _google_tasks_insert_task(title: str, due_date: str | None = None, notes: st
         )
 
 
+def _extract_bulk_task_items(payload: dict[str, object]) -> list[dict[str, object]]:
+    raw_items = None
+    for key in ("tasks", "items", "titles", "task_list", "lines"):
+        candidate = payload.get(key)
+        if candidate is not None:
+            raw_items = candidate
+            break
+
+    default_due_date = str(payload.get("due_date", "") or payload.get("date", "")).strip() or None
+    default_notes = str(payload.get("notes", "") or payload.get("description", "")).strip()
+
+    entries: list[object] = []
+    if isinstance(raw_items, list):
+        entries = list(raw_items)
+    elif isinstance(raw_items, str):
+        entries = [part.strip() for part in re.split(r"[\n\r]+", raw_items) if part.strip()]
+    elif raw_items is not None:
+        entries = [raw_items]
+
+    if not entries:
+        single_title = str(payload.get("title", "") or payload.get("task_title", "") or payload.get("query", "")).strip()
+        if single_title:
+            entries = [single_title]
+
+    items: list[dict[str, object]] = []
+    for entry in entries:
+        if isinstance(entry, dict):
+            title = str(
+                entry.get("title", "")
+                or entry.get("task_title", "")
+                or entry.get("summary", "")
+                or entry.get("content", "")
+                or entry.get("text", "")
+            ).strip()
+            if not title:
+                continue
+            due_date = str(entry.get("due_date", "") or entry.get("date", "")).strip() or default_due_date
+            notes = str(entry.get("notes", "") or entry.get("description", "")).strip() or default_notes
+            items.append({"title": title, "due_date": due_date, "notes": notes})
+            continue
+
+        title = str(entry or "").strip()
+        if not title:
+            continue
+        # Bullet prefixes and numbering are common in LLM outputs.
+        title = re.sub(r"^(?:[-*•]|\d+[.)])\s*", "", title).strip()
+        if not title:
+            continue
+        items.append({"title": title, "due_date": default_due_date, "notes": default_notes})
+
+    return items
+
+
+def _handle_bulk_add_task(payload: dict[str, object]) -> str:
+    items = _extract_bulk_task_items(payload)
+    if not items:
+        return _as_json_line(
+            {
+                "status": "error",
+                "code": "missing_required_fields",
+                "action": "bulk_add_task",
+                "required": ["tasks|items|titles|task_list|lines"],
+            }
+        )
+
+    results: list[dict[str, object]] = []
+    ok_count = 0
+    for item in items:
+        title = str(item.get("title", "")).strip()
+        due_date = str(item.get("due_date", "")).strip() or None
+        notes = str(item.get("notes", "")).strip()
+        result = json.loads(_google_tasks_insert_task(title=title, due_date=due_date, notes=notes))
+        if result.get("status") == "ok":
+            ok_count += 1
+        results.append(result)
+
+    status = "ok" if ok_count == len(results) else ("partial" if ok_count > 0 else "error")
+    return _as_json_line(
+        {
+            "status": status,
+            "action": "bulk_add_task",
+            "created": ok_count,
+            "requested": len(results),
+            "results": results,
+        }
+    )
+
+
 def _google_tasks_list_all_tasks() -> tuple[list[dict[str, object]], str | None, int | None]:
     token, err = _google_access_token()
     if not token:
@@ -2200,6 +2288,9 @@ def execute_internal_action(action: str, payload_json: str = "{}") -> str:
 
     if clean_action == "add_task":
         return _handle_add_task(payload)
+
+    if clean_action == "bulk_add_task":
+        return _handle_bulk_add_task(payload)
 
     if clean_action == "update_task":
         return _handle_update_task(payload)

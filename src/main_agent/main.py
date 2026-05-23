@@ -1320,7 +1320,7 @@ async def bootstrap_channel_history(
                         "channel_name": str(getattr(msg.channel, "name", "") or ""),
                     }
                 )
-                latest_seen = max(latest_seen, int(msg.id))
+                latest_committed = max(latest_committed, int(msg.id))
 
                 if len(payload) >= batch_size:
                     ingest_result = await orchestrator.ingest_channel_history(

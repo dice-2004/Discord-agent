@@ -1059,6 +1059,7 @@ class DiscordOrchestrator:
             "- ユーザーが調査時間（秒/分）を指定した場合、dispatch_research_job の timeout_sec に秒換算した値を設定する\n"
             "- timeout_sec はユーザー指定値をそのまま使い、増減しない（例: 1分=60, 2分=120）\n"
             "- 区別ルール: 「タスク」「TODO」「やること」等の明示キーワード→add_task、「予定」「会議」「面接」等→add_calendar_event\n"
+            "- 複数のタスク/TODOが列挙されている場合は、1件ずつadd_taskに分けず bulk_add_task を使う\n"
             "- add_calendar_event は2方式を許可: 1) timed(start_time,end_time) 2) all_day(true)+date(YYYY-MM-DD)\n"
             "- add_task は必須: title, optional: due_date(YYYY-MM-DD)\n"
             "- カレンダー/タスク操作での確認ルール: タイトル+日付（+時刻/終日指定）が揃っていれば、「〜してよろしいでしょうか」などの確認メッセージ不可。直ちに execute_internal_action を呼び出す\n"
